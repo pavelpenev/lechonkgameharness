@@ -127,9 +127,10 @@ this repository pinned at that commit.
   - Working tree `player_state.py:73–74`:
     `if player_state['researching'] in self.rule_ctrl.techs:` /
     `player_state['research_name'] =
-    self.rule_ctrl.techs[player_state['researching']]['name']`. The tree's
-    only uncommitted modification is `envs/__init__.py` (entry 1), so the
-    committed fix is what ships.
+    self.rule_ctrl.techs[player_state['researching']]['name']`. The
+    ray-guard extension is committed (commit `8eb6dba` on branch
+    `lechonk-harness`) and the working tree carries no uncommitted
+    `envs/__init__.py` modification, so the committed fix is what ships.
   - Plan line 137 records the same mainline break (`player_state.py:73–74`,
     looked up in governments) and gates our snapshot's research display on
     this fix being verified applied.
