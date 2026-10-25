@@ -1298,3 +1298,62 @@ def test_entity_id_re_rejects_trailing_newline():
     assert ENTITY_ID_RE.match("unit:7\n") is None
     assert ENTITY_ID_RE.match("city:8\n") is None
     assert ENTITY_ID_RE.match("unit:7") is not None
+
+
+# ---------------------------------------------------------------------------
+# FW-R2: the CommitmentRecord carries the union of every attempt's
+# memory_update (a repair replaces the executed batch, never an earlier
+# attempt's commitments/threats)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_two_attempt_turn_unions_memory_updates(tmp_path):
+    """A repaired turn's CommitmentRecord carries both attempts'
+    memory_update commitments."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        # Attempt 1 emits a commitment, then an unoffered ref -> repair.
+        ok_response(["unit:99:goto_n"], turn_id="t1",
+                    commitments=[("research", "Alphabet", 3)]),
+        # The repair emits a different commitment.
+        ok_response(["unit:10:goto_e"], turn_id="t1",
+                    commitments=[("expansion", "city:2", 5)]),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = [r for r in _records(runner.ledger.path)
+               if isinstance(r, CommitmentRecord) and r.turn == 1]
+    assert len(records) == 1
+    assert [(c.domain, c.target) for c in records[0].commitments] == [
+        ("research", "Alphabet"), ("expansion", "city:2")]
+
+
+def test_runner_repair_budget_skip_still_ledgers_attempt_memory_update(
+        tmp_path):
+    """FW-R2: the repair-budget-skip path still ledgers attempt 1's
+    memory_update — the fabricated degraded result never hides it."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    clock = FakeClock()
+    client = FakeModelClient([
+        # Attempt 1 burns 165 s of the 180 s ACTING budget: remaining
+        # 15 s sits below the 20 s repair floor -> the repair is skipped.
+        advancing_response(
+            lambda: ok_response(["unit:99:goto_n"], turn_id="t1",
+                                commitments=[("research", "Alphabet", 3)]),
+            clock, seconds=165.0),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = [r for r in _records(runner.ledger.path)
+               if isinstance(r, CommitmentRecord) and r.turn == 1]
+    assert len(records) == 1
+    assert [(c.domain, c.target) for c in records[0].commitments] == [
+        ("research", "Alphabet")]

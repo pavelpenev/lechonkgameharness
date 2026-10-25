@@ -244,6 +244,9 @@ class _IngestResult:
     call_seq: Optional[int] = None  # the model_call record's seq
     why: str = ""  # why the response was unusable (repair/degraded reason)
     degraded: bool = False  # the degraded default applies
+    # FW-R2: every attempt's memory_update for the turn, in attempt order;
+    # _model_phase attaches the shared list to the result it returns.
+    attempt_memory_updates: list = field(default_factory=list)
 
 
 @dataclass
@@ -593,14 +596,26 @@ class GameRunner:
         self._check_acting_deadline(acting_entered)
         self._check_abort()
 
-        # --- memory update (rides the ActionBatch, never a separate call)
-        if result.batch is not None and result.batch.memory_update is not None:
-            update = result.batch.memory_update
-            self.memory.apply(update, turn=turn)
+        # --- memory update (rides the ActionBatch, never a separate call);
+        # FW-R2: the ledger carries the union of every attempt's
+        # memory_update — a repair replaces the executed batch, never a
+        # commitment the model already made this turn
+        updates = result.attempt_memory_updates
+        if updates:
+            self.memory.apply(updates[-1], turn=turn)
+            commitments: list = []
+            threats: list = []
+            for update in updates:
+                for c in update.commitments:
+                    if c not in commitments:
+                        commitments.append(c)
+                for t in update.threats:
+                    if t not in threats:
+                        threats.append(t)
             self._emit(CommitmentRecord(
                 turn=turn,
-                commitments=list(update.commitments),
-                threats=self._threat_mentions(update.threats, turn, snapshot),
+                commitments=commitments,
+                threats=self._threat_mentions(threats, turn, snapshot),
                 call_seq=result.call_seq))
 
         # --- execute ------------------------------------------------------
@@ -752,6 +767,10 @@ class GameRunner:
         """Attempt 1 + at most one repair (≤2 total API attempts, decision
         4). Returns (result, repair_used, why)."""
         run_id = self.config.run_id
+        # FW-R2: every attempt's memory_update, in attempt order — the
+        # turn's CommitmentRecord unions them, so a repair never drops
+        # what an earlier attempt already stated.
+        memory_updates: list = []
         prompt = TurnPrompt(
             call_id=f"{run_id}/t{turn}/call1", turn_id=f"{run_id}/t{turn}",
             memory=self.memory.render_for_prompt(),
@@ -769,6 +788,9 @@ class GameRunner:
             resp, turn=turn, table=table, call_seq=call_seq,
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
             provenance=provenance)
+        if result.batch is not None and result.batch.memory_update is not None:
+            memory_updates.append(result.batch.memory_update)
+        result.attempt_memory_updates = memory_updates
         result.call_seq = call_seq
         result.why = self._why_unusable(resp, result)
 
@@ -792,6 +814,7 @@ class GameRunner:
                        f"the {REPAIR_BUDGET_FLOOR_S:.0f}s repair floor; "
                        f"degraded default applies")))
             result2 = _IngestResult(batch=None, failed=True)
+            result2.attempt_memory_updates = memory_updates
             result2.degraded = True
             why = (f"repair skipped: insufficient ACTING budget "
                    f"({remaining_s:.1f}s remaining < "
@@ -826,6 +849,9 @@ class GameRunner:
             resp2, turn=turn, table=table, call_seq=call_seq2,
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
             provenance=provenance)
+        if result2.batch is not None and result2.batch.memory_update is not None:
+            memory_updates.append(result2.batch.memory_update)
+        result2.attempt_memory_updates = memory_updates
         result2.call_seq = call_seq2
         result2.why = self._why_unusable(resp2, result2)
         # The degraded default applies when the model is unresponsive after
