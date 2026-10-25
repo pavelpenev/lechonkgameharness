@@ -619,8 +619,14 @@ class ActionResultRecord(TranscriptRecordBase):
     Outcomes: ``executed`` (the mutation was sent; ``readback`` carries the
     verification evidence), ``rejected`` (never sent; ``rejection_class``
     carries the illegal-action taxonomy class), ``aborted_group`` (never
-    sent; the entity's group was aborted by an earlier stale/illegal action,
-    §3 line 33).
+    sent; the entity's group was aborted by an earlier stale/illegal
+    action, §3 line 33 — and, W3-2/DEF-2, the ACTING-deadline stop: a
+    planned action the deadline left undispatched, detail "not
+    dispatched: ACTING deadline reached". The reuse of this frozen
+    literal for the deadline case is a deliberate compatibility choice
+    ratified at the plan rev-5 fold (DEF-2); either way the record is a
+    pipeline-side abort, never an attempt — excluded from the
+    attempt/illegal-action accounting).
     """
 
     kind: Literal["action_result"] = "action_result"

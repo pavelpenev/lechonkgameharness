@@ -23,17 +23,22 @@ import pytest
 
 from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import TranscriptLedger, load_transcript
-from lechonk.core.metrics import commitment_board
+from lechonk.core.metrics import commitment_board, compute_metrics
 from lechonk.core.model_client import ModelResponse
 from lechonk.core.runner import (
+    ACTING_DEADLINE_STOP_EVENT,
     ENTITY_ID_RE,
     GameRunner,
     RunState,
     RunnerConfig,
     StallWatchdog,
+    StateDeadlineExceeded,
+    _dispatch_cancelled_payload,
     _dispatch_intent_payload,
+    _dispatch_result_detail,
     _QuarantineFailStop,
     _StandingOrder,
+    _unresolved_dispatch_intents,
     mark_armed_in_contact,
 )
 from lechonk.core.schemas import (
@@ -3247,3 +3252,541 @@ def test_runner_intent_is_the_honest_crash_window_boundary(tmp_path):
     load2 = load_transcript(killed_after)
     assert [r.seq for r in load2.records] == [r.seq for r in load.records]
     assert load2.records[-1].seq == intent.seq
+
+
+# ---------------------------------------------------------------------------
+# W3-2 (D6/D13, DEF-1/DEF-2): stop dispatch at the ACTING deadline with
+# partial-batch accounting — one guard per mutation route
+# ---------------------------------------------------------------------------
+
+
+class _DeadlineStepSession(FakeSession):
+    """A mutation step that consumes a scripted fake-clock interval per
+    send (a slow send/read-back) — the ACTING deadline passes mid-batch
+    while the in-flight send still completes (the D13 straddle)."""
+
+    def __init__(self, worlds, clock, *, step_delays_s):
+        super().__init__(worlds)
+        self._clock = clock
+        self._step_delays_s = list(step_delays_s)
+
+    def step(self, action, *, deadline=None):
+        if action is not None and self._step_delays_s:
+            self._clock.advance(self._step_delays_s.pop(0))
+        return super().step(action, deadline=deadline)
+
+
+class _GameOverSlowStepSession(FakeSession):
+    """The named mutation ends the game (terminated=True) AND consumes a
+    scripted fake-clock interval — the game-over is established while the
+    ACTING deadline also passes (the DEF-1 precedence injection)."""
+
+    def __init__(self, worlds, clock, *, terminate_on, delay_s):
+        super().__init__(worlds)
+        self._clock = clock
+        self._terminate_on = terminate_on
+        self._delay_s = delay_s
+
+    def step(self, action, *, deadline=None):
+        if action is not None and tuple(action) == self._terminate_on:
+            self._clock.advance(self._delay_s)
+            outcome = super().step(action, deadline=deadline)
+            return replace(outcome, terminated=True, truncated=False)
+        return super().step(action, deadline=deadline)
+
+
+class _DeadlineRefreshSession(LifecycleSession):
+    """The reconnect read (refresh) consumes a scripted fake-clock
+    interval — the ACTING deadline passes during the §3 line 35
+    reconciliation, before the verified resubmission's pre-send check
+    (the resend-route stop injection)."""
+
+    def __init__(self, worlds, clock, *, disconnect_on, refresh_delay_s):
+        super().__init__(worlds, disconnect_on=disconnect_on,
+                         effect_applied=False)
+        self._clock = clock
+        self._refresh_delay_s = refresh_delay_s
+
+    def refresh(self):
+        self._clock.advance(self._refresh_delay_s)
+        return super().refresh()
+
+
+def _stop_events(records):
+    return [r for r in records
+            if isinstance(r, MetricEventRecord)
+            and r.name == ACTING_DEADLINE_STOP_EVENT]
+
+
+def _detail_envelope(record):
+    """The dispatch-result/v1 detail envelope of an action_result (None
+    for plain/legacy details)."""
+    try:
+        data = json.loads(record.detail)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _run_mid_batch_deadline_stop(tmp_path):
+    """The W3-2 mid-batch stop scenario (the planned route): a 3-action
+    batch whose sends each consume 100 s of fake time — the first two
+    sends complete (the second straddles the 180 s ACTING deadline,
+    D13), the loop-top guard stops the third. Returns (result, runner,
+    session, records)."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _DeadlineStepSession(worlds, clock,
+                                   step_delays_s=[100.0, 100.0, 100.0])
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e",
+                     "tech:cur_player:research_tech_alphabet_0",
+                     "unit:11:sentry"],
+                    turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    return result, runner, session, _records(runner.ledger.path)
+
+
+def test_runner_acting_deadline_stop_mid_batch(tmp_path):
+    """W3-2 (D6) acceptance (1): the mid-batch deadline stop — earlier
+    actions have executed results, the remaining action gets an
+    aborted_group record + the acting_deadline_stop summary event
+    (correct fields), and the run truncates with the deadline reason."""
+    result, runner, session, records = _run_mid_batch_deadline_stop(tmp_path)
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    actions = _actions(records)
+    executed = [a for a in actions if a.outcome == "executed"]
+    aborted = [a for a in actions if a.outcome == "aborted_group"]
+    # Two sends completed (the second straddled the deadline, D13); the
+    # third action was never dispatched, and no finish primitive ran.
+    assert [a.ref for a in executed] == [
+        "unit:10:goto_e", "tech:cur_player:research_tech_alphabet_0"]
+    assert len([c for c in session.calls if c[0] is not None]) == 2
+    assert not [c for c in session.calls if c[0] is None]
+    # The partial-batch record: the frozen literal, readback "none", the
+    # pinned deadline detail, the batch's provenance linkage.
+    assert [a.ref for a in aborted] == ["unit:11:sentry"]
+    assert aborted[0].readback == "none"
+    assert aborted[0].detail == "not dispatched: ACTING deadline reached"
+    assert aborted[0].provenance_class == "model"
+    assert aborted[0].turn == 1
+    assert aborted[0].call_seq == executed[0].call_seq
+    # The summary event: exactly one, the pinned partial-batch/v1 shape.
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    payload = json.loads(stops[0].value)
+    assert payload == {
+        "protocol": "partial-batch/v1",
+        "turn": 1,
+        "reason": "acting_deadline",
+        "route": "planned",
+        "completed_result_seqs": [executed[0].seq, executed[1].seq],
+        "unresolved_intent_seqs": [],
+        "unstarted_refs": [],
+        "remaining_standing_actors": [],
+    }
+    # The accounting rides after the executed results, before the
+    # run-level metrics/outcome records.
+    assert stops[0].seq > aborted[0].seq > executed[-1].seq
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "TRUNCATED"
+
+
+def test_runner_acting_deadline_stop_reconciles_dispatched(tmp_path):
+    """W3-2 acceptance (7): reconciliation-by-construction — at the
+    deadline stop no dispatched action lacks its result: every
+    dispatch_intent pairs with its correlated action_result (or its
+    cancellation), and the summary's unresolved_intent_seqs is empty."""
+    result, runner, session, records = _run_mid_batch_deadline_stop(tmp_path)
+    intents = _intent_events(records)
+    assert len(intents) == 2  # one per dispatched send
+    correlated = set()
+    for action in _actions(records):
+        envelope = _detail_envelope(action)
+        if envelope is not None \
+                and envelope.get("protocol") == "dispatch-result/v1":
+            correlated.add(envelope["intent_seq"])
+    assert correlated == {i.seq for i in intents}
+    stops = _stop_events(records)
+    assert json.loads(stops[0].value)["unresolved_intent_seqs"] == []
+    assert _unresolved_dispatch_intents(records) == []
+
+
+def test_unresolved_dispatch_intents_scans_by_seq(tmp_path):
+    """The W3-2 stop summary's unresolved_intent_seqs scan: an intent
+    alone is unresolved (the D15 forensic case); a correlated
+    action_result (a dispatch-result/v1 envelope) or a cancellation (a
+    dispatch-cancelled/v1 payload) settles it — by SEQ, never
+    positional."""
+    path = tmp_path / "scan.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1))
+    intent_a = ledger.append(MetricEventRecord(
+        name="dispatch_intent",
+        value=_dispatch_intent_payload(
+            turn=1, ref=GOTO_REF, call_seq=None, snapshot_seq=0,
+            candidates_seq=0, provenance="model")))
+    intent_b = ledger.append(MetricEventRecord(
+        name="dispatch_intent",
+        value=_dispatch_intent_payload(
+            turn=1, ref="unit:11:sentry", call_seq=None, snapshot_seq=0,
+            candidates_seq=0, provenance="model")))
+    ledger.close()
+    # Both intents alone: unresolved (the forensic crash-window case).
+    assert _unresolved_dispatch_intents(_records(path)) == [intent_a,
+                                                             intent_b]
+    # A cancellation settles intent_b; a correlated result settles
+    # intent_a — each by its OWN seq.
+    ledger = TranscriptLedger.attach(path)
+    ledger.append(MetricEventRecord(
+        name="mutation_dispatch_cancelled",
+        value=_dispatch_cancelled_payload(
+            intent_seq=intent_b, reason="ACTING deadline reached", turn=1,
+            ref="unit:11:sentry", call_seq=None, snapshot_seq=0,
+            candidates_seq=0, provenance="model")))
+    ledger.append(ActionResultRecord(
+        turn=1, ref=GOTO_REF, domain="unit", verb="goto_e",
+        outcome="executed", provenance_class="model", readback="verified",
+        detail=_dispatch_result_detail(intent_a, "sent")))
+    ledger.close()
+    assert _unresolved_dispatch_intents(_records(path)) == []
+
+
+def test_runner_acting_deadline_aborted_group_excluded_from_metrics(tmp_path):
+    """W3-2/DEF-2 acceptance (8): the deadline aborted_group records are
+    excluded from the attempt/illegal-action accounting and never count
+    as model participation — they are pipeline-side aborts, not
+    attempts (metrics._is_attempt gates on the outcome)."""
+    result, runner, session, records = _run_mid_batch_deadline_stop(tmp_path)
+    aborted = [a for a in _actions(records) if a.outcome == "aborted_group"]
+    assert len(aborted) == 1 and aborted[0].provenance_class == "model"
+    # The two executed model actions are the attempts; the deadline
+    # aborted_group is not.
+    assert result.metrics.illegal_attempts_total == 2
+    # Participation: one turn with opportunities, one with a credited
+    # model execution — the aborted_group never credits.
+    assert result.metrics.participation.numerator == 1
+    assert result.metrics.participation.denominator == 1
+    # The direct pin over the stopped transcript.
+    report = compute_metrics(records)
+    attempts = [a for a in _actions(records)
+                if a.provenance_class == "model"
+                and a.outcome in ("executed", "rejected")]
+    assert report.illegal_attempts_total == len(attempts) == 2
+
+
+def test_runner_acting_deadline_stop_degraded_between_groups(tmp_path):
+    """W3-2 acceptance (2a): the degraded route stops between groups —
+    the first defaulted group's send straddles the deadline and
+    completes (D13); the next group's re-entry into _execute_planned
+    stops at its loop-top guard: its action gets the deadline
+    aborted_group record and was never sent."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _DeadlineStepSession(worlds, clock, step_delays_s=[190.0])
+    client = FakeModelClient([
+        error_response("timeout 1"),
+        error_response("timeout 2"),  # the repair also fails -> degraded
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    defaults = [a for a in actions if a.provenance_class == "scripted_default"]
+    executed = [a for a in defaults if a.outcome == "executed"]
+    aborted = [a for a in defaults if a.outcome == "aborted_group"]
+    # The first group (the research pick) straddled and completed; the
+    # second group (the city production pick) was never dispatched.
+    assert [a.domain for a in executed] == ["tech"]
+    assert [a.domain for a in aborted] == ["city"]
+    assert aborted[0].readback == "none"
+    assert aborted[0].detail == "not dispatched: ACTING deadline reached"
+    assert len([c for c in session.calls if c[0] is not None]) == 1
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    payload = json.loads(stops[0].value)
+    assert payload["protocol"] == "partial-batch/v1"
+    assert payload["turn"] == 1
+    assert payload["reason"] == "acting_deadline"
+    assert payload["route"] == "degraded"
+    assert payload["completed_result_seqs"] == [executed[0].seq]
+    assert payload["unstarted_refs"] == []
+    assert payload["unresolved_intent_seqs"] == []
+
+
+def test_runner_acting_deadline_stop_degraded_unstarted_groups(tmp_path):
+    """W3-2 acceptance (2b): the degraded route's unstarted groups —
+    with the deadline already reached, the FIRST group's loop-top guard
+    stops before any send: its action gets the aborted_group record and
+    the later groups' refs ride in the summary's unstarted_refs."""
+    worlds = [turn_world(1), turn_world(2)]
+    clock = FakeClock()
+    session = _DeadlineStepSession(worlds, clock, step_delays_s=[])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1, clock=clock)
+    adapter = runner._load_adapter()
+    runner._session = session  # direct-call tests: run() never ran
+    # The deadline is already reached at the degraded route's entry.
+    runner._acting_deadline_at = clock() - 1.0
+    snapshot = _fixture_snapshot(session)
+    table = session.build_candidate_table()
+    # Premise: the degraded default resolves both mandatory choices
+    # (research completed + city production empty) — two groups.
+    from lechonk.comparator import defaults as defaults_mod
+    log = defaults_mod.decide(snapshot, table.offered())
+    assert [d.domain for d in log.decisions] == ["tech", "city"]
+
+    with pytest.raises(StateDeadlineExceeded):
+        runner._execute_degraded(
+            adapter, turn=1, table=table, snapshot=snapshot,
+            snapshot_seq=0, candidates_seq=0, why="test: degraded")
+    # No send at all: the guard fired before the first group's dispatch.
+    assert session.calls == []
+    records = _records(runner.ledger.path)
+    aborted = [a for a in _actions(records) if a.outcome == "aborted_group"]
+    assert [a.domain for a in aborted] == ["tech"]
+    assert aborted[0].detail == "not dispatched: ACTING deadline reached"
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    payload = json.loads(stops[0].value)
+    assert payload["route"] == "degraded"
+    assert payload["completed_result_seqs"] == []
+    # The later (unstarted) group's ref rides in the summary.
+    city_decision = [d for d in log.decisions if d.domain == "city"][0]
+    assert payload["unstarted_refs"] == [city_decision.candidate_id]
+    assert payload["unresolved_intent_seqs"] == []
+
+
+def test_runner_acting_deadline_stop_skips_standing_order(tmp_path):
+    """W3-2 acceptance (3): the standing-order re-issue is skipped by
+    the guard — turn 1 stores two standing orders (its sends consume no
+    fake time); turn 2's first continuation straddles the deadline and
+    completes (D13), the second continuation's guard stops the loop:
+    its re-issue is never dispatched and the summary reports it as a
+    remaining standing actor."""
+    worlds = [
+        turn_world(1),
+        turn_world(2, unit_overrides=[(10, {"activity": 0}),
+                                      (11, {"activity": 0})]),
+        turn_world(3),
+    ]
+    clock = FakeClock()
+    session = _DeadlineStepSession(
+        worlds, clock, step_delays_s=[0.0, 0.0, 190.0])
+    client = FakeModelClient([
+        ok_response(["unit:10:sentry", "unit:11:sentry"],
+                    turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),  # responsive empty
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    continuations = [a for a in actions
+                     if a.provenance_class == "continued_model_order"]
+    # Only unit 10's continuation was dispatched (it straddled the
+    # deadline and completed); unit 11's re-issue was skipped by the
+    # guard — its send never happened.
+    assert [a.ref for a in continuations] == ["unit:10:sentry"]
+    assert continuations[0].outcome == "executed"
+    assert continuations[0].readback == "verified"
+    assert continuations[0].turn == 2
+    sends = [c for c in session.calls if c[0] is not None]
+    assert len(sends) == 3  # 2 turn-1 model orders + 1 continuation
+    assert len([c for c in sends if c[0] == ("unit", 11, "sentry")]) == 1
+    # No deadline aborted_group records: standing orders are reported
+    # via the summary's remaining_standing_actors, not per-action
+    # records.
+    assert not [a for a in actions if a.outcome == "aborted_group"]
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    payload = json.loads(stops[0].value)
+    assert payload["route"] == "standing"
+    assert payload["turn"] == 2
+    assert payload["reason"] == "acting_deadline"
+    assert payload["protocol"] == "partial-batch/v1"
+    assert payload["completed_result_seqs"] == [continuations[0].seq]
+    assert payload["unstarted_refs"] == []
+    assert payload["remaining_standing_actors"] == ["11"]
+    assert payload["unresolved_intent_seqs"] == []
+
+
+def test_runner_acting_deadline_stop_blocks_verified_resend(tmp_path):
+    """W3-2 acceptance (4): the verified resend is never dispatched past
+    the deadline — the ACTING deadline passes during the §3 line 35
+    reconciliation (the reconnect read); W3-1's pre-send check at the
+    resend site blocks the resubmission (verified: no loop-level guard
+    needed — the resend site's own pre-send check is the authority), and
+    the run truncates with the deadline reason."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _DeadlineRefreshSession(worlds, clock,
+                                      disconnect_on=GOTO_ACTION,
+                                      refresh_delay_s=200.0)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    records = _records(runner.ledger.path)
+    # The original dispatch was sent exactly once; the resubmission was
+    # never dispatched (blocked at the resend site's FIRST pre-send
+    # check — no resend intent was even written, no cancellation).
+    assert len([c for c in session.calls if c[0] == GOTO_ACTION]) == 1
+    intents = _intent_events(records)
+    assert len(intents) == 1  # only the original dispatch's intent
+    cancels = [r for r in records
+               if isinstance(r, MetricEventRecord)
+               and r.name == "mutation_dispatch_cancelled"]
+    assert cancels == []
+    # The uncertain attempt is ledgered and correlated to its intent
+    # (the W3-1 contract: the send's fate is durably recorded).
+    uncertain = [a for a in _actions(records) if a.ref == GOTO_REF]
+    assert len(uncertain) == 1
+    assert uncertain[0].readback == "inconclusive"
+    envelope = json.loads(uncertain[0].detail)
+    assert envelope["protocol"] == "dispatch-result/v1"
+    assert envelope["intent_seq"] == intents[0].seq
+    # The stop here is W3-1's pre-send authority inside _execute_one
+    # (the final authority), not a loop guard: the loop-level
+    # partial-batch accounting is the loop guards' contract, and this
+    # single-action batch leaves nothing unrecorded.
+    assert _stop_events(records) == []
+    assert not [a for a in _actions(records) if a.outcome == "aborted_group"]
+    assert _unresolved_dispatch_intents(records) == []
+
+
+def test_runner_acting_deadline_in_flight_send_keeps_full_budget(tmp_path):
+    """W3-2/D13 acceptance (5): an in-flight send that started before
+    the deadline keeps its FULL 30 s mutation deadline (never bounded by
+    the remaining ACTING time) and completes with its result; the NEXT
+    loop iteration stops. The documented ACTING overshoot (up to one
+    mutation deadline) is expected."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _DeadlineStepSession(worlds, clock, step_delays_s=[190.0])
+    client = FakeModelClient([
+        ok_response([GOTO_REF, "unit:11:sentry"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    # The straddling send was dispatched with the FULL mutation
+    # deadline (30 s), not the remaining ACTING time (D13: no
+    # min(remaining) bounding — explicitly not adopted).
+    assert [c[1] for c in session.calls] == [30.0]
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    executed = [a for a in actions if a.outcome == "executed"]
+    # The straddling send completed with its result...
+    assert [a.ref for a in executed] == [GOTO_REF]
+    assert executed[0].readback == "verified"
+    # ...and the next iteration stopped: the second action was never
+    # dispatched and carries the deadline aborted_group record.
+    aborted = [a for a in actions if a.outcome == "aborted_group"]
+    assert [a.ref for a in aborted] == ["unit:11:sentry"]
+    assert aborted[0].detail == "not dispatched: ACTING deadline reached"
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    payload = json.loads(stops[0].value)
+    assert payload["route"] == "planned"
+    assert payload["completed_result_seqs"] == [executed[0].seq]
+    assert payload["unresolved_intent_seqs"] == []
+
+
+def test_runner_acting_deadline_game_over_wins(tmp_path):
+    """W3-2/DEF-1 acceptance (6): an ALREADY-ESTABLISHED game-over wins
+    over a newly-noticed deadline expiry — the batch's first action ends
+    the game (terminated) while its send also carries the ACTING
+    deadline past: the outcome flows through the game-over path
+    (VICTORY), never a deadline truncation, and no acting_deadline_stop
+    is emitted."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _GameOverSlowStepSession(
+        worlds, clock, terminate_on=GOTO_ACTION, delay_s=200.0)
+    client = FakeModelClient([
+        ok_response([GOTO_REF, "unit:11:sentry"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    # The game-over outcome, NOT a deadline truncation.
+    assert result.outcome == "VICTORY"
+    assert "game over mid-batch" in result.reason
+    records = _records(runner.ledger.path)
+    # No deadline stop was emitted: the established termination won.
+    assert _stop_events(records) == []
+    actions = _actions(records)
+    # The remaining planned action was aborted by the GAME-OVER path
+    # (the W2-4 mid-batch handling), not by the deadline.
+    aborted = [a for a in actions if a.outcome == "aborted_group"]
+    assert [a.ref for a in aborted] == ["unit:11:sentry"]
+    assert aborted[0].detail == "game ended mid-batch"
+
+
+def test_runner_acting_deadline_guard_fires_at_exact_deadline(tmp_path):
+    """W3-2 (the single >= convention): exact equality with the ACTING
+    deadline means NO send — the loop-top guard fires when
+    clock() >= _acting_deadline_at (the first send consumes exactly the
+    180 s budget; the second action is stopped, never dispatched)."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _DeadlineStepSession(worlds, clock, step_delays_s=[180.0])
+    client = FakeModelClient([
+        ok_response([GOTO_REF, "unit:11:sentry"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    # The first send completed (in-flight, D13); at exactly the
+    # deadline the guard stops the second action.
+    assert len([c for c in session.calls if c[0] is not None]) == 1
+    records = _records(runner.ledger.path)
+    aborted = [a for a in _actions(records) if a.outcome == "aborted_group"]
+    assert [a.ref for a in aborted] == ["unit:11:sentry"]
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    assert json.loads(stops[0].value)["route"] == "planned"
+
+
+def test_runner_acting_deadline_phase_check_fires_at_exact_deadline(tmp_path):
+    """W3-2 (the single >= convention at the phase check): a model call
+    consuming EXACTLY the 180 s ACTING budget trips the post-model-phase
+    deadline check (clock() - acting_entered >= acting_deadline_s) —
+    the run truncates with the deadline reason."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        advancing_response(
+            lambda: ok_response([], turn_id="t1", with_memory=False),
+            clock, seconds=180.0),  # exactly the ACTING deadline
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    # Nothing was dispatched: the phase check fired before execution.
+    assert session.calls == []

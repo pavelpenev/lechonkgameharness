@@ -834,3 +834,98 @@ def test_viewer_separates_operational_events_from_aggregate_metrics(tmp_path):
     assert "mutation_dispatch_cancelled" not in aggregate_names
     assert "state_transition" not in aggregate_names
     assert "some_legacy_event" not in aggregate_names
+
+
+def _metrics_panel_tables(tree, heading_prefix):
+    """The tables rendered under the h3 headings whose text starts with
+    ``heading_prefix`` in the viewer's dumped metrics panel:
+    [{heading, rows: [[cell, ...], ...]}]."""
+    found = []
+    current = None
+
+    def walk(n):
+        nonlocal current
+        if not isinstance(n, dict):
+            return
+        if n.get("tag") == "h3":
+            current = n.get("text")
+        elif n.get("tag") == "table" and current is not None:
+            rows = []
+            for tr in n.get("children") or []:
+                if not isinstance(tr, dict) or tr.get("tag") != "tr":
+                    continue
+                rows.append([c.get("text")
+                             for c in (tr.get("children") or [])
+                             if isinstance(c, dict)])
+            found.append({"heading": current, "rows": rows})
+            current = None
+        for c in (n.get("children") or []):
+            walk(c)
+
+    walk(tree)
+    return [t for t in found
+            if t["heading"] and t["heading"].startswith(heading_prefix)]
+
+
+def test_viewer_acting_deadline_stop_renders_as_diagnostics(tmp_path):
+    """W3-2 viewer obligation: the acting_deadline_stop summary event is
+    an operational protocol event — the viewer's aggregate-metric
+    filter never registers it, so it renders in the diagnostics table,
+    never as an aggregate (the W3-1 filter already sends unknown names
+    to diagnostics; this pins the W3-2 name explicitly)."""
+    path = tmp_path / "w3-2-transcript.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(RunManifestRecord(manifest=RunManifest(run_id="w3-2-run")))
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(MetricEventRecord(name="participation", value=1.0))
+    ledger.append(MetricEventRecord(
+        name="acting_deadline_stop",
+        value=('{"completed_result_seqs":[4],"protocol":"partial-batch/v1",'
+               '"reason":"acting_deadline","remaining_standing_actors":[],'
+               '"route":"planned","turn":1,"unresolved_intent_seqs":[],'
+               '"unstarted_refs":["unit:11:sentry"]}')))
+    ledger.append(OutcomeRecord(
+        outcome="TRUNCATED",
+        reason="infrastructure deadline exceeded: state ACTING exceeded "
+               "its deadline of 180.0s (artifacts intact)"))
+    ledger.close()
+    out = tmp_path / "w3-2-replay"
+    replay.render_bundle(path, out)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    script = _viewer_main_script(html)
+    # structural pin: the stop event's name is never registered as an
+    # aggregate (neither the names list nor the prefixes special-case
+    # it), so the filter classifies it as a diagnostic.
+    assert "isAggregateMetric" in script
+    assert '"acting_deadline_stop"' not in script
+    # behavioral: execute the viewer JS under node and read the metrics
+    # panel's tables (skipped when node is absent — the structural pin
+    # above still runs).
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available to execute the viewer JS")
+    blocks = {bid: _script_block(html, bid)
+              for bid in ("lechonk-meta", "lechonk-turns",
+                          "lechonk-commitments", "lechonk-transcript")}
+    blocks_path = tmp_path / "viewer-blocks.json"
+    blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+    script_path = tmp_path / "viewer-main.js"
+    script_path.write_text(script, encoding="utf-8")
+    driver_path = tmp_path / "viewer-tables.js"
+    driver_path.write_text(_VIEWER_TABLES_DRIVER, encoding="utf-8")
+    proc = subprocess.run(
+        [node, str(driver_path), str(blocks_path), str(script_path)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"viewer JS failed under node: {proc.stderr}"
+    tree = json.loads(proc.stdout)
+    aggregates = _metrics_panel_tables(tree, "aggregate metrics")
+    assert len(aggregates) == 1
+    assert [r[0] for r in aggregates[0]["rows"][1:]] == ["participation"]
+    diagnostics = _metrics_panel_tables(tree, "operational events")
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["rows"][0] == ["event", "value"]
+    assert [r[0] for r in diagnostics[0]["rows"][1:]] == [
+        "acting_deadline_stop"]
+    # The stop event never appears in the aggregate table.
+    aggregate_names = {r[0] for r in aggregates[0]["rows"]}
+    assert "acting_deadline_stop" not in aggregate_names

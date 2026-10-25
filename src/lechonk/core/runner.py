@@ -105,11 +105,36 @@ legacy detail strings remain valid). An intent with neither a correlated
 result nor a cancellation (a crash inside the dispatch window) is FORENSIC
 ONLY (D15): the P11 audit's pending-intent scanner reports it; the runner
 never refuses or quarantines on it.
+
+W3-2 stop-at-deadline (D6/D13, DEF-1/DEF-2): every mutation route stops
+initiating dispatches at the ACTING deadline. The planned batch guards
+the TOP of each _execute_planned loop iteration — before _execute_one's
+intent write, so a NEW mutation is never dispatched after the deadline
+(the W3-1 pre-send check inside _execute_one remains the final
+authority); the degraded defaults are covered by each group's re-entry
+into _execute_planned; the standing-order continuation guards before
+each _execute_one; the verified resend is covered by W3-1's pre-send
+check at the resend site (verified: no gap). When a loop guard finds the
+deadline reached it emits the partial-batch accounting — one
+aborted_group action_result per planned-but-undispatched action
+(readback "none", detail "not dispatched: ACTING deadline reached") plus
+ONE "acting_deadline_stop" summary metric event (a partial-batch/v1
+canonical-JSON payload) — and raises StateDeadlineExceeded(ACTING); the
+run-level handler truncates with artifacts. An in-flight send keeps its
+FULL mutation deadline (D13: never bounded by the remaining ACTING
+time), so the documented ACTING overshoot of up to one mutation
+deadline is expected. A session timeout marks the session failed but
+does NOT cancel an in-flight worker operation — a timeout is not
+transport cancellation. An ALREADY-ESTABLISHED game-over wins over a
+newly-noticed deadline expiry (DEF-1). ONE comparison convention (>=
+— the deadline is reached when clock() >= the deadline) is pinned across
+the guards and the phase checks.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import threading
 import time
@@ -253,6 +278,69 @@ def _dispatch_result_detail(intent_seq: int, message: str) -> str:
         "intent_seq": intent_seq,
         "message": message,
     })
+
+
+# --- W3-2 stop-at-deadline protocol (D6/D13, DEF-1/DEF-2) ----------------------
+# The loop-level ACTING-deadline guards stop every mutation route at the
+# deadline; the stop's partial-batch accounting is one aborted_group
+# action_result per planned-but-undispatched action (the DEF-2
+# compatibility extension of the frozen literal) plus ONE summary metric
+# event (a partial-batch/v1 canonical-JSON payload — no schema change,
+# no freeze amendment; the viewer's operational-event filter renders it
+# as a diagnostic, never an aggregate).
+ACTING_DEADLINE_STOP_EVENT = "acting_deadline_stop"
+PARTIAL_BATCH_PROTOCOL = "partial-batch/v1"
+
+
+def _json_object(value: Any) -> Optional[dict]:
+    """The parsed JSON object behind a metric event's value or an
+    action_result's detail (None when it is not a JSON object)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _unresolved_dispatch_intents(records: Sequence[Any]) -> list[int]:
+    """The W3-2 stop summary's unresolved_intent_seqs: the seqs of
+    dispatch_intent metric events with neither a correlated
+    action_result (a dispatch-result/v1 detail envelope carrying the
+    intent's seq) nor a cancellation (a dispatch-cancelled/v1 payload
+    carrying it). The correlation is BY SEQ, never positional (the same
+    semantics as the P11 audit's pending-intent scanner — a crash inside
+    the dispatch window leaves the intent forensic-only, D15; the runner
+    reports it in the stop summary, never refuses on it)."""
+    intents: set[int] = set()
+    settled: set[int] = set()
+
+    def _intent_seq(data: dict) -> Optional[int]:
+        seq = data.get("intent_seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            return seq
+        return None
+
+    for rec in records:
+        if isinstance(rec, MetricEventRecord):
+            if rec.name == DISPATCH_INTENT_EVENT:
+                intents.add(rec.seq)
+            elif rec.name == DISPATCH_CANCELLED_EVENT:
+                payload = _json_object(rec.value)
+                if payload is not None and payload.get("protocol") \
+                        == DISPATCH_CANCELLED_PROTOCOL:
+                    seq = _intent_seq(payload)
+                    if seq is not None:
+                        settled.add(seq)
+        elif isinstance(rec, ActionResultRecord):
+            envelope = _json_object(rec.detail)
+            if envelope is not None and envelope.get("protocol") \
+                    == DISPATCH_RESULT_PROTOCOL:
+                seq = _intent_seq(envelope)
+                if seq is not None:
+                    settled.add(seq)
+    return sorted(intents - settled)
 
 
 class RunState(str, Enum):
@@ -680,9 +768,104 @@ class GameRunner:
         return self._game_over is not None
 
     def _check_acting_deadline(self, acting_entered: float) -> None:
-        if self._clock() - acting_entered > self.config.acting_deadline_s:
+        """The phase-level ACTING check (its finish-boundary call site
+        guards leaving ACTING before the finish primitive). The single
+        >= convention: the deadline is reached when
+        clock() >= acting_entered + acting_deadline_s — the same instant
+        _transition(ACTING) published as _acting_deadline_at. DEF-1: an
+        ALREADY-ESTABLISHED game-over wins over a newly-noticed deadline
+        expiry — when _game_over is set the check does not raise; the
+        game-over path handles the outcome (mirrors
+        _dispatch_block_reason's ordering)."""
+        if self._game_over is not None:
+            return
+        if self._clock() - acting_entered >= self.config.acting_deadline_s:
             raise StateDeadlineExceeded(
                 RunState.ACTING, self.config.acting_deadline_s)
+
+    def _acting_deadline_reached(self) -> bool:
+        """True when the ACTING deadline is reached — the single >=
+        convention (clock() >= _acting_deadline_at, W3-3's single
+        source) — and no game-over is established. DEF-1: an
+        ALREADY-ESTABLISHED game-over wins over a newly-noticed
+        deadline expiry (mirrors _dispatch_block_reason's ordering)."""
+        if self._game_over is not None:
+            return False
+        deadline = self._acting_deadline_at
+        return deadline is not None and self._clock() >= deadline
+
+    def _emit_acting_deadline_stop(self, *, route: str, turn: int,
+                                   remaining: Sequence[_PlannedAction],
+                                   completed_result_seqs: Sequence[int],
+                                   unstarted_refs: Sequence[str],
+                                   provenance: str,
+                                   call_seq: Optional[int],
+                                   snapshot_seq: int,
+                                   candidates_seq: int) -> None:
+        """The W3-2 partial-batch accounting (D6, DEF-2): one
+        aborted_group action_result per planned-but-undispatched action
+        (readback "none", detail "not dispatched: ACTING deadline
+        reached" — the DEF-2 compatibility extension of the frozen
+        literal, amended openly in schemas.py), then ONE summary metric
+        event "acting_deadline_stop" (a partial-batch/v1
+        canonical-JSON payload: protocol, turn, reason, route, the
+        completed result seqs, the unresolved dispatch-intent seqs, the
+        unstarted refs and the remaining standing actors)."""
+        for action in remaining:
+            self._emit_aborted_group(
+                turn=turn, cand=action.candidate, provenance=provenance,
+                call_seq=call_seq, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq,
+                detail="not dispatched: ACTING deadline reached")
+        self._emit(MetricEventRecord(
+            name=ACTING_DEADLINE_STOP_EVENT,
+            value=canonical_json({
+                "protocol": PARTIAL_BATCH_PROTOCOL,
+                "turn": turn,
+                "reason": "acting_deadline",
+                "route": route,
+                "completed_result_seqs": list(completed_result_seqs),
+                "unresolved_intent_seqs": _unresolved_dispatch_intents(
+                    self.ledger.records()),
+                "unstarted_refs": list(unstarted_refs),
+                "remaining_standing_actors": sorted(
+                    actor for actor, order in self._standing.items()
+                    if not order.reissued),
+            })))
+
+    def _acting_deadline_guard(self, *, route: str, turn: int,
+                               remaining: Sequence[_PlannedAction],
+                               completed_result_seqs: Sequence[int],
+                               unstarted_refs: Sequence[str] = (),
+                               provenance: str,
+                               call_seq: Optional[int],
+                               snapshot_seq: int,
+                               candidates_seq: int) -> None:
+        """The W3-2 loop-level ACTING-deadline guard (D6/D13). Called at
+        the top of each mutation-route loop iteration, BEFORE
+        _execute_one's intent write (the ORDER INVARIANT: never dispatch
+        a NEW mutation after the deadline; the W3-1 pre-send check
+        inside _execute_one remains the final authority). When the
+        deadline is reached: emit the partial-batch accounting, then
+        raise StateDeadlineExceeded(ACTING) — the existing run-level
+        handler truncates with artifacts. D13: an in-flight send keeps
+        its FULL mutation deadline (never bounded by the remaining
+        ACTING time), so the documented ACTING overshoot of up to one
+        mutation deadline is expected. A session timeout marks the
+        session failed but does NOT cancel an in-flight worker
+        operation — a timeout is not transport cancellation (the
+        supervision deadline ends the RUN, never the server-side
+        mutation)."""
+        if not self._acting_deadline_reached():
+            return
+        self._emit_acting_deadline_stop(
+            route=route, turn=turn, remaining=remaining,
+            completed_result_seqs=completed_result_seqs,
+            unstarted_refs=unstarted_refs, provenance=provenance,
+            call_seq=call_seq, snapshot_seq=snapshot_seq,
+            candidates_seq=candidates_seq)
+        raise StateDeadlineExceeded(
+            RunState.ACTING, self.config.acting_deadline_s)
 
     # ------------------------------------------------------------------
     # run
@@ -992,7 +1175,9 @@ class GameRunner:
         self._transition(RunState.WAITING)
         finish = adapter.execute.finish_phase(
             self._session, deadline=self.config.waiting_deadline_s)
-        if self._clock() - self._state_entered > self.config.waiting_deadline_s:
+        # The single >= convention (the phase checks share it with the
+        # W3-2 guards and _check_acting_deadline).
+        if self._clock() - self._state_entered >= self.config.waiting_deadline_s:
             raise StateDeadlineExceeded(
                 RunState.WAITING, self.config.waiting_deadline_s)
         self.memory.advance(turn)
@@ -1334,20 +1519,45 @@ class GameRunner:
                          planned: Sequence[_PlannedAction],
                          table: CandidateTable, provenance: str,
                          call_seq: Optional[int], snapshot_seq: int,
-                         candidates_seq: int, reason: str = ""
+                         candidates_seq: int, reason: str = "",
+                         route: str = "planned",
+                         unstarted_refs: Sequence[str] = (),
+                         completed_result_seqs: Optional[list[int]] = None
                          ) -> set[str]:
         """Execute planned actions sequentially with per-action read-back
         verification. After each executed mutation the remaining actions
         are revalidated against refreshed state; a stale or illegal action
         aborts only that entity's remaining group (logged rejected /
         aborted_group); other entities proceed; the turn is never aborted.
-        Returns the set of actor IDs acted for."""
+        Returns the set of actor IDs acted for.
+
+        W3-2 (D6/D13): the loop-top ACTING-deadline guard runs at the top
+        of every iteration, BEFORE _execute_one's intent write (never
+        dispatch a NEW mutation after the deadline). The degraded route
+        re-enters this loop per group (route="degraded", the later
+        groups' refs carried as unstarted_refs, and the batch-level
+        completed_result_seqs accumulator shared across the groups); the
+        guard's accounting covers the batch's planned-but-undispatched
+        actions."""
         remaining = list(planned)
         aborted_actors: set[str] = set()
         acted_actors: set[str] = set()
         executed_any = False
+        # The batch's action_result seqs so far (shared across the
+        # degraded route's groups when the caller passes its own list).
+        completed_seqs = (completed_result_seqs
+                           if completed_result_seqs is not None else [])
         while remaining:
             self._check_abort()
+            # W3-2 (D6/D13): the loop-top guard — before _execute_one's
+            # intent write (the ORDER INVARIANT); the W3-1 pre-send check
+            # inside _execute_one remains the final authority.
+            self._acting_deadline_guard(
+                route=route, turn=turn, remaining=remaining,
+                completed_result_seqs=completed_seqs,
+                unstarted_refs=unstarted_refs, provenance=provenance,
+                call_seq=call_seq, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq)
             planned_action = remaining[0]
             ref, cand = planned_action.ref, planned_action.candidate
             actor = cand.actor_id
@@ -1381,6 +1591,7 @@ class GameRunner:
                 adapter, cand, turn=turn, provenance=provenance,
                 call_seq=call_seq, snapshot_seq=snapshot_seq,
                 candidates_seq=candidates_seq, reason=reason)
+            completed_seqs.append(seq)
             readback = result.readback.status
             executed_any = True
             remaining.pop(0)
@@ -1413,7 +1624,13 @@ class GameRunner:
         """The degraded default (§3 line 44): the model is unresponsive
         after the repair cap → comparator/defaults.decide, logged
         scripted_default with reason. Selects from the OFFERED (capped)
-        set so both arms act with identical capability (W2-1)."""
+        set so both arms act with identical capability (W2-1).
+
+        W3-2 (D6/D13): the degraded route needs no guard of its own —
+        each group re-enters _execute_planned, whose loop-top guard
+        stops the next group before any dispatch (verified at HEAD: the
+        group loop only calls _execute_planned). The later groups' refs
+        ride into the stop summary as unstarted_refs."""
         offered = table.offered()
         log = defaults_mod.decide(snapshot, offered)
         planned: list[_PlannedAction] = []
@@ -1429,6 +1646,9 @@ class GameRunner:
         # own reason); the group semantics still apply per entity.
         acted: set[str] = set()
         remaining = list(planned)
+        # W3-2: the degraded batch's action_result seqs so far — shared
+        # across the groups so a stop summary reports the WHOLE batch.
+        completed_seqs: list[int] = []
         while remaining:
             if self._terminated():
                 # W2-4: the game ended mid-group — no further group is
@@ -1443,7 +1663,10 @@ class GameRunner:
                 adapter, turn=turn, planned=group, table=table,
                 provenance="scripted_default", call_seq=None,
                 snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
-                reason=reasons.get(group[0].ref, why))
+                reason=reasons.get(group[0].ref, why),
+                route="degraded",
+                unstarted_refs=[a.ref for a in remaining[len(group):]],
+                completed_result_seqs=completed_seqs)
             acted |= executed
             del remaining[:len(group)]
         return acted
@@ -1971,8 +2194,14 @@ class GameRunner:
         non-execution, §3 line 32). The re-issue resolves against the
         OFFERED (capped) candidate set (W2-1): a cap-elided ref is a lookup
         miss — re-resolve within the offered set or drop; never a
-        state_fog_error and never executed from the uncapped table."""
+        state_fog_error and never executed from the uncapped table.
+
+        W3-2 (D6/D13): the loop-level guard runs before each _execute_one
+        — a standing-order re-issue is never dispatched after the ACTING
+        deadline (the stop summary reports the outstanding orders as
+        remaining_standing_actors, never as per-action records)."""
         offered = table.offered()
+        completed_seqs: list[int] = []
         for actor in sorted(self._standing):
             self._check_abort()
             standing = self._standing[actor]
@@ -1994,13 +2223,22 @@ class GameRunner:
             if cand is None:
                 del self._standing[actor]
                 continue
-            result, _seq = self._execute_one(
+            # W3-2 (D6/D13): the guard — before each _execute_one in the
+            # continuation loop (a re-issue is never dispatched after the
+            # deadline).
+            self._acting_deadline_guard(
+                route="standing", turn=turn, remaining=(),
+                completed_result_seqs=completed_seqs,
+                provenance="continued_model_order", call_seq=None,
+                snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
+            result, seq = self._execute_one(
                 adapter, cand, turn=turn,
                 provenance="continued_model_order", call_seq=None,
                 snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
                 reason="pipeline continuation of a model-originated order "
                        "(linked to its origin)",
                 origin_seq=standing.origin_seq)
+            completed_seqs.append(seq)
             readback = result.readback.status
             standing.reissued = True
             if readback == adapter.execute.CONTRADICTED:
