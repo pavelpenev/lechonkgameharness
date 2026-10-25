@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import inspect
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
 from lechonk.core.metrics import commitment_board
 from lechonk.core.model_client import ModelResponse
-from lechonk.core.runner import ENTITY_ID_RE
+from lechonk.core.runner import ENTITY_ID_RE, GameRunner
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
@@ -1756,3 +1757,57 @@ def test_runner_prompt_budget_exceeded_bounded_fail_stop(tmp_path):
     # Bounded: the failed turn never reached a model_call record.
     assert _by_kind(records, ModelCallRecord) == []
     assert session.closed
+
+
+# ---------------------------------------------------------------------------
+# W1-4: reason accounting — no "no actions" on success; dead origin_seqs gone
+# ---------------------------------------------------------------------------
+
+
+def test_runner_successful_batch_carries_no_misleading_reason(tmp_path):
+    """W1-4: a successful planned batch's executed action_results carry no
+    reason ("" — the record default); "no actions" is never ledgered for a
+    response whose actions were planned and executed."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    executed = [a for a in _actions(records) if a.outcome == "executed"]
+    assert {a.ref for a in executed} == {"unit:10:goto_e"}
+    assert all(a.provenance_class == "model" for a in executed)
+    assert all(a.reason == "" for a in executed)
+    assert all(a.reason != "no actions" for a in executed)
+
+
+def test_runner_why_unusable_success_and_empty_batch(tmp_path):
+    """W1-4: _why_unusable returns "" for a usable response (planned
+    actions) and "no actions" only for a genuinely empty batch."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    table = session.build_candidate_table()
+    resp_ok = ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False)
+    result_ok = runner._ingest(resp_ok, turn=1, table=table, call_seq=0,
+                               snapshot_seq=0, candidates_seq=0)
+    assert result_ok.planned
+    assert runner._why_unusable(resp_ok, result_ok) == ""
+    resp_empty = ok_response([], turn_id="t1", with_memory=False)
+    result_empty = runner._ingest(resp_empty, turn=1, table=table,
+                                  call_seq=0, snapshot_seq=0, candidates_seq=0)
+    assert not result_empty.planned
+    assert not result_empty.batch.actions
+    assert runner._why_unusable(resp_empty, result_empty) == "no actions"
+
+
+def test_execute_planned_has_no_origin_seqs_parameter():
+    """W1-4: the dead origin_seqs parameter is removed (no caller ever
+    passed it; origin_seq stays None on _execute_one)."""
+    params = inspect.signature(GameRunner._execute_planned).parameters
+    assert "origin_seqs" not in params

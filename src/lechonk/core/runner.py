@@ -255,7 +255,8 @@ class _IngestResult:
     invalid: list[tuple[str, str]] = field(default_factory=list)
     failed: bool = False  # no valid batch at all (transport error / malformed)
     call_seq: Optional[int] = None  # the model_call record's seq
-    why: str = ""  # why the response was unusable (repair/degraded reason)
+    why: str = ""  # why the response was unusable ("" when usable; the
+    # repair/degraded reason — "no actions" only for an empty batch)
     degraded: bool = False  # the degraded default applies
     # FW-R2: every attempt's memory_update for the turn, in attempt order;
     # _model_phase attaches the shared list to the result it returns.
@@ -928,6 +929,9 @@ class GameRunner:
         return result2, True, why
 
     def _why_unusable(self, resp: ModelResponse, result: _IngestResult) -> str:
+        """Why the response was unusable (the repair/degraded reason): ""
+        when the response was usable (planned actions exist), "no actions"
+        only for a genuinely empty batch."""
         if resp.error is not None:
             return f"API call failed: {resp.error}"
         if resp.malformed is not None or resp.batch is None:
@@ -936,6 +940,8 @@ class GameRunner:
             classes = sorted({cls for _, cls in result.invalid})
             return (f"all {len(result.batch.actions)} emitted actions "
                     f"invalid (classes: {', '.join(classes)})")
+        if result.planned:
+            return ""
         return "no actions"
 
     def _repair_class(self, resp: ModelResponse, result: _IngestResult) -> str:
@@ -1018,8 +1024,7 @@ class GameRunner:
                          planned: Sequence[_PlannedAction],
                          table: CandidateTable, provenance: str,
                          call_seq: Optional[int], snapshot_seq: int,
-                         candidates_seq: int, reason: str = "",
-                         origin_seqs: Optional[dict[str, int]] = None
+                         candidates_seq: int, reason: str = ""
                          ) -> set[str]:
         """Execute planned actions sequentially with per-action read-back
         verification. After each executed mutation the remaining actions
@@ -1062,12 +1067,10 @@ class GameRunner:
                     remaining.pop(0)
                     continue
                 cand = fresh_by_id[ref]
-            origin_seq = (origin_seqs or {}).get(actor)
             result, seq = self._execute_one(
                 adapter, cand, turn=turn, provenance=provenance,
                 call_seq=call_seq, snapshot_seq=snapshot_seq,
-                candidates_seq=candidates_seq, reason=reason,
-                origin_seq=origin_seq)
+                candidates_seq=candidates_seq, reason=reason)
             readback = result.readback.status
             executed_any = True
             remaining.pop(0)
