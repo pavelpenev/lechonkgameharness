@@ -180,6 +180,7 @@ def build_manifest(arm_start_ts, spike_fingerprint, live_probe):
     from lechonk.core.schemas import RunManifest
     from lechonk.model import mistral_client as mc
     from lechonk.model import prompts
+    from lechonk.model.sampling import actual_client_sampling
 
     decision = mc.spike_decision(
         live_probe_done=True,
@@ -213,11 +214,10 @@ def build_manifest(arm_start_ts, spike_fingerprint, live_probe):
             "aifill": 2, "self_play": False,
         },
         model_id=mc.MODEL_ID,
-        sampling={
-            "temperature": 0.0, "max_tokens": mc.DEFAULT_MAX_TOKENS,
-            "random_seed": None, "top_p": 1.0,
-            "response_format": "json_schema strict (WP2 spike decision)",
-        },
+        # W1-6 sampling manifest truth: the ACTUAL client sampling
+        # (temperature 1.0, reasoning_effort "high"; the client never
+        # sends top_p) — never the fabricated greedy dict.
+        sampling=actual_client_sampling(),
         prompt_hashes=prompts.prompt_manifest_hashes(),
         config_after_load={
             "fresh_reset": True, "checkpoint_loaded": False,

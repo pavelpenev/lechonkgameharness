@@ -562,11 +562,12 @@ def cmd_arm(policy):
             }
             policy_client = MistralTurnClient(client, api_log=api_log)
             model_id = mc.MODEL_ID
-            sampling = {
-                "temperature": 0.0, "max_tokens": mc.DEFAULT_MAX_TOKENS,
-                "random_seed": None, "top_p": 1.0,
-                "response_format": "json_schema strict (WP2 spike decision)",
-            }
+            # W1-6 sampling manifest truth: persist the ACTUAL client
+            # sampling (temperature 1.0, reasoning_effort "high"; the
+            # client never sends top_p) — never the fabricated greedy
+            # dict previously recorded here.
+            from lechonk.model.sampling import actual_client_sampling
+            sampling = actual_client_sampling()
             prompt_hashes = prompts.prompt_manifest_hashes()
             enforcement_decision = mc.spike_decision(
                 live_probe_done=True, json_schema_supported=True,

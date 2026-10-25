@@ -633,3 +633,161 @@ def test_outcome_taxonomy_separation():
     assert wp4.survived("VICTORY") is True
     assert wp4.survived("DEFEATED") is False
     assert wp4.survived("TRUNCATED") is None
+
+
+# ---------------------------------------------------------------------------
+# W1-6 (a): sampling manifest truth — the shared actual-sampling helper
+# ---------------------------------------------------------------------------
+
+def test_actual_client_sampling_is_the_client_truth():
+    """The helper returns the sampling the MistralClient ACTUALLY runs
+    (decision 4, 2026-10-24 amendment): temperature 1.0, reasoning_effort
+    "high" — never the fabricated greedy dict, never a top_p key."""
+    from lechonk.model import mistral_client as mc
+    from lechonk.model.sampling import actual_client_sampling
+
+    s = actual_client_sampling()
+    assert s["temperature"] == mc.DEFAULT_TEMPERATURE == 1.0
+    assert s["reasoning_effort"] == mc.DEFAULT_REASONING_EFFORT == "high"
+    assert s["max_tokens"] == mc.DEFAULT_MAX_TOKENS
+    assert s["response_format"] == "json_schema strict (WP2 spike decision)"
+    assert "top_p" not in s       # the client never sends it — never recorded
+    assert "random_seed" not in s  # the client sends none — nothing fabricated
+
+
+def test_all_four_scripts_persist_the_actual_sampling():
+    """All four run drivers call the shared helper and none keeps the
+    fabricated sampling dict (source-level check: importing the WP2
+    drivers would parse argv and create run dirs)."""
+    for name in ("wp4_eval.py", "wp3_paired_smoke.py", "wp2_model_run.py",
+                 "wp2_fault_run.py"):
+        src = (REPO / "scripts" / name).read_text(encoding="utf-8")
+        assert "actual_client_sampling()" in src, name
+        assert '"top_p"' not in src, name
+        assert '"temperature": 0.0' not in src, name
+
+
+# ---------------------------------------------------------------------------
+# W1-6 (b): probe usage counted exactly once in api_totals
+# ---------------------------------------------------------------------------
+
+class _ProbeLogStub:
+    """A CallLog stand-in with the to_dict() keys the record builder
+    reads (per-request logs carry a real call_id; the AGGREGATE
+    FingerprintProbe carries none — that difference is the fixture)."""
+
+    def __init__(self, call_id, tokens_in, tokens_out, latency_ms,
+                 cost_usd):
+        self._d = {
+            "call_id": call_id, "prompt_hash": "p", "kind": "probe",
+            "model_requested": "mistral-large-4",
+            "model_responded": "mistral-large-4",
+            "enforcement": "json_schema", "temperature": 1.0,
+            "latency_ms": latency_ms, "tokens_in": tokens_in,
+            "tokens_out": tokens_out, "tokens_total": tokens_in + tokens_out,
+            "cost_usd": cost_usd, "finish_reason": "stop",
+            "response_id": "r", "fingerprint": "sha256:x",
+            "transport_retries": 0, "error": None,
+            "ts": "2026-10-25T00:00:00+00:00",
+        }
+
+    def to_dict(self):
+        return dict(self._d)
+
+
+def test_probe_requests_logged_exactly_once(tmp_path):
+    """Hand-computed fixture: probe1 = 2 requests (100+200 in, 10+20 out),
+    re-probe = 1 request (50 in, 5 out), turn calls = 2 requests. The
+    probe AGGREGATE (tokens_in=300, tokens_out=30 — the sum of probe1's
+    requests) is never written, so api_totals sums each request exactly
+    once. Under the pre-W1-6 accounting the aggregate was written next to
+    its own constituents and tokens_in summed to 2250 — double-counted."""
+    probe1_logs = [_ProbeLogStub("probe-1", 100, 10, 11, 0.001),
+                   _ProbeLogStub("probe-2", 200, 20, 22, 0.002)]
+    reprobe_logs = [_ProbeLogStub("reprobe-1", 50, 5, 12, 0.0005)]
+    turn_calls = [
+        {"turn": 5, "attempt": 1, "tokens_in": 1000, "tokens_out": 200,
+         "latency_ms": 100, "cost_usd": 0.01},
+        {"turn": 6, "attempt": 1, "tokens_in": 900, "tokens_out": 150,
+         "latency_ms": 70, "cost_usd": 0.009},
+    ]
+    records = wp4.probe_request_log_records(probe1_logs, reprobe_logs)
+    # one line per HTTP request — never the aggregate
+    assert [r["call_id"] for r in records] == \
+        ["probe-1", "probe-2", "reprobe-1"]
+    assert [r["kind"] for r in records] == \
+        ["probe", "probe", "probe_reprobe"]
+    assert sum(r["tokens_in"] for r in records) == 350  # 100+200+50, not
+    # +300 (the aggregate) — the aggregate never enters the log
+    totals = wp4.api_totals_from_call_log(records + turn_calls)
+    assert totals == {
+        "calls": 5,
+        "tokens_in": 100 + 200 + 50 + 1000 + 900,      # 2250 without the
+        "tokens_out": 10 + 20 + 5 + 200 + 150,         # aggregate line
+        "cost_usd": round(0.001 + 0.002 + 0.0005 + 0.01 + 0.009, 6),
+        "latency_ms": 11 + 22 + 12 + 100 + 70,
+    }
+
+
+def test_probe_request_records_never_carry_the_aggregate():
+    """The aggregate FingerprintProbe has no call_id/enforcement of its
+    own; every emitted record must carry a real call_id from an
+    underlying request (the pre-W1-6 code fell back to the literal
+    'probe' call_id for the aggregate record)."""
+    logs = [_ProbeLogStub(f"probe-{i}", 100, 10, 10, 0.001) for i in range(3)]
+    records = wp4.probe_request_log_records(logs, [])
+    assert len(records) == 3
+    assert all(r["call_id"] != "probe" for r in records)
+    assert all(r["enforcement"] is not None for r in records)
+
+
+# ---------------------------------------------------------------------------
+# W1-6 (c): the phase subprocess is bounded (timeout -> recorded failure)
+# ---------------------------------------------------------------------------
+
+def test_phase_timeout_derivation_from_config():
+    """Documented derivation: overhead + turns x per-turn bound."""
+    assert wp4.phase_timeout_s(0) == wp4.PHASE_OVERHEAD_S
+    assert wp4.phase_timeout_s(4) == (wp4.PHASE_OVERHEAD_S
+                                      + 4 * wp4.PHASE_PER_TURN_BOUND_S)
+    # the default WP4 shape: create 4 turns, arms 50 turns
+    assert wp4.phase_timeout_s(4) == 900 + 4 * 1200
+    assert wp4.phase_timeout_s(50) == 900 + 50 * 1200
+
+
+def test_run_subprocess_timeout_maps_to_failure_rc(tmp_path, monkeypatch):
+    """An expired phase subprocess is killed and REPORTED (rc 124, the
+    timeout recorded in the phase log) — never an unbounded wait, never
+    a raised exception."""
+    import subprocess as sp
+
+    def fake_run(cmd, **kwargs):
+        raise sp.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(wp4.subprocess, "run", fake_run)
+    log_lines = []
+    log_path = tmp_path / "phase.log"
+    rc = wp4.run_subprocess(lambda m: log_lines.append(m),
+                            ["create", "--pair-index", "1"],
+                            str(log_path), timeout_s=5)
+    assert rc == 124
+    assert any("PHASE TIMEOUT" in m for m in log_lines)
+    assert "[phase timeout] killed after 5s" in log_path.read_text(
+        encoding="utf-8")
+
+
+def test_run_phase_timeout_is_a_recorded_failure_not_a_crash(
+        tmp_path, monkeypatch):
+    """run_phase treats the timeout rc like any failure: ONE bounded
+    retry, then the rc returns to the caller's existing recorded-failure
+    handling."""
+    seen_timeouts = []
+    monkeypatch.setattr(
+        wp4, "run_subprocess",
+        lambda log, args, lp, timeout_s:
+            seen_timeouts.append(timeout_s) or 124)
+    monkeypatch.setattr(wp4.time, "sleep", lambda s: None)
+    rc = wp4.run_phase(lambda m: None, ["create"],
+                       str(tmp_path / "x.log"), timeout_s=7)
+    assert rc == 124
+    assert seen_timeouts == [7, 7]  # the retry carries the same bound

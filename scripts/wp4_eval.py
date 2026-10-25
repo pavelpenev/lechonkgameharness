@@ -113,6 +113,16 @@ OBSERVE_JS = os.path.join(REPO, "scripts", "wp0_observe_attach.js")
 _OBSERVE_OUT_LINE = ("const OUT = path.join(__dirname, '..', 'artifacts',"
                      " 'runs', 'wp0-observe');")
 
+# Phase-subprocess bounds (W1-6): the orchestrator never waits unbounded
+# on a phase subprocess. Derivation: per turn at worst ACTING = 2 API
+# attempts x 120 s (mistral_client.DEFAULT_TIMEOUT_MS) + the 900 s
+# WAITING deadline (AdapterSession) = 1140 s, rounded up to 1200 s per
+# turn; the overhead covers the stack wait (150 s) + the session startup
+# deadline (150 s) + the fingerprint probe (3 x 120 s) + close/export/
+# render margins.
+PHASE_PER_TURN_BOUND_S = 1200
+PHASE_OVERHEAD_S = 900
+
 PILOT_FRAMING = (
     "Honest pilot evaluation: descriptive reporting only — no model-"
     "ranking claims. The two arms share an exported checkpoint but are "
@@ -216,6 +226,60 @@ def read_turns_jsonl(path):
         return None
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+def probe_request_log_records(probe1_logs, reprobe_logs):
+    """api_calls.jsonl records for the fingerprint probe — ONE record PER
+    PROBE REQUEST (kind="probe" / "probe_reprobe"). The AGGREGATE
+    FingerprintProbe (probe1.to_dict(): tokens summed over the underlying
+    requests) is deliberately NOT written here — it is not an HTTP
+    request, and writing it next to its own constituents double-counted
+    probe usage in api_totals (W1-6). The aggregate stays recorded in
+    fingerprint_evidence.probe_1_details."""
+    records = []
+    for kind, logs in (("probe", probe1_logs),
+                       ("probe_reprobe", reprobe_logs)):
+        for pl in logs:
+            d = pl.to_dict()
+            records.append({
+                "call_id": d.get("call_id", kind),
+                "turn": None, "attempt": 0,
+                "kind": kind, "prompt_hash": d["prompt_hash"],
+                "model_requested": d["model_requested"],
+                "model_responded": d["model_responded"],
+                "enforcement": d.get("enforcement"),
+                "temperature": d["temperature"],
+                "latency_ms": d["latency_ms"],
+                "tokens_in": d["tokens_in"],
+                "tokens_out": d["tokens_out"],
+                "tokens_total": d["tokens_total"],
+                "cost_usd": d["cost_usd"],
+                "finish_reason": d["finish_reason"],
+                "response_id": d["response_id"],
+                "fingerprint": d["fingerprint"],
+                "transport_retries": d.get("transport_retries"),
+                "error": d.get("error"), "outcome": "probe",
+                "raw_attempts": [], "section_tokens": None,
+                "ts": d["ts"]})
+    return records
+
+
+def api_totals_from_call_log(records):
+    """api_totals over the api_calls.jsonl records. The log carries
+    exactly ONE line per HTTP request (the probe AGGREGATE is never
+    written — see probe_request_log_records), so summing every record
+    counts probe usage exactly once (W1-6)."""
+    return {
+        "calls": len(records),
+        "tokens_in": sum(r.get("tokens_in") or 0
+                         for r in records),
+        "tokens_out": sum(r.get("tokens_out") or 0
+                          for r in records),
+        "cost_usd": round(sum(r.get("cost_usd") or 0.0
+                              for r in records), 6),
+        "latency_ms": sum(r.get("latency_ms") or 0
+                          for r in records),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +636,14 @@ def pair_seed(seed, pair_index):
     distinct fresh games per pair, each deterministic (recorded in the
     creation manifest and the pair manifest)."""
     return seed + pair_index - 1
+
+
+def phase_timeout_s(turns):
+    """The orchestrator's phase-subprocess timeout (W1-6), derived from
+    config — never unbounded: PHASE_OVERHEAD_S + turns x
+    PHASE_PER_TURN_BOUND_S (the derivation is documented on the
+    constants)."""
+    return PHASE_OVERHEAD_S + turns * PHASE_PER_TURN_BOUND_S
 
 
 # ===========================================================================
@@ -965,38 +1037,20 @@ def cmd_arm(run_id, pair_index, policy, spectate):
                 f"unique={len(probe1.output_hashes)}, "
                 f"mode={probe1.sample_mode})")
             # The probe is an API call too (decision 4) — logged with
-            # kind="probe" (the WP2 logging pattern). The first probe's
-            # result is a FingerprintProbe (no call_id/enforcement);
-            # every individual probe request (the K=3 samples) is logged
-            # from the client's call logs, the re-probe's requests as
-            # kind="probe_reprobe".
-            probe_records = [("probe", probe1.to_dict())]
+            # kind="probe" (the WP2 logging pattern), ONE record PER
+            # PROBE REQUEST. The first probe's AGGREGATE FingerprintProbe
+            # (tokens summed over the underlying requests) is NOT written
+            # to the log — it is not an HTTP request, and writing it next
+            # to its own constituents double-counted probe usage in
+            # api_totals (W1-6); it stays in
+            # fingerprint_evidence.probe_1_details. The re-probe's
+            # requests are logged as kind="probe_reprobe".
+            # (probe1_probe_logs was captured BEFORE any re-probe.)
             reprobe_logs = [l for l in client.call_logs
                             if l.kind == "probe"][len(probe1_probe_logs):]
-            for pl in probe1_probe_logs:
-                probe_records.append(("probe", pl.to_dict()))
-            for pl in reprobe_logs:
-                probe_records.append(("probe_reprobe", pl.to_dict()))
-            for kind, pl in probe_records:
-                api_log({"call_id": pl.get("call_id", "probe"),
-                         "turn": None, "attempt": 0,
-                         "kind": kind, "prompt_hash": pl["prompt_hash"],
-                         "model_requested": pl["model_requested"],
-                         "model_responded": pl["model_responded"],
-                         "enforcement": pl.get("enforcement"),
-                         "temperature": pl["temperature"],
-                         "latency_ms": pl["latency_ms"],
-                         "tokens_in": pl["tokens_in"],
-                         "tokens_out": pl["tokens_out"],
-                         "tokens_total": pl["tokens_total"],
-                         "cost_usd": pl["cost_usd"],
-                         "finish_reason": pl["finish_reason"],
-                         "response_id": pl["response_id"],
-                         "fingerprint": pl["fingerprint"],
-                         "transport_retries": pl.get("transport_retries"),
-                         "error": pl.get("error"), "outcome": "probe",
-                         "raw_attempts": [], "section_tokens": None,
-                         "ts": pl["ts"]})
+            for record in probe_request_log_records(probe1_probe_logs,
+                                                    reprobe_logs):
+                api_log(record)
             fingerprint_evidence = {
                 "reference": reference,
                 "probe_1": fingerprint,
@@ -1014,11 +1068,12 @@ def cmd_arm(run_id, pair_index, policy, spectate):
             }
             policy_client = MistralTurnClient(client, api_log=api_log)
             model_id = mc.MODEL_ID
-            sampling = {
-                "temperature": 0.0, "max_tokens": mc.DEFAULT_MAX_TOKENS,
-                "random_seed": None, "top_p": 1.0,
-                "response_format": "json_schema strict (WP2 spike decision)",
-            }
+            # W1-6 sampling manifest truth: persist the ACTUAL client
+            # sampling (temperature 1.0, reasoning_effort "high"; the
+            # client never sends top_p) — never the fabricated greedy
+            # dict previously recorded here.
+            from lechonk.model.sampling import actual_client_sampling
+            sampling = actual_client_sampling()
             prompt_hashes = prompts.prompt_manifest_hashes()
             enforcement_decision = mc.spike_decision(
                 live_probe_done=True, json_schema_supported=True,
@@ -1177,17 +1232,7 @@ def cmd_arm(run_id, pair_index, policy, spectate):
         if policy == "model":
             with open(api_log_path, encoding="utf-8") as fh:
                 call_records = [json.loads(l) for l in fh if l.strip()]
-            post["api_totals"] = {
-                "calls": len(call_records),
-                "tokens_in": sum(r.get("tokens_in") or 0
-                                 for r in call_records),
-                "tokens_out": sum(r.get("tokens_out") or 0
-                                  for r in call_records),
-                "cost_usd": round(sum(r.get("cost_usd") or 0.0
-                                      for r in call_records), 6),
-                "latency_ms": sum(r.get("latency_ms") or 0
-                                  for r in call_records),
-            }
+            post["api_totals"] = api_totals_from_call_log(call_records)
             log(f"api calls: {post['api_totals']}")
 
         # The replay bundle (the static viewer, §7.6).
@@ -1269,36 +1314,58 @@ def cmd_arm(run_id, pair_index, policy, spectate):
 # pair manifest + divergence; then the overall report
 # ===========================================================================
 
-def run_subprocess(log, args, log_path):
+def run_subprocess(log, args, log_path, timeout_s):
     """Run one phase as a subprocess, persisting its stdout to the log
-    file AND echoing it (the phases are long; the log is the artifact)."""
-    log(f"--- phase: {' '.join(args)} ---")
+    file AND echoing it (the phases are long; the log is the artifact).
+    The subprocess is BOUNDED (W1-6): timeout_s comes from
+    phase_timeout_s() (the documented derivation) — an expired phase is
+    killed and reported as a phase failure (rc 124), never waited on
+    unbounded."""
+    log(f"--- phase: {' '.join(args)} (timeout {timeout_s}s) ---")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "w", encoding="utf-8") as fh:
-        proc = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), *args],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        fh.write(proc.stdout)
-        for line in proc.stdout.splitlines():
+    try:
+        with open(log_path, "w", encoding="utf-8") as fh:
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), *args],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=timeout_s)
+            fh.write(proc.stdout)
+            for line in proc.stdout.splitlines():
+                log(f"  | {line}")
+        return proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(partial or "")
+            fh.write(f"\n[phase timeout] killed after {timeout_s}s\n")
+        for line in (partial or "").splitlines():
             log(f"  | {line}")
-    return proc.returncode
+        log(f"PHASE TIMEOUT: the phase subprocess exceeded timeout_s="
+            f"{timeout_s} (phase_timeout_s: overhead + turns x per-turn "
+            f"bound) — killed; recorded as a phase failure (rc 124)")
+        return 124
 
 
-def run_phase(log, args, log_path):
-    """Run one phase as a subprocess; on a non-zero rc, ONE bounded retry
-    with a fresh process (the WP1 infra-retry discipline: a single logged
-    retry, never a silent loop-retry). The failed attempt's stdout is
-    preserved in the orchestrator log. Before the retry the driver
-    settles 25 s: the failed attempt's game server quits ~20 s after its
-    client disconnects (--quitidle 20, HANDOFF) and attaching to the
-    stale in-progress server races CivRealm's begin-turn handling."""
-    rc = run_subprocess(log, args, log_path)
+def run_phase(log, args, log_path, timeout_s):
+    """Run one phase as a subprocess; on a non-zero rc (including the
+    W1-6 phase timeout, rc 124), ONE bounded retry with a fresh process
+    (the WP1 infra-retry discipline: a single logged retry, never a
+    silent loop-retry). The failed attempt's stdout is preserved in the
+    orchestrator log. Before the retry the driver settles 25 s: the
+    failed attempt's game server quits ~20 s after its client
+    disconnects (--quitidle 20, HANDOFF) and attaching to the stale
+    in-progress server races CivRealm's begin-turn handling. A timeout
+    that survives the retry surfaces through the caller's existing
+    non-zero-rc handling (a recorded phase failure, never a crash)."""
+    rc = run_subprocess(log, args, log_path, timeout_s)
     if rc != 0:
         log(f"phase {' '.join(args)} rc={rc} — bounded retry (once, fresh "
             f"process; the WP1 infra-retry discipline, never a silent loop)")
         log("settling 25 s before the retry (--quitidle 20 server teardown)")
         time.sleep(25)
-        rc = run_subprocess(log, args, log_path)
+        rc = run_subprocess(log, args, log_path, timeout_s)
     return rc
 
 
@@ -1775,11 +1842,14 @@ def cmd_orchestrate(pairs, horizon, create_turns, seed, run_id, spectate):
             f"sha256={paired.contract_sha256(contract)}")
 
         # --- phase 1: create (fresh game + the checkpoint export) -------
+        # The phase subprocess is bounded (W1-6): the create phase plays
+        # create_turns comparator turns.
         rc = run_phase(log, [
             "--run-id", run_id, "--seed", str(seed),
             "--horizon", str(horizon), "--create-turns", str(create_turns),
             "create", "--pair-index", str(pair_index)],
-            os.path.join(pair_dir, "creation", "run_stdout.log"))
+            os.path.join(pair_dir, "creation", "run_stdout.log"),
+            phase_timeout_s(create_turns))
         log(f"create phase rc={rc}")
         creation_path = os.path.join(pair_dir, "creation",
                                      "creation_manifest.json")
@@ -1809,9 +1879,12 @@ def cmd_orchestrate(pairs, horizon, create_turns, seed, run_id, spectate):
                 "--pair-index", str(pair_index)]
             if spectate and pair_index == 1 and arm == "model":
                 arm_args.append("--spectate")
+            # Bounded (W1-6): the arm plays horizon turns from the
+            # exported checkpoint.
             rc = run_phase(log, arm_args,
                            os.path.join(pair_dir, "arms", arm,
-                                        "run_stdout.log"))
+                                        "run_stdout.log"),
+                           phase_timeout_s(horizon))
             log(f"{arm} arm rc={rc}")
 
         arm_manifests = {}

@@ -391,6 +391,31 @@ Upstream quirks with fog implications, disclosed:
   AI-state divergence over turns is therefore reported as a descriptive per-pair
   diagnostic (score, city count, units, known tiles) — not as a causal estimate.
 
+### Sampling recorded in run manifests (old vs new semantics)
+
+- **What the client actually runs (decision 4, 2026-10-24 amendment):** every
+  model call — turn calls, repair attempts, and capability/fingerprint probes
+  alike — runs at temperature 1.0 with `reasoning_effort="high"`; the client
+  never sends `top_p` and never sets a random seed. This is the single source of
+  truth (`lechonk.model.sampling.actual_client_sampling`), and it is what all
+  four run drivers (`wp4_eval.py`, `wp3_paired_smoke.py`, `wp2_model_run.py`,
+  `wp2_fault_run.py`) now persist in their manifests.
+- **Old manifests (before this change) are NOT rewritten.** Manifests recorded
+  before 2026-10-25 persist a fabricated sampling dict
+  (`{"temperature": 0.0, ..., "top_p": 1.0, "random_seed": null, ...}`) that the
+  client never ran — a greedy-sampling description left over from the pre-FW-20
+  spike era. That evidence is never edited: when comparing runs across this
+  boundary, treat any manifest `sampling.temperature == 0.0` (or a `top_p` key)
+  as a pre-W1-6 record whose actual sampling was temperature 1.0,
+  `reasoning_effort="high"`, no `top_p` — the same as every post-W1-6 manifest
+  records explicitly.
+- **API-call totals:** arm manifests' `post_run.api_totals` now count each HTTP
+  request exactly once. Totals recorded before this change double-counted
+  fingerprint-probe usage (the probe's aggregate record plus its per-request
+  records were both summed); the probe's per-request records remain the log's
+  unit of account, and the probe aggregate lives in
+  `fingerprint_evidence.probe_1_details`.
+
 ## Evaluation
 
 Evaluation of record: **`artifacts/runs/wp4-eval3/`** (2026-10-24, overall verdict
