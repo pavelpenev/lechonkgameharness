@@ -350,10 +350,11 @@ def _action_metric_domain(rec: ActionResultRecord) -> str:
 def _is_model_participation(rec: ActionResultRecord) -> bool:
     """Model participation (§3 line 38): ≥1 EXECUTED model-class or
     model-originated continued_model_order decision — housekeeping-verb
-    decisions (cancel_order/keep_activity) and failed attempts never
-    enter the numerator."""
+    decisions (cancel_order/keep_activity) and readback-CONTRADICTED
+    executions (D1: provably non-executed) never enter the numerator."""
     return (rec.outcome == "executed"
             and rec.provenance_class in MODEL_PARTICIPATION_CLASSES
+            and _credits_execution(rec)
             and _action_metric_domain(rec) != "housekeeping")
 
 

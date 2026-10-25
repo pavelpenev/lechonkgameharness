@@ -767,3 +767,158 @@ def test_fw12_fixture_build_city_expansion_opportunity(fixtures, tmp_path):
     for domain, expected in exp["domain_model_shares"].items():
         _assert_share(report.domain_model_shares[domain], expected,
                       f"domain_model_share:{domain}")
+
+
+# ---------------------------------------------------------------------------
+# D1 (W3-4): the participation numerator is gated on readback credit
+# ---------------------------------------------------------------------------
+
+
+def _d1_records():
+    """A 6-turn run pinning the D1 participation gate end to end:
+    turn 1: opportunity + an executed/VERIFIED model research -> counts;
+    turn 2: opportunity + an executed/CONTRADICTED model research
+    (rejection_class illegal_in_rule — the rules engine proved
+    non-execution) and an executed/INCONCLUSIVE one -> neither credits;
+    turn 3: opportunity + a rejected model attempt -> never counted;
+    turn 4: opportunity + a model housekeeping-verb decision (cancel_order)
+    and an engine_automatic resolution -> neither is model participation;
+    turn 5: opportunity + an executed/verified model research -> counts;
+    turn 6: an empty candidate table (no opportunity domains) + an
+    executed/verified model research -> excluded (zero-opportunity turns
+    never enter the numerator).
+    Hand-computed: opportunity turns {1,2,3,4,5} = 5; model-participation
+    turns {1,5} = 2 -> participation 2/5 = 0.4 < 0.8 -> gate FAIL."""
+    from lechonk.core.schemas import (
+        ActionResultRecord,
+        CandidatesRefRecord,
+        TurnStartRecord,
+    )
+
+    def opp(turn):
+        return CandidatesRefRecord(
+            turn=turn, table_hash="sha256:" + "01" * 32, candidate_count=10,
+            by_domain={"tech": 10}, opportunity_domains=["research"])
+
+    def action(turn, ref, domain, verb, target, *, outcome="executed",
+               provenance_class="model", readback="verified",
+               rejection_class=None):
+        return ActionResultRecord(
+            turn=turn, ref=ref, domain=domain, verb=verb, target=target,
+            outcome=outcome, provenance_class=provenance_class,
+            readback=readback, rejection_class=rejection_class, detail="")
+
+    return [
+        TurnStartRecord(turn=1),
+        opp(1),
+        action(1, "tech:player:research_tech_alphabet_0", "tech",
+               "research_tech_alphabet_0", "Alphabet"),
+        TurnStartRecord(turn=2),
+        opp(2),
+        # CONTRADICTED: emitted "executed", the read-back proved
+        # non-execution (D1: provably non-executed -> no credit).
+        action(2, "tech:player:research_tech_pottery_1", "tech",
+               "research_tech_pottery_1", "Pottery", readback="contradicted",
+               rejection_class="illegal_in_rule"),
+        # INCONCLUSIVE: the read-back is non-probative -> no credit either.
+        action(2, "tech:player:research_tech_bronze_working_5", "tech",
+               "research_tech_bronze_working_5", "Bronze working",
+               readback="inconclusive"),
+        TurnStartRecord(turn=3),
+        opp(3),
+        # A rejected attempt is never model participation (pin).
+        action(3, "tech:player:research_tech_currency_3", "tech",
+               "research_tech_currency_3", "Currency", outcome="rejected",
+               readback="none", rejection_class="illegal_in_rule"),
+        TurnStartRecord(turn=4),
+        opp(4),
+        # A model housekeeping-verb decision: never participation.
+        action(4, "unit:10:cancel_order", "unit", "cancel_order", "unit:10"),
+        # An engine-automatic resolution: never model participation.
+        action(4, "tech:player:research_tech_auto_4", "tech",
+               "research_tech_auto", "Auto",
+               provenance_class="engine_automatic", readback="none"),
+        TurnStartRecord(turn=5),
+        opp(5),
+        action(5, "tech:player:research_tech_writing_5", "tech",
+               "research_tech_writing_5", "Writing"),
+        TurnStartRecord(turn=6),
+        # An empty candidate table: no opportunity domains -> the turn is
+        # not a turn-with-opportunities even though a model action executed.
+        CandidatesRefRecord(
+            turn=6, table_hash="sha256:" + "01" * 32, candidate_count=0,
+            by_domain={}, opportunity_domains=[]),
+        action(6, "tech:player:research_tech_masonry_6", "tech",
+               "research_tech_masonry_6", "Masonry"),
+    ]
+
+
+def test_d1_participation_numerator_is_readback_gated():
+    """D1: _is_model_participation gains the _credits_execution conjunct —
+    executed+verified model actions count; executed+CONTRADICTED
+    (illegal_in_rule) and executed+inconclusive ones do not; rejected
+    attempts never counted; the housekeeping-verb and engine-automatic
+    exclusions are unchanged; and the aggregate intersects with
+    opportunity turns, so a zero-opportunity turn never counts."""
+    from lechonk.core.metrics import _is_model_participation, compute_metrics
+    from lechonk.core.schemas import ActionResultRecord
+    records = _d1_records()
+    by_turn = {}
+    for rec in records:
+        if isinstance(rec, ActionResultRecord):
+            by_turn.setdefault(rec.turn, []).append(rec)
+    # (1) executed + verified model action counts.
+    assert _is_model_participation(by_turn[1][0])
+    assert _is_model_participation(by_turn[5][0])
+    # (2) executed + CONTRADICTED (illegal_in_rule) does NOT count; an
+    # executed + inconclusive read-back does not count either.
+    assert not _is_model_participation(by_turn[2][0])
+    assert not _is_model_participation(by_turn[2][1])
+    # (3) a rejected attempt is never counted (pin).
+    assert not _is_model_participation(by_turn[3][0])
+    # (4) housekeeping/engine-auto exclusion unchanged: the model's
+    # housekeeping-verb decision and the engine_automatic resolution are
+    # not model participation.
+    assert not _is_model_participation(by_turn[4][0])
+    assert not _is_model_participation(by_turn[4][1])
+    # (5) the aggregate: opportunity turns {1,2,3,4,5} = 5, participating
+    # {1,5} = 2 — the contradicted/inconclusive/rejected/housekeeping turns
+    # and the zero-opportunity turn 6 (verified model action) never enter
+    # the numerator.
+    report = compute_metrics(records)
+    assert report.participation.numerator == 2
+    assert report.participation.denominator == 5
+    assert report.participation.value == pytest.approx(2 / 5)
+    assert report.participation.status == "ok"
+    assert report.participation_gate_pass is False
+
+
+def test_d1_contradicted_execution_alone_drops_the_numerator():
+    """The D1 discontinuity in isolation: the SAME run with the turn-2
+    read-back flipped from 'verified' to 'contradicted'
+    (rejection_class illegal_in_rule) drops the participation numerator
+    from 3 to 2 — the record still says outcome "executed" either way,
+    so the gate is read-back-gated, not outcome-gated; recorded evidence
+    is never recomputed."""
+    from lechonk.core.metrics import compute_metrics
+    from lechonk.core.schemas import ActionResultRecord
+
+    def run_with(readback):
+        records = _d1_records()
+        for rec in records:
+            if (isinstance(rec, ActionResultRecord) and rec.turn == 2
+                    and rec.verb == "research_tech_pottery_1"):
+                rec.readback = readback
+                rec.rejection_class = ("illegal_in_rule"
+                                       if readback == "contradicted" else None)
+        return compute_metrics(records)
+
+    gated = run_with("contradicted")
+    assert (gated.participation.numerator, gated.participation.denominator) \
+        == (2, 5)
+    # Flip the same record's read-back back to verified: turn 2 counts
+    # again — the numerator is read-back-gated, not outcome-gated (the
+    # record still says outcome "executed" either way).
+    ungated = run_with("verified")
+    assert (ungated.participation.numerator,
+            ungated.participation.denominator) == (3, 5)

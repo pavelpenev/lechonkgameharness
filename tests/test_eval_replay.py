@@ -25,6 +25,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -425,3 +427,217 @@ def test_render_bundle_clean_turns_round_trip(tmp_path):
     replay.render_bundle(transcript, out, turns_path=turns)
     html = (out / "index.html").read_text(encoding="utf-8")
     assert json.loads(_script_block(html, "lechonk-turns")) == [summary]
+
+
+# ---------------------------------------------------------------------------
+# D1 (W3-4): viewer parity — the participation curve is readback-gated
+# and opportunity-intersected, mirroring lechonk.core.metrics
+# ---------------------------------------------------------------------------
+
+
+def _build_d1_transcript(tmp_path: Path):
+    """A 4-turn transcript pinning the D1 viewer parity: turn 1 an
+    executed/VERIFIED model action (counts); turn 2 an executed/
+    CONTRADICTED model action (rejection_class illegal_in_rule — the
+    viewer predicate must exclude it); turn 3 NO candidates_ref (a
+    zero-opportunity turn — the curve must not increment even though a
+    verified model action executed); turn 4 a rejected model attempt
+    (never counted). Expected viewer curves: opportunities [1,2,2,3],
+    participation [1,1,1,1]; the frozen core metrics over the same
+    transcript: participation 1/3."""
+    path = tmp_path / "d1-transcript.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(RunManifestRecord(manifest=RunManifest(
+        run_id="d1-run", model_id="mistral-large-4",
+        model_fingerprint="sha256:" + "ab" * 32,
+        arm_start_ts="2026-10-24T18:00:00+00:00",
+        checkpoint_checksums={"start": "sha256:" + "cd" * 32},
+        seeds={"mapseed": 1, "gameseed": 1, "agentseed": 1},
+        ruleset="classic")))
+    for turn in (1, 2, 3, 4):
+        ledger.append(TurnStartRecord(turn=turn))
+        ledger.append(SnapshotRefRecord(
+            turn=turn, snapshot_hash="sha256:" + "ef" * 32,
+            token_count=1200 + turn))
+        if turn != 3:
+            # turn 3 deliberately has NO candidates_ref: a zero-opportunity
+            # turn (the viewer's opportunity intersection must exclude it).
+            ledger.append(CandidatesRefRecord(
+                turn=turn, table_hash="sha256:" + "01" * 32,
+                candidate_count=100,
+                by_domain={"unit": 60, "tech": 20, "city": 20},
+                opportunity_domains=["research", "unit_action"]))
+        ledger.append(ModelCallRecord(
+            call_id=f"d1-run/t{turn}/call1", attempt=1,
+            prompt_hash="sha256:" + "02" * 32, latency_ms=1000,
+            tokens_in=500, tokens_out=100, cost_usd=0.001,
+            fingerprint="sha256:" + "ab" * 32))
+    # turn 1: executed + verified model action -> participation.
+    ledger.append(ActionResultRecord(
+        turn=1, ref="tech:player:research_tech_alphabet_0", domain="tech",
+        verb="research_tech_alphabet_0", target="Alphabet",
+        outcome="executed", provenance_class="model", readback="verified",
+        detail="verified model research"))
+    # turn 2: executed + CONTRADICTED (illegal_in_rule) -> no credit (D1).
+    ledger.append(ActionResultRecord(
+        turn=2, ref="tech:player:research_tech_pottery_1", domain="tech",
+        verb="research_tech_pottery_1", target="Pottery",
+        outcome="executed", provenance_class="model",
+        readback="contradicted", rejection_class="illegal_in_rule",
+        detail="emitted executed; the read-back proved non-execution"))
+    # turn 3: a verified model action on a zero-opportunity turn -> the
+    # curve must not increment (opportunity intersection).
+    ledger.append(ActionResultRecord(
+        turn=3, ref="tech:player:research_tech_currency_3", domain="tech",
+        verb="research_tech_currency_3", target="Currency",
+        outcome="executed", provenance_class="model", readback="verified",
+        detail="verified model research on a zero-opportunity turn"))
+    # turn 4: a rejected model attempt -> never counted.
+    ledger.append(ActionResultRecord(
+        turn=4, ref="tech:player:research_tech_writing_4", domain="tech",
+        verb="research_tech_writing_4", target="Writing",
+        outcome="rejected", rejection_class="illegal_in_rule",
+        provenance_class="model", readback="none",
+        detail="rejected attempt"))
+    ledger.append(MetricEventRecord(name="participation", value=0.5))
+    ledger.append(OutcomeRecord(outcome="COMPLETED", reason="horizon reached"))
+    ledger.close()
+    return path
+
+
+# A minimal DOM shim + runner for the viewer's main script: it executes
+# the extracted JS under node with the embedded JSON blocks and reports
+# the plotted circle coordinates of the metrics panel's FIRST chart (the
+# cumulative participation curve), grouped by series color.
+_VIEWER_DRIVER = r"""
+"use strict";
+const fs = require("fs");
+const blocks = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const script = fs.readFileSync(process.argv[3], "utf8");
+function makeEl(tag) {
+  const e = {
+    tagName: tag,
+    attributes: {},
+    children: [],
+    className: "",
+    value: undefined,
+    _text: "",
+    appendChild(c) {
+      this.children.push(c);
+      if (this.tagName === "select" && c && c.tagName === "option" &&
+          this.value === undefined) {
+        this.value = c.attributes.value;
+      }
+      return c;
+    },
+    setAttribute(k, v) { this.attributes[k] = v; },
+    addEventListener() {},
+  };
+  Object.defineProperty(e, "textContent", {
+    get() { return this._text; },
+    set(v) { this._text = String(v); },
+  });
+  return e;
+}
+const ids = ["lechonk-meta", "lechonk-turns", "lechonk-commitments",
+  "lechonk-transcript", "manifest-body", "empire-body", "turns-body",
+  "snapshot-body", "actions-body", "commitments-body", "metrics-body",
+  "footer", "run-title", "run-sub"];
+const byId = {};
+for (const id of ids) {
+  const e = makeEl("div");
+  e.id = id;
+  e._text = blocks[id] === undefined ? "" : blocks[id];
+  byId[id] = e;
+}
+global.document = {
+  getElementById(id) { return byId[id] || null; },
+  createElement(tag) { return makeEl(tag); },
+  createTextNode(t) { return { text: String(t) }; },
+};
+eval(script);
+const svg = byId["metrics-body"].children.find(
+  (c) => c && c.tagName === "svg");
+if (!svg) { throw new Error("no chart in the metrics panel"); }
+const series = {};
+for (const c of svg.children) {
+  if (c && c.tagName === "circle") {
+    (series[c.attributes.fill] = series[c.attributes.fill] || []).push(
+      [c.attributes.cx, c.attributes.cy]);
+  }
+}
+process.stdout.write(JSON.stringify(series));
+"""
+
+
+def _viewer_main_script(html: str) -> str:
+    """The viewer's main <script> block (the one without attributes — the
+    JSON payload blocks all carry id/type attributes)."""
+    m = re.search(r"<script>\n(.*?)\n</script>", html, re.DOTALL)
+    assert m, "the viewer's main script block not found"
+    return m.group(1)
+
+
+def test_viewer_participation_curve_is_readback_gated_and_opportunity_intersected(
+        tmp_path):
+    """D1 viewer parity: the viewer's isParticipation gains the readback
+    gating (mirroring lechonk.core.metrics._credits_execution — a
+    CONTRADICTED execution is excluded) and the cumulative participation
+    curve increments only on turns-with-opportunities. The recalculated
+    curve stays labeled as viewer-computed, distinct from the frozen
+    aggregate metrics. The behavioral half executes the shipped viewer JS
+    under node with a minimal DOM shim (skipped when node is absent —
+    the structural pins below still run)."""
+    from lechonk.core.ledger import load_transcript
+    from lechonk.core.metrics import compute_metrics
+
+    transcript = _build_d1_transcript(tmp_path)
+    out = tmp_path / "d1-replay"
+    replay.render_bundle(transcript, out)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    script = _viewer_main_script(html)
+    # structural pins: the gating and the labeling ship in the viewer JS
+    assert "creditsExecution" in script
+    assert 'a.readback === "verified"' in script
+    assert "creditsExecution(a)" in script
+    assert "hasOpp && p.actions.some(isParticipation)" in script
+    # the recalculated curve is labeled distinctly from the frozen
+    # aggregate (the frozen heading's phrase is split across a JS string
+    # concatenation — assert the contiguous fragment)
+    assert "readback-gated" in html
+    assert "distinct from the frozen aggregate" in html
+    assert "aggregate metrics (frozen, ledger-" in html
+    # the frozen core metrics over the same transcript (the viewer must
+    # agree with the core): opportunity turns {1,2,4}, participating {1}
+    report = compute_metrics(load_transcript(transcript).records)
+    assert (report.participation.numerator,
+            report.participation.denominator) == (1, 3)
+    # behavioral: execute the viewer JS and read the participation
+    # chart's plotted points (the metrics panel's first chart)
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available to execute the viewer JS")
+    blocks = {bid: _script_block(html, bid)
+              for bid in ("lechonk-meta", "lechonk-turns",
+                          "lechonk-commitments", "lechonk-transcript")}
+    blocks_path = tmp_path / "viewer-blocks.json"
+    blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+    script_path = tmp_path / "viewer-main.js"
+    script_path.write_text(script, encoding="utf-8")
+    driver_path = tmp_path / "viewer-driver.js"
+    driver_path.write_text(_VIEWER_DRIVER, encoding="utf-8")
+    proc = subprocess.run(
+        [node, str(driver_path), str(blocks_path), str(script_path)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"viewer JS failed under node: {proc.stderr}"
+    series = json.loads(proc.stdout)
+    part = series["#2563eb"]  # the participation series' color
+    opp = series["#6b7280"]   # the opportunities series' color
+    assert len(part) == 4 and len(opp) == 4
+    # participation [1,1,1,1]: the contradicted execution (turn 2) and the
+    # zero-opportunity turn 3 never increment the curve — all four
+    # plotted cy are equal (the chart's Y mapping is injective).
+    assert len({cy for _, cy in part}) == 1
+    # opportunities [1,2,2,3]: Y decreases as the value rises, so
+    # cy[0] > cy[1] == cy[2] > cy[3].
+    assert opp[0][1] > opp[1][1] == opp[2][1] > opp[3][1]

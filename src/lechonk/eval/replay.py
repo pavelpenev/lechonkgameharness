@@ -281,9 +281,19 @@ records.forEach(function (r) {
 });
 var turnList = Object.keys(perTurn).map(Number).sort(function (a, b) {
   return a - b; });
+// Readback-gated execution credit (D1): mirrors lechonk.core.metrics
+// _credits_execution — an executed action credits only when its ledger
+// read-back VERIFIED the mutation; engine-automatic resolutions carry
+// readback "none" by construction and remain creditable. A CONTRADICTED
+// execution (emitted "executed" with readback "contradicted") and an
+// inconclusive read-back never credit.
+function creditsExecution(a) {
+  return a.outcome === "executed" &&
+    (a.readback === "verified" || a.provenance_class === "engine_automatic");
+}
 function isParticipation(a) {
   return a.outcome === "executed" && MODEL_CLASSES[a.provenance_class] &&
-    !HOUSEKEEPING_VERBS[a.verb];
+    !HOUSEKEEPING_VERBS[a.verb] && creditsExecution(a);
 }
 function turnActions(t, outcome) {
   return perTurn[t].actions.filter(function (a) {
@@ -692,19 +702,24 @@ function legend(seriesList) {
 (function renderMetrics() {
   var body = $("metrics-body");
   // cumulative participation curve (viewer-computed; the aggregate is the
-  // frozen metric_event below)
+  // frozen metric_event below). D1 parity with lechonk.core.metrics: the
+  // participation numerator counts a turn only when it has opportunities
+  // AND a readback-credited model-class execution — contradicted
+  // executions and zero-opportunity turns never increment it.
   var opp = [], part = [];
   var cumOpp = 0, cumPart = 0;
   turnList.forEach(function (t) {
     var p = perTurn[t];
-    if (p.candidates && (p.candidates.opportunity_domains || []).length) {
-      cumOpp += 1; }
-    if (p.actions.some(isParticipation)) { cumPart += 1; }
+    var hasOpp = !!(p.candidates &&
+      (p.candidates.opportunity_domains || []).length);
+    if (hasOpp) { cumOpp += 1; }
+    if (hasOpp && p.actions.some(isParticipation)) { cumPart += 1; }
     opp.push([t, cumOpp]);
     part.push([t, cumPart]);
   });
   body.appendChild(el("h3", { text:
-    "cumulative model participation (viewer-computed from the ledger)" }));
+    "cumulative model participation (viewer-computed from the ledger, " +
+    "readback-gated — distinct from the frozen aggregate metrics below)" }));
   body.appendChild(legend([
     { label: "turns with opportunities", color: "#6b7280" },
     { label: "turns with model participation", color: "#2563eb" }]));
