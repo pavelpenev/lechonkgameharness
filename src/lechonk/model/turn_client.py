@@ -48,7 +48,7 @@ from lechonk.core.schemas import estimate_tokens
 from lechonk.model import prompts as prompt_templates
 from lechonk.model.mistral_client import MistralClient
 
-_TURN_ID_RE = re.compile(r"/t(\d+)$")
+_TURN_ID_RE = re.compile(r"/t(\d+)\Z")
 
 
 def _prompt_hash(messages: list[dict[str, str]]) -> str:

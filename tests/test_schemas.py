@@ -101,6 +101,14 @@ def test_is_candidate_id_helper():
     assert not is_candidate_id("12,34")
     assert not is_candidate_id("unit:7:goto n")
     assert not is_candidate_id(12)
+    # C5: a trailing newline must not slip past the end anchor ($ vs \Z).
+    assert not is_candidate_id("unit:7:goto_n\n")
+
+
+def test_action_item_rejects_trailing_newline_ref():
+    # C5: pydantic Field pattern must reject a newline-terminated ref.
+    with pytest.raises(ValidationError):
+        ActionItem.model_validate({"ref": "unit:7:goto_n\n"})
 
 
 # ---------------------------------------------------------------------------

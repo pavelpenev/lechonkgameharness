@@ -48,8 +48,11 @@ ACTION_BATCH_MAX_ACTIONS = 20
 # ActionBatch actions reference candidate IDs ONLY: a raw coordinate, a free-text
 # move description, or any extra field is a schema violation (§7.3: "raw
 # coordinates from the model are rejected as schema-error").
-CANDIDATE_ID_REGEX = r"^(unit|city|tech|dipl):[A-Za-z0-9_]+:[a-z0-9_]+$"
-CandidateRef = Field(pattern=CANDIDATE_ID_REGEX)
+CANDIDATE_ID_REGEX = r"^(unit|city|tech|dipl):[A-Za-z0-9_]+:[a-z0-9_]+\Z"
+# Pydantic v2 compiles Field patterns with the Rust regex crate, which
+# rejects Python's \Z; its end anchor is \z.
+CANDIDATE_ID_FIELD_PATTERN = r"^(unit|city|tech|dipl):[A-Za-z0-9_]+:[a-z0-9_]+\z"
+CandidateRef = Field(pattern=CANDIDATE_ID_FIELD_PATTERN)
 
 
 def estimate_tokens(text: str) -> int:

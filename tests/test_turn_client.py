@@ -12,6 +12,7 @@ for the §3 budget table), and the no-secret assertion.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 
@@ -27,6 +28,7 @@ from lechonk.model import mistral_client as mc
 from lechonk.model import prompts
 from lechonk.model.turn_client import (
     MistralTurnClient,
+    _prompt_hash,
     _raw_attempts_from,
     _turn_number,
 )
@@ -481,3 +483,15 @@ def test_raw_attempts_extraction():
     # Non-dict actions items stringify.
     assert _raw_attempts_from('{"actions": ["unit:1:goto_n"]}') == \
         ["unit:1:goto_n"]
+
+
+def test_prompt_hash_clean_ids_unaffected():
+    # C5: the regex end-anchor fix does not disturb the hash path for clean ids.
+    messages = [{"role": "user", "content": "unit:7:goto_n"}]
+    expected = "sha256:" + hashlib.sha256(json.dumps(
+        messages, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
+    assert _prompt_hash(messages) == expected
+    # Clean turn ids still parse; a newline-terminated id no longer does.
+    assert _turn_number("run/t7") == 7
+    assert _turn_number("run/t7\n") is None

@@ -87,10 +87,10 @@ CTRL_DOMAIN_REVERSE = {v: k for k, v in CTRL_DOMAIN.items()}
 # Deterministic domain ordering for the table.
 _DOMAIN_ORDER = ("unit", "city", "tech", "dipl")
 
-_DIR8_KEY_RE = re.compile(r"^(goto|attack)_([0-7])$")
-_TECH_KEY_RE = re.compile(r"^(research_tech|set_tech_goal)_(.+)_(\d+)$")
-_CITY_WORK_RE = re.compile(r"^city_(un)?work_(.+)$")
-_DIPL_KEY_RE = re.compile(r"^(stop_negotiation|cancel_treaty|accept_treaty)_(\d+)$")
+_DIR8_KEY_RE = re.compile(r"^(goto|attack)_([0-7])\Z")
+_TECH_KEY_RE = re.compile(r"^(research_tech|set_tech_goal)_(.+)_(\d+)\Z")
+_CITY_WORK_RE = re.compile(r"^city_(un)?work_(.+)\Z")
+_DIPL_KEY_RE = re.compile(r"^(stop_negotiation|cancel_treaty|accept_treaty)_(\d+)\Z")
 
 
 def _sanitize(text: str) -> str:

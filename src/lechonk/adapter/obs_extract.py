@@ -103,7 +103,7 @@ GRID_MAX_CELLS = 1024
 # Per-tech invention fields as filled by the embassy report
 # (player_state.py:128-129): ``tech_<numeric id>``. Distinct from the common
 # ``tech_goal`` / ``tech_upkeep`` / ``techs_researched`` player fields.
-_TECH_FIELD_RE = re.compile(r"^tech_\d+$")
+_TECH_FIELD_RE = re.compile(r"^tech_\d+\Z")
 
 
 @dataclass(frozen=True)
