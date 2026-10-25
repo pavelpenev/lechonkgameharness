@@ -20,9 +20,11 @@ ledger-only — no free-text parsing anywhere):
   turn. Housekeeping, failed attempts, and zero-opportunity turns never
   enter numerator or denominator. Per-domain model-control shares
   (research, production, expansion) = model-class executed decisions /
-  all executed decisions in the metric domain, majority-model; zero-choice
-  domains are n/a. Engine-automatic resolutions are counted (they are
-  executed decisions), never hidden.
+  all creditable executed decisions in the metric domain, majority-model;
+  zero-choice domains are n/a. D2 (2026-10-24): both sides are
+  readback-gated — contradicted and inconclusive executions enter
+  neither numerator nor denominator. Engine-automatic resolutions are
+  counted (they are creditable executed decisions), never hidden.
 - commitment follow-through: commitments are the structured objects the
   model emits (domain, target kind, target, optional verb, deadline turn),
   de-duplicated per (target, domain) — FW-11 (2026-10-24): when duplicates
@@ -542,8 +544,11 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
              "excluded)")
     # Per-domain model-control shares (research, production, expansion).
     # Computed BEFORE the gate: the gate's domain-majority conjunct reads
-    # these shares.
-    executed = [r for r in actions if r.outcome == "executed"]
+    # these shares. D2 (2026-10-24): both numerator and denominator are
+    # readback-gated — contradicted and inconclusive executions enter
+    # neither; engine_automatic records remain in the denominator
+    # (creditable, non-model — they lower the share).
+    executed = [r for r in actions if _credits_execution(r)]
     for domain in SHARE_DOMAINS:
         in_domain = [r for r in executed if _action_metric_domain(r) == domain]
         model_controlled = [r for r in in_domain

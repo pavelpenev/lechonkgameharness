@@ -922,3 +922,117 @@ def test_d1_contradicted_execution_alone_drops_the_numerator():
     ungated = run_with("verified")
     assert (ungated.participation.numerator,
             ungated.participation.denominator) == (3, 5)
+
+
+# ---------------------------------------------------------------------------
+# D2 (W3-5): domain shares are gated on readback credit
+# ---------------------------------------------------------------------------
+
+
+def _d2_action(turn, verb, *, outcome="executed", provenance_class="model",
+               readback="verified", rejection_class=None):
+    from lechonk.core.schemas import ActionResultRecord
+    return ActionResultRecord(
+        turn=turn, ref=f"city:3:{verb}", domain="city", verb=verb,
+        target="Warriors", outcome=outcome, provenance_class=provenance_class,
+        readback=readback, rejection_class=rejection_class, detail="")
+
+
+def _d2_shares(records):
+    from lechonk.core.metrics import compute_metrics
+    from lechonk.core.schemas import TurnStartRecord
+    report = compute_metrics([TurnStartRecord(turn=1), *records])
+    return report.domain_model_shares
+
+
+def test_d2_contradicted_execution_excluded_from_both_sides():
+    """D2: a CONTRADICTED production execution (readback 'contradicted',
+    rejection_class illegal_in_rule — the rules engine proved
+    non-execution) enters NEITHER the share numerator NOR the
+    denominator: a domain containing only that record is n/a (0/0),
+    not 0/1. Flipping the same record's read-back back to 'verified'
+    puts it into both sides (1/1) — the gate is read-back-gated, not
+    outcome-gated; recorded evidence is never recomputed."""
+    from lechonk.core.metrics import STATUS_INSUFFICIENT, STATUS_NA
+    gated = _d2_shares([
+        _d2_action(1, "produce_warriors", readback="contradicted",
+                   rejection_class="illegal_in_rule"),
+    ])
+    assert (gated["production"].numerator,
+            gated["production"].denominator) == (0, 0)
+    assert gated["production"].status == STATUS_NA
+    assert gated["production"].value is None
+    # Flip the same record's read-back to verified: it enters both the
+    # numerator and the denominator (the record still says outcome
+    # "executed" either way).
+    credited = _d2_shares([
+        _d2_action(1, "produce_warriors"),
+    ])
+    assert (credited["production"].numerator,
+            credited["production"].denominator) == (1, 1)
+    assert credited["production"].status == STATUS_INSUFFICIENT
+
+
+def test_d2_engine_automatic_remains_in_denominator_only():
+    """D2: an engine_automatic record with readback 'none' (by
+    construction) stays in the denominator — it is creditable but
+    non-model, so it counts against the share (0/1, 'insufficient
+    sample', not n/a) and never enters the numerator."""
+    from lechonk.core.metrics import STATUS_INSUFFICIENT
+    shares = _d2_shares([
+        _d2_action(1, "produce_warriors", provenance_class="engine_automatic",
+                   readback="none"),
+    ])
+    assert (shares["production"].numerator,
+            shares["production"].denominator) == (0, 1)
+    assert shares["production"].status == STATUS_INSUFFICIENT
+    assert shares["production"].value is None
+
+
+def test_d2_share_statuses_unchanged_na_and_insufficient():
+    """D2 does not change the _share status boundaries: a domain with no
+    creditable executions at all is n/a (denominator 0); 1-4 creditable
+    executions stay 'insufficient sample' (not a number)."""
+    from lechonk.core.metrics import STATUS_INSUFFICIENT, STATUS_NA
+    shares = _d2_shares([])
+    assert shares["production"].status == STATUS_NA
+    assert (shares["production"].numerator,
+            shares["production"].denominator) == (0, 0)
+    shares = _d2_shares([_d2_action(1, f"produce_warriors_{i}")
+                         for i in range(4)])
+    assert (shares["production"].numerator,
+            shares["production"].denominator) == (4, 4)
+    assert shares["production"].status == STATUS_INSUFFICIENT
+    assert shares["production"].value is None
+
+
+def test_d2_mixed_fixture_hand_computed_shares():
+    """Hand-computed mixed fixture (production domain, all turn 1): four
+    verified model productions + one CONTRADICTED model production
+    (excluded from both sides) + one engine_automatic production
+    (denominator only) + one REJECTED model attempt (never executed, so
+    never in either side). Share = 4/5 = 0.8, 'ok' — under the ungated
+    rule it would have been 4/6 = 0.666...; research/expansion have no
+    executions and stay n/a."""
+    from lechonk.core.metrics import STATUS_OK, STATUS_NA
+    records = [
+        # 4 verified model productions: numerator + denominator.
+        *[_d2_action(1, f"produce_warriors_{i}") for i in range(4)],
+        # CONTRADICTED: excluded from BOTH sides (D2).
+        _d2_action(1, "produce_warriors_broken", readback="contradicted",
+                   rejection_class="illegal_in_rule"),
+        # engine_automatic: denominator only (creditable, non-model).
+        _d2_action(1, "produce_warriors_auto",
+                   provenance_class="engine_automatic", readback="none"),
+        # REJECTED: never executed, never in either side (pin).
+        _d2_action(1, "produce_warriors_rejected", outcome="rejected",
+                   readback="none", rejection_class="illegal_in_rule"),
+    ]
+    shares = _d2_shares(records)
+    assert (shares["production"].numerator,
+            shares["production"].denominator) == (4, 5)
+    assert shares["production"].status == STATUS_OK
+    assert shares["production"].value == pytest.approx(4 / 5)
+    for domain in ("research", "expansion"):
+        assert (shares[domain].numerator, shares[domain].denominator) == (0, 0)
+        assert shares[domain].status == STATUS_NA
