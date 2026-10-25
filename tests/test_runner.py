@@ -2092,3 +2092,167 @@ def test_mark_armed_in_contact_protects_offered_membership():
     mark_armed_in_contact(big, snapshot)
     assert {"unit:7:attack_e", "unit:7:fortify"} \
         <= set(big.offered().by_id())
+
+
+# ---------------------------------------------------------------------------
+# W2-4: stop all dispatch paths on game termination (claim 9)
+# ---------------------------------------------------------------------------
+
+
+class _GameEndingContinuationSession(FakeSession):
+    """The standing-order continuation ends the game: the SECOND send of
+    the named action (the turn-1 model order is the first) returns
+    terminated=True — the game-ending continuation injection."""
+
+    def __init__(self, worlds, *, terminate_on):
+        super().__init__(worlds)
+        self._terminate_on = terminate_on
+        self._terminate_sends = 0
+
+    def step(self, action, *, deadline=None):
+        if action is not None and tuple(action) == self._terminate_on:
+            self._terminate_sends += 1
+            if self._terminate_sends >= 2:
+                outcome = super().step(action, deadline=deadline)
+                return replace(outcome, terminated=True, truncated=False)
+        return super().step(action, deadline=deadline)
+
+
+class _GameOverOnResearchSession(FakeSession):
+    """The degraded default's research pick ends the game (terminated=True)
+    as its step outcome — the game-over-mid-degraded-group injection."""
+
+    def step(self, action, *, deadline=None):
+        if action is not None and action[0] == "tech" \
+                and str(action[2]).startswith("research_tech_"):
+            outcome = super().step(action, deadline=deadline)
+            return replace(outcome, terminated=True, truncated=False)
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_game_over_mid_batch_skips_standing_order_continuation(tmp_path):
+    """W2-4(a): an ordinary batch that ends the game mid-batch guards the
+    standing-order continuation entry — a continuable standing order
+    pending from turn 1 is never re-issued (no dispatch follows a dead
+    game)."""
+    worlds = [
+        turn_world(1),
+        turn_world(2, unit_overrides=[(11, {"activity": 0})]),
+        turn_world(3),
+    ]
+    session = _GameOverMidBatchSession(worlds,
+                                       terminate_on=("unit", 10, "goto_4"))
+    client = FakeModelClient([
+        ok_response(["unit:11:sentry"], turn_id="t1", with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "VICTORY"
+    assert "game over mid-batch" in result.reason
+    actions = _actions(_records(runner.ledger.path))
+    # The turn-1 standing order for unit 11 was continuable (the unit is
+    # idle again and the turn-2 batch holds no action for it) but the
+    # continuation never ran.
+    assert not [a for a in actions
+                if a.provenance_class == "continued_model_order"]
+    # Unit 11's sentry was sent exactly once (the turn-1 model order).
+    assert len([c for c in session.calls
+                if c[0] == ("unit", 11, "sentry")]) == 1
+
+
+def test_runner_game_over_mid_degraded_group_stops_next_group(tmp_path):
+    """W2-4(b): the degraded group loop stops before the next group once
+    the game ended mid-group — the pending city-production default is
+    never dispatched after the research pick terminated the game."""
+    session = _GameOverOnResearchSession([turn_world(1)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    adapter = runner._load_adapter()
+    runner._session = session  # direct-call tests: run() never ran
+    snapshot = _fixture_snapshot(session)
+    table = session.build_candidate_table()
+    # Premise: the degraded default resolves BOTH mandatory choices
+    # (research completed + city production empty) — two groups with two
+    # distinct actors, the research pick first.
+    from lechonk.comparator import defaults as defaults_mod
+    log = defaults_mod.decide(snapshot, table.offered())
+    assert [d.domain for d in log.decisions] == ["tech", "city"]
+
+    acted = runner._execute_degraded(
+        adapter, turn=1, table=table, snapshot=snapshot,
+        snapshot_seq=0, candidates_seq=0, why="test: degraded")
+    # The first group (the research pick) acted and ended the game.
+    assert acted == {"cur_player"}
+    assert runner._game_over == (True, False)
+    # The second group (the city production pick) was never dispatched:
+    # no city send, and the only scripted_default record is the research.
+    assert not [c for c in session.calls
+                if c[0] is not None and c[0][0] == "city"]
+    scripted = [a for a in _actions(_records(runner.ledger.path))
+                if a.provenance_class == "scripted_default"]
+    assert [a.domain for a in scripted] == ["tech"]
+
+
+def test_runner_game_ending_continuation_breaks_and_marks_game_over(tmp_path):
+    """W2-4(c): a standing-order continuation whose result carries
+    terminated breaks the continuation loop AND marks game over — the
+    next standing order is never dispatched, and the turn ends through
+    the game-over path (no finish primitive)."""
+    worlds = [
+        turn_world(1),
+        turn_world(2, unit_overrides=[(10, {"activity": 0}),
+                                      (11, {"activity": 0})]),
+        turn_world(3),
+    ]
+    session = _GameEndingContinuationSession(
+        worlds, terminate_on=("unit", 10, "sentry"))
+    client = FakeModelClient([
+        ok_response(["unit:10:sentry", "unit:11:sentry"],
+                    turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),  # responsive empty
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "VICTORY"
+    assert "game over mid-batch" in result.reason
+    actions = _actions(_records(runner.ledger.path))
+    continuations = [a for a in actions
+                     if a.provenance_class == "continued_model_order"]
+    # Only unit 10's continuation was dispatched — the game ended on it,
+    # so unit 11's standing order was never re-issued.
+    assert [a.ref for a in continuations] == ["unit:10:sentry"]
+    assert continuations[0].turn == 2
+    assert continuations[0].outcome == "executed"
+    assert continuations[0].readback == "verified"
+    # The sends: unit 10 sentried twice (model order + continuation),
+    # unit 11 exactly once (its model order; no continuation).
+    assert len([c for c in session.calls
+                if c[0] == ("unit", 10, "sentry")]) == 2
+    assert len([c for c in session.calls
+                if c[0] == ("unit", 11, "sentry")]) == 1
+    # No finish primitive after the game ended mid-continuation (only
+    # turn 1's finish advanced the phase).
+    assert len([c for c in session.calls if c[0] is None]) == 1
+
+
+def test_runner_game_ending_resend_marks_game_over(tmp_path):
+    """W2-4(d): a verified resubmission whose result carries terminated
+    marks game over at the resend site — the termination state is set
+    before the result flows back to any caller."""
+    session = _GameOverMidBatchSession([turn_world(1)],
+                                       terminate_on=GOTO_ACTION)
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    adapter = runner._load_adapter()
+    runner._session = session  # direct-call tests: run() never ran
+    cand = session.build_candidate_table().by_id()[GOTO_REF]
+    result, _seq = runner._resend_verified_non_execution(
+        adapter, cand, turn=1, provenance="model", snapshot_seq=0,
+        candidates_seq=0, origin_seq=0, target=None, affected=None,
+        actor_tile=None)
+    assert result.terminated and not result.truncated
+    assert result.readback.status == "verified"
+    assert runner._game_over == (True, False)

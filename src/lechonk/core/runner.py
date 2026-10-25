@@ -453,6 +453,9 @@ class GameRunner:
     # supervision
     # ------------------------------------------------------------------
 
+    def _terminated(self) -> bool:
+        return self._game_over is not None
+
     def _check_acting_deadline(self, acting_entered: float) -> None:
         if self._clock() - acting_entered > self.config.acting_deadline_s:
             raise StateDeadlineExceeded(
@@ -704,10 +707,14 @@ class GameRunner:
         # nothing to execute, no degraded default.
 
         self._check_abort()
-        self._continue_standing_orders(
-            adapter, turn=turn, table=table, snapshot=snapshot,
-            acted_actors=executed_actors,
-            snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
+        # W2-4: the game-over check guards the continuation entry — a
+        # mid-batch termination is checked BEFORE standing orders are
+        # re-issued; no dispatch follows a dead game.
+        if self._game_over is None:
+            self._continue_standing_orders(
+                adapter, turn=turn, table=table, snapshot=snapshot,
+                acted_actors=executed_actors,
+                snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
         self._check_acting_deadline(acting_entered)
         self._check_abort()
         if self._game_over is not None:
@@ -1141,6 +1148,10 @@ class GameRunner:
         acted: set[str] = set()
         remaining = list(planned)
         while remaining:
+            if self._terminated():
+                # W2-4: the game ended mid-group — no further group is
+                # dispatched (no dispatch follows a dead game).
+                break
             group = [remaining[0]]
             actor = remaining[0].candidate.actor_id
             while len(remaining) > len(group) \
@@ -1435,6 +1446,12 @@ class GameRunner:
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
             call_seq=None, readback=readback, detail=result.detail,
             durable=True)
+        if result.terminated or result.truncated:
+            # W2-4: a resubmission that ends the game marks termination at
+            # the resend site (mirrors the _execute_planned writer) — no
+            # dispatch path continues past a dead game.
+            self._game_over = (bool(result.terminated),
+                               bool(result.truncated))
         return result, seq
 
     # ------------------------------------------------------------------
@@ -1634,6 +1651,13 @@ class GameRunner:
             standing.reissued = True
             if readback == adapter.execute.CONTRADICTED:
                 del self._standing[actor]
+            if result.terminated or result.truncated:
+                # W2-4: a continuation that ends the game breaks the loop
+                # and marks termination (mirrors the _execute_planned
+                # writer) — no further standing order is dispatched.
+                self._game_over = (bool(result.terminated),
+                                   bool(result.truncated))
+                break
 
     def _standing_in_effect(self, standing: _StandingOrder,
                             table: CandidateTable) -> bool:
