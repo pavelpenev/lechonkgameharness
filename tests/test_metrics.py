@@ -642,3 +642,128 @@ def test_fw11_fixture_duplicate_prefers_in_run(fixtures, tmp_path):
     assert board[0]["status"] == "fulfilled_model"
     assert board[0]["fulfilled_by"] == [
         "tech:cur_player:research_tech_pottery_1"]
+
+
+# ---------------------------------------------------------------------------
+# FW-12: readback-gated credit, expansion opportunity domain, gate
+# domain-majority conjunct
+# ---------------------------------------------------------------------------
+
+
+def test_fw12_build_city_candidate_is_an_expansion_opportunity():
+    """FW-12: metric_domain maps a build_city candidate to "expansion", and
+    "expansion" is in OPPORTUNITY_DOMAINS — a build_city-only turn is a
+    turn-with-opportunities (housekeeping still excluded)."""
+    from lechonk.core.metrics import OPPORTUNITY_DOMAINS, opportunity_domains
+    from lechonk.core.schemas import Candidate
+    build = Candidate(id="unit:10:build_city", domain="unit",
+                      actor_id="unit:10", verb="build_city")
+    keep = Candidate(id="unit:11:cancel_order", domain="unit",
+                     actor_id="unit:11", verb="cancel_order")
+    assert "expansion" in OPPORTUNITY_DOMAINS
+    assert opportunity_domains([build]) == ["expansion"]
+    assert opportunity_domains([build, keep]) == ["expansion"]
+
+
+def test_fw12_fixture_contradicted_does_not_credit(fixtures, tmp_path):
+    """Hand-computed (see the fixture): the turn-3 CONTRADICTED research
+    (readback 'contradicted', rejection_class illegal_in_rule) does not
+    fulfill the Pottery commitment and does not count as acted against the
+    unit:20 threat; the turn-4 inconclusive scripted_default research does
+    not fulfill Currency; the turn-5 engine_automatic research (readback
+    'none' by construction) fulfills Writing by any policy."""
+    from lechonk.core.metrics import commitment_board
+    name = "fw12-contradicted-does-not-credit"
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    assert report.run_turns == tuple(exp["run_turns"])
+    assert report.commitment_total == exp["commitment_total"]
+    assert report.commitment_deduped == exp["commitment_deduped"]
+    assert report.commitment_censored == exp["commitment_censored"]
+    _assert_share(report.commitment_followthrough_any,
+                  exp["commitment_followthrough_any"],
+                  "commitment_followthrough_any")
+    _assert_share(report.commitment_followthrough_model,
+                  exp["commitment_followthrough_model"],
+                  "commitment_followthrough_model")
+    assert report.reason_mentions_total == exp["reason_mentions_total"]
+    assert report.reason_mentions_deduped == exp["reason_mentions_deduped"]
+    assert report.reason_mentions_censored == exp["reason_mentions_censored"]
+    # acted-count 0 (numerator 1 = the single mention): the contradicted
+    # attack on unit:20 is readback-gated out
+    _assert_share(report.reason_but_dont_act, exp["reason_but_dont_act"],
+                  "reason_but_dont_act")
+    # commitment_board uses the SAME readback-gated semantics (no parallel
+    # implementation)
+    statuses = {(e["domain"], e["target"]): e["status"]
+                for e in commitment_board(records)}
+    assert statuses == {
+        ("research", "Pottery"): "missed",      # contradicted -> no credit
+        ("research", "Currency"): "missed",     # inconclusive -> no credit
+        ("research", "Writing"): "fulfilled_other",  # engine_automatic
+    }
+
+
+def test_fw12_fixture_gate_fails_on_domain_share(fixtures, tmp_path):
+    """Hand-computed (see the fixture): participation 5/6 = 0.833... >= 0.8,
+    but the research domain share 2/6 = 0.333... is numeric and <= 0.5 ->
+    the gate FAILS even though the participation share alone would pass."""
+    name = "fw12-gate-fails-domain-share"
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    assert report.run_turns == tuple(exp["run_turns"])
+    _assert_share(report.participation, exp["participation"], "participation")
+    assert report.participation_gate_pass is exp["participation_gate_pass"]
+    for domain, expected in exp["domain_model_shares"].items():
+        _assert_share(report.domain_model_shares[domain], expected,
+                      f"domain_model_share:{domain}")
+
+
+def test_fw12_fixture_gate_passes_with_one_domain_na(fixtures, tmp_path):
+    """Hand-computed (see the fixture): participation 5/6 >= 0.8, research
+    and production numeric and > 0.5, expansion n/a (zero executed
+    decisions) — the n/a domain does not block -> the gate PASSES."""
+    name = "fw12-gate-passes-one-domain-na"
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    _assert_share(report.participation, exp["participation"], "participation")
+    assert report.participation_gate_pass is exp["participation_gate_pass"]
+    for domain, expected in exp["domain_model_shares"].items():
+        _assert_share(report.domain_model_shares[domain], expected,
+                      f"domain_model_share:{domain}")
+
+
+def test_fw12_fixture_gate_passes_all_domains_na(fixtures, tmp_path):
+    """Hand-computed (see the fixture): participation 5/6 >= 0.8 and all
+    three SHARE_DOMAINS n/a (no executed decisions in any of them) -> the
+    gate PASSES on the participation conjunct alone."""
+    name = "fw12-gate-all-domains-na"
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    _assert_share(report.participation, exp["participation"], "participation")
+    assert report.participation_gate_pass is exp["participation_gate_pass"]
+    for domain, expected in exp["domain_model_shares"].items():
+        _assert_share(report.domain_model_shares[domain], expected,
+                      f"domain_model_share:{domain}")
+
+
+def test_fw12_fixture_build_city_expansion_opportunity(fixtures, tmp_path):
+    """Hand-computed (see the fixture): build_city-only turns (opportunity
+    domains ['expansion'], as the runner now derives) are turns-with-
+    opportunities — all 6 enter the participation denominator — and the
+    model's build_city decisions give expansion 5/5 = 1.0 -> gate PASS."""
+    name = "fw12-build-city-expansion-opportunity"
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    assert report.run_turns == tuple(exp["run_turns"])
+    _assert_share(report.participation, exp["participation"], "participation")
+    assert report.participation.denominator == 6  # every turn counts
+    assert report.participation_gate_pass is exp["participation_gate_pass"]
+    for domain, expected in exp["domain_model_shares"].items():
+        _assert_share(report.domain_model_shares[domain], expected,
+                      f"domain_model_share:{domain}")

@@ -13,7 +13,9 @@ ledger-only — no free-text parsing anywhere):
 - participation = count(turns_with_model_participation) /
   count(turns_with_opportunities); a turn has opportunities iff its
   candidates_ref offered ≥1 consequential choice (research, production,
-  unit action, diplomacy response); model participation = ≥1 EXECUTED
+  expansion — a build_city founding choice — unit action, diplomacy
+  response; FW-12 adds expansion so a build_city-only turn counts);
+  model participation = ≥1 EXECUTED
   model-class or model-originated continued_model_order decision on the
   turn. Housekeeping, failed attempts, and zero-opportunity turns never
   enter numerator or denominator. Per-domain model-control shares
@@ -32,8 +34,12 @@ ledger-only — no free-text parsing anywhere):
   EXECUTED action (same domain + registered target + compatible verb) with
   turn in [emission turn, deadline] — FW-11: an action cannot predate the
   commitment's emission, and an unset verb accepts any action while a set
-  verb must be compatible per the dated addendum's verb mapping. Two
-  shares: intent realized by any policy (fulfilled_any), and model-attributed
+  verb must be compatible per the dated addendum's verb mapping. FW-12:
+  credit is readback-gated in both compute_metrics and commitment_board —
+  a crediting action has readback "verified", or provenance
+  "engine_automatic" (its readback is "none" by construction);
+  contradicted (provably non-executed) and inconclusive read-backs never
+  credit. Two shares: intent realized by any policy (fulfilled_any), and model-attributed
   (fulfilled_model: the fulfilling action's provenance is model, or
   continued_model_order whose ORIGIN action is model-class and itself
   matches the commitment) — a scripted default realizing the promise is
@@ -45,7 +51,8 @@ ledger-only — no free-text parsing anywhere):
   parsing), de-duplicated per (entity, turn). acted = a ledger action
   targeting that entity, its tile or 8 neighbors, or a defensive response
   (fortify/sentry at the threatened settlement — within Chebyshev 2 of the
-  threat tile — or a move strictly toward the threat tile) within ±2 turns.
+  threat tile — or a move strictly toward the threat tile) within ±2 turns;
+  acted is readback-gated like fulfillment credit (FW-12).
   Denominator = mentions whose full ±2-turn window falls inside the run;
   censored at run boundaries. Reported share = 1 − acted-rate.
 - illegal-action shares = counts by class (schema-error / state-fog-error /
@@ -94,8 +101,11 @@ HOUSEKEEPING_VERBS = frozenset({"cancel_order", "keep_activity"})
 # Defensive-response verbs (§3 line 41).
 DEFENSIVE_VERBS = frozenset({"fortify", "sentry"})
 # Metric domains that count as consequential choice opportunities.
+# FW-12: "expansion" is consequential (metric_domain maps a build_city
+# founding choice to "expansion") — a build_city-only turn is a
+# turn-with-opportunities.
 OPPORTUNITY_DOMAINS = frozenset(
-    {"research", "production", "unit_action", "diplomacy"})
+    {"research", "production", "expansion", "unit_action", "diplomacy"})
 # Per-domain model-control shares (§3 line 38): research, production,
 # expansion.
 SHARE_DOMAINS = ("research", "production", "expansion")
@@ -356,6 +366,22 @@ def _is_attempt(rec: ActionResultRecord) -> bool:
             and rec.outcome in ("executed", "rejected"))
 
 
+def _credits_execution(rec: ActionResultRecord) -> bool:
+    """Readback-gated execution credit (FW-12, §3 line 40
+    "ledger-verified"): an executed action counts for commitment
+    fulfillment and acted-on credit only when its ledger read-back
+    VERIFIED the mutation, or when the decision is an engine-automatic
+    resolution — those have readback "none" by construction
+    (runner._detect_engine_automatic emits no read-back) and remain
+    creditable per the frozen "any policy" wording. A CONTRADICTED action
+    (emitted outcome "executed" with readback "contradicted" and
+    rejection_class "illegal_in_rule" — the rules engine proved
+    non-execution) and an inconclusive read-back never credit."""
+    return (rec.outcome == "executed"
+            and (rec.readback == "verified"
+                 or rec.provenance_class == "engine_automatic"))
+
+
 def _commitment_matches(action: ActionResultRecord, c: Commitment) -> bool:
     """The frozen commitment-matching predicate (§3 line 40): the action's
     metric domain is compatible with the commitment's domain, its registered
@@ -468,7 +494,7 @@ def commitment_board(records: Sequence[TranscriptRecord]
             board.append(entry)
             continue
         fulfilling = [a for a in actions
-                      if a.outcome == "executed"
+                      if _credits_execution(a)
                       and emitted_turn <= a.turn <= c.deadline_turn
                       and _commitment_matches(a, c)]
         model_fulfilling = [a for a in fulfilling
@@ -513,10 +539,9 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
         note="model participation on turns-with-opportunities "
              "(housekeeping, failed attempts, zero-opportunity turns "
              "excluded)")
-    if report.participation.status == STATUS_OK:
-        report.participation_gate_pass = (
-            report.participation.value >= PARTICIPATION_GATE_THRESHOLD)
     # Per-domain model-control shares (research, production, expansion).
+    # Computed BEFORE the gate: the gate's domain-majority conjunct reads
+    # these shares.
     executed = [r for r in actions if r.outcome == "executed"]
     for domain in SHARE_DOMAINS:
         in_domain = [r for r in executed if _action_metric_domain(r) == domain]
@@ -525,6 +550,21 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
         report.domain_model_shares[domain] = _share(
             len(model_controlled), len(in_domain),
             note=f"majority-model share of executed {domain} decisions")
+    if report.participation.status == STATUS_OK:
+        # Gate (§3 line 38; FW-12): pass iff participation >= 0.80 AND
+        # every SHARE_DOMAINS share with a NUMERIC status is majority-model
+        # (> 0.5). A domain whose share is not a number — n/a (denominator
+        # 0: no executed decision in the metric domain at all) or
+        # "insufficient sample" (0 < denominator < MIN_DENOMINATOR, per
+        # _share) — has too small a sample to vote and does not block
+        # the gate.
+        numeric_shares = [
+            report.domain_model_shares[domain] for domain in SHARE_DOMAINS
+            if report.domain_model_shares.get(domain) is not None
+            and report.domain_model_shares[domain].status == STATUS_OK]
+        report.participation_gate_pass = (
+            report.participation.value >= PARTICIPATION_GATE_THRESHOLD
+            and all(s.value > 0.5 for s in numeric_shares))
 
     # ------------------------------------------------------------------
     # commitment follow-through (§3 line 40, §7.7)
@@ -545,7 +585,7 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
     fulfilled_model_count = 0
     for c, emitted_turn in in_run:
         fulfilling = [a for a in actions
-                      if a.outcome == "executed"
+                      if _credits_execution(a)
                       and emitted_turn <= a.turn <= c.deadline_turn
                       and _commitment_matches(a, c)]
         if fulfilling:
@@ -590,7 +630,9 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
     def acted(m: ThreatMention) -> bool:
         lo, hi = m.turn - REASON_WINDOW_TURNS, m.turn + REASON_WINDOW_TURNS
         for a in actions:
-            if a.outcome != "executed" or not (lo <= a.turn <= hi):
+            # FW-12: a contradicted or inconclusive read-back never counts
+            # as acting (same readback gate as fulfillment credit).
+            if not _credits_execution(a) or not (lo <= a.turn <= hi):
                 continue
             # (a) targeting the entity itself.
             for descriptor in (a.affected, a.target):

@@ -322,6 +322,194 @@
         "commitment_followthrough_any": {"numerator": 1, "denominator": 1, "value": null, "status": "insufficient sample"},
         "commitment_followthrough_model": {"numerator": 1, "denominator": 1, "value": null, "status": "insufficient sample"}
       }
+    },
+
+    "fw12-contradicted-does-not-credit": {
+      "description": "FW-12 readback-gated credit: a CONTRADICTED action (emitted outcome 'executed' with readback 'contradicted' and rejection_class 'illegal_in_rule' — the rules engine proved non-execution, runner._execute_one) and an inconclusive read-back never credit fulfillment or acted; an engine-automatic resolution (readback 'none' by construction) remains creditable per the frozen 'any policy' wording.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "commitment", "turn": 1, "commitments": [
+          {"domain": "research", "target": "Pottery", "deadline_turn": 4},
+          {"domain": "research", "target": "Currency", "deadline_turn": 5},
+          {"domain": "research", "target": "Writing", "deadline_turn": 5}
+        ], "threats": []},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "commitment", "turn": 3, "commitments": [], "threats": [
+          {"entity_id": "unit:20", "turn": 3, "tile": [2, 2]}
+        ]},
+        {"kind": "action_result", "turn": 3, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "rejection_class": "illegal_in_rule", "provenance_class": "model", "readback": "contradicted"},
+        {"kind": "action_result", "turn": 3, "ref": "unit:11:attack_n", "domain": "unit", "verb": "attack_n", "target": "unit:20", "affected": "unit:20", "actor_tile": [2, 1], "outcome": "executed", "rejection_class": "illegal_in_rule", "provenance_class": "model", "readback": "contradicted"},
+        {"kind": "turn_start", "turn": 4},
+        {"kind": "action_result", "turn": 4, "ref": "tech:cur_player:research_tech_currency_3", "domain": "tech", "verb": "research_tech_currency_3", "target": "Currency", "affected": "Currency", "outcome": "executed", "provenance_class": "scripted_default", "reason": "reconciliation read-back inconclusive: state unchanged after reconnect", "readback": "inconclusive"},
+        {"kind": "turn_start", "turn": 5},
+        {"kind": "action_result", "turn": 5, "ref": "engine_automatic:research:Writing", "domain": "tech", "verb": "research_tech_auto", "target": "Writing", "affected": "Writing", "outcome": "executed", "provenance_class": "engine_automatic", "readback": "none"},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "run [1,5]; 3 commitments (distinct keys (Pottery,research), (Currency,research), (Writing,research)) -> total 3, deduped 0; deadlines 4,5,5 inside [1,5] -> censored 0, denominator 3. c_Pottery: its only matching action is the turn-3 research Pottery - emitted 1 <= 3 <= 4, domain+target+verb match, but readback 'contradicted' (rejection_class illegal_in_rule, provably non-executed) -> NOT credited. c_Currency: the turn-4 scripted_default research has readback 'inconclusive' -> never credits (only engine_automatic is exempt) -> NOT fulfilled. c_Writing: the turn-5 engine_automatic research (readback 'none' by construction, provenance engine_automatic) IS creditable -> fulfilled, 1 <= 5 <= 5. fulfilled_any = 1/3, fulfilled_model = 0/3 (engine_automatic is not model/continued_model_order); denominator 3 < 5 -> both 'insufficient sample', value null. Threats: 1 mention (unit:20 @turn 3, window [1,5] inside [1,5]) -> 0 censored. acted: the only in-window action targeting unit:20 is the turn-3 CONTRADICTED attack -> readback gate excludes it -> acted 0/1, share numerator 1, denominator 1 < 5 -> 'insufficient sample'.",
+        "run_turns": [1, 5],
+        "commitment_total": 3,
+        "commitment_deduped": 0,
+        "commitment_censored": 0,
+        "commitment_followthrough_any": {"numerator": 1, "denominator": 3, "value": null, "status": "insufficient sample"},
+        "commitment_followthrough_model": {"numerator": 0, "denominator": 3, "value": null, "status": "insufficient sample"},
+        "reason_mentions_total": 1,
+        "reason_mentions_deduped": 0,
+        "reason_mentions_censored": 0,
+        "reason_but_dont_act": {"numerator": 1, "denominator": 1, "value": null, "status": "insufficient sample"}
+      }
+    },
+
+    "fw12-gate-fails-domain-share": {
+      "description": "FW-12 gate domain-majority: participation 5/6 >= 0.8 alone no longer passes; the research domain share is 2/6 <= 0.5 (numeric) -> the gate FAILS.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "candidates_ref", "turn": 1, "table_hash": "h1", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 1, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 1, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "candidates_ref", "turn": 2, "table_hash": "h2", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 2, "ref": "tech:cur_player:research_tech_writing_7", "domain": "tech", "verb": "research_tech_writing_7", "target": "Writing", "affected": "Writing", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 2, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "candidates_ref", "turn": 3, "table_hash": "h3", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 3, "ref": "tech:cur_player:research_tech_currency_3", "domain": "tech", "verb": "research_tech_currency_3", "target": "Currency", "affected": "Currency", "outcome": "executed", "provenance_class": "scripted_default", "reason": "model unresponsive after the repair cap; research_completed", "readback": "verified"},
+        {"kind": "action_result", "turn": 3, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 4},
+        {"kind": "candidates_ref", "turn": 4, "table_hash": "h4", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 4, "ref": "tech:cur_player:research_tech_masonry_4", "domain": "tech", "verb": "research_tech_masonry_4", "target": "Masonry", "affected": "Masonry", "outcome": "executed", "provenance_class": "scripted_default", "reason": "model unresponsive after the repair cap; research_completed", "readback": "verified"},
+        {"kind": "action_result", "turn": 4, "ref": "city:1:produce_granary", "domain": "city", "verb": "produce_granary", "target": "Granary", "affected": "Granary", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 5},
+        {"kind": "candidates_ref", "turn": 5, "table_hash": "h5", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 5, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "provenance_class": "scripted_default", "reason": "model unresponsive after the repair cap; research_completed", "readback": "verified"},
+        {"kind": "action_result", "turn": 5, "ref": "city:1:produce_settlers", "domain": "city", "verb": "produce_settlers", "target": "Settlers", "affected": "Settlers", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 6},
+        {"kind": "candidates_ref", "turn": 6, "table_hash": "h6", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 6, "ref": "tech:cur_player:research_tech_writing_7", "domain": "tech", "verb": "research_tech_writing_7", "target": "Writing", "affected": "Writing", "outcome": "executed", "provenance_class": "scripted_default", "reason": "model unresponsive after the repair cap; research_completed", "readback": "verified"},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "opportunity turns = {1..6} = 6; model-participation turns = {1,2,3,4,5} (each has a model executed decision; turn 6 has only a scripted_default) = 5 -> participation = 5/6 = 0.8333333333333334 >= 0.8. research executed = t1,t2 (model) + t3,t4,t5,t6 (scripted_default) = 6, model 2 -> 2/6 = 0.3333333333333333 (numeric, ok). production executed = t1,t2,t3,t4,t5 = 5, all model -> 5/5 = 1.0. expansion: no executed decisions -> 0/0 'n/a'. Gate = participation >= 0.8 AND every numeric domain share > 0.5: 0.8333 >= 0.8 holds but research 0.3333 <= 0.5 -> gate FAILS (False). The n/a expansion share does not block (non-numeric).",
+        "run_turns": [1, 6],
+        "participation": {"numerator": 5, "denominator": 6, "value": 0.8333333333333334, "status": "ok"},
+        "participation_gate_pass": false,
+        "domain_model_shares": {
+          "research": {"numerator": 2, "denominator": 6, "value": 0.3333333333333333, "status": "ok"},
+          "production": {"numerator": 5, "denominator": 5, "value": 1.0, "status": "ok"},
+          "expansion": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"}
+        }
+      }
+    },
+
+    "fw12-gate-passes-one-domain-na": {
+      "description": "FW-12 gate: participation 5/6 >= 0.8, research and production numeric and majority-model, expansion n/a (no executed decisions) -> the n/a domain does not block -> the gate PASSES.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "candidates_ref", "turn": 1, "table_hash": "h1", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 1, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 1, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "candidates_ref", "turn": 2, "table_hash": "h2", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 2, "ref": "tech:cur_player:research_tech_writing_7", "domain": "tech", "verb": "research_tech_writing_7", "target": "Writing", "affected": "Writing", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 2, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "candidates_ref", "turn": 3, "table_hash": "h3", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 3, "ref": "tech:cur_player:research_tech_currency_3", "domain": "tech", "verb": "research_tech_currency_3", "target": "Currency", "affected": "Currency", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 3, "ref": "city:1:produce_warriors", "domain": "city", "verb": "produce_warriors", "target": "Warriors", "affected": "Warriors", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 4},
+        {"kind": "candidates_ref", "turn": 4, "table_hash": "h4", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 4, "ref": "tech:cur_player:research_tech_masonry_4", "domain": "tech", "verb": "research_tech_masonry_4", "target": "Masonry", "affected": "Masonry", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 4, "ref": "city:1:produce_granary", "domain": "city", "verb": "produce_granary", "target": "Granary", "affected": "Granary", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 5},
+        {"kind": "candidates_ref", "turn": 5, "table_hash": "h5", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "action_result", "turn": 5, "ref": "tech:cur_player:research_tech_bronze working_5", "domain": "tech", "verb": "research_tech_bronze working_5", "target": "Bronze Working", "affected": "Bronze Working", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 5, "ref": "city:1:produce_settlers", "domain": "city", "verb": "produce_settlers", "target": "Settlers", "affected": "Settlers", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 6},
+        {"kind": "candidates_ref", "turn": 6, "table_hash": "h6", "candidate_count": 2, "by_domain": {"tech": 1, "city": 1}, "opportunity_domains": ["production", "research"]},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "opportunity turns = {1..6} = 6; model-participation turns = {1,2,3,4,5} = 5 -> participation = 5/6 = 0.8333333333333334 >= 0.8. research executed = 5, all model -> 5/5 = 1.0; production executed = 5, all model -> 5/5 = 1.0; expansion: no executed decisions -> 0/0 'n/a'. Gate = 0.8333 >= 0.8 AND research 1.0 > 0.5 AND production 1.0 > 0.5 (expansion is n/a: zero-choice domain, too small a sample to vote, does not block) -> gate PASSES (True).",
+        "run_turns": [1, 6],
+        "participation": {"numerator": 5, "denominator": 6, "value": 0.8333333333333334, "status": "ok"},
+        "participation_gate_pass": true,
+        "domain_model_shares": {
+          "research": {"numerator": 5, "denominator": 5, "value": 1.0, "status": "ok"},
+          "production": {"numerator": 5, "denominator": 5, "value": 1.0, "status": "ok"},
+          "expansion": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"}
+        }
+      }
+    },
+
+    "fw12-gate-all-domains-na": {
+      "description": "FW-12 gate: participation 5/6 >= 0.8 and NO executed decisions in research, production, or expansion at all -> all three domain shares n/a -> none blocks -> the gate PASSES on the participation conjunct alone.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "candidates_ref", "turn": 1, "table_hash": "h1", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "action_result", "turn": 1, "ref": "unit:10:goto_e", "domain": "unit", "verb": "goto_e", "target": "tile:2,1", "affected": "tile:2,1", "actor_tile": [1, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "candidates_ref", "turn": 2, "table_hash": "h2", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "action_result", "turn": 2, "ref": "unit:10:goto_e", "domain": "unit", "verb": "goto_e", "target": "tile:3,1", "affected": "tile:3,1", "actor_tile": [2, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "candidates_ref", "turn": 3, "table_hash": "h3", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "action_result", "turn": 3, "ref": "unit:10:goto_e", "domain": "unit", "verb": "goto_e", "target": "tile:4,1", "affected": "tile:4,1", "actor_tile": [3, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 4},
+        {"kind": "candidates_ref", "turn": 4, "table_hash": "h4", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "action_result", "turn": 4, "ref": "unit:10:goto_e", "domain": "unit", "verb": "goto_e", "target": "tile:5,1", "affected": "tile:5,1", "actor_tile": [4, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 5},
+        {"kind": "candidates_ref", "turn": 5, "table_hash": "h5", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "action_result", "turn": 5, "ref": "unit:10:goto_e", "domain": "unit", "verb": "goto_e", "target": "tile:6,1", "affected": "tile:6,1", "actor_tile": [5, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 6},
+        {"kind": "candidates_ref", "turn": 6, "table_hash": "h6", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["unit_action"]},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "opportunity turns = {1..6} = 6; model-participation turns = {1,2,3,4,5} (goto_e is a unit action, not housekeeping) = 5 -> participation = 5/6 = 0.8333333333333334 >= 0.8. Executed decisions are all unit_action (goto_e), which is not in SHARE_DOMAINS -> research/production/expansion each 0 executed -> 0/0 'n/a' for all three. Gate = 0.8333 >= 0.8 AND (no numeric domain share to violate) -> gate PASSES (True).",
+        "run_turns": [1, 6],
+        "participation": {"numerator": 5, "denominator": 6, "value": 0.8333333333333334, "status": "ok"},
+        "participation_gate_pass": true,
+        "domain_model_shares": {
+          "research": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"},
+          "production": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"},
+          "expansion": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"}
+        }
+      }
+    },
+
+    "fw12-build-city-expansion-opportunity": {
+      "description": "FW-12 expansion opportunity domain: build_city-only candidate tables (the runner now derives opportunity_domains ['expansion'] for them) are turns-with-opportunities — they enter the participation denominator, and the model's build_city decisions form the expansion domain share.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "candidates_ref", "turn": 1, "table_hash": "h1", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "action_result", "turn": 1, "ref": "unit:10:build_city", "domain": "unit", "verb": "build_city", "target": "tile:2,1", "affected": "tile:2,1", "actor_tile": [2, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "candidates_ref", "turn": 2, "table_hash": "h2", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "action_result", "turn": 2, "ref": "unit:10:build_city", "domain": "unit", "verb": "build_city", "target": "tile:3,1", "affected": "tile:3,1", "actor_tile": [3, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "candidates_ref", "turn": 3, "table_hash": "h3", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "action_result", "turn": 3, "ref": "unit:10:build_city", "domain": "unit", "verb": "build_city", "target": "tile:4,1", "affected": "tile:4,1", "actor_tile": [4, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 4},
+        {"kind": "candidates_ref", "turn": 4, "table_hash": "h4", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "action_result", "turn": 4, "ref": "unit:10:build_city", "domain": "unit", "verb": "build_city", "target": "tile:5,1", "affected": "tile:5,1", "actor_tile": [5, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 5},
+        {"kind": "candidates_ref", "turn": 5, "table_hash": "h5", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "action_result", "turn": 5, "ref": "unit:10:build_city", "domain": "unit", "verb": "build_city", "target": "tile:6,1", "affected": "tile:6,1", "actor_tile": [6, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 6},
+        {"kind": "candidates_ref", "turn": 6, "table_hash": "h6", "candidate_count": 1, "by_domain": {"unit": 1}, "opportunity_domains": ["expansion"]},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "Every turn offers only a build_city choice -> opportunity_domains ['expansion'] (metric_domain maps unit/build_city -> expansion, which is in OPPORTUNITY_DOMAINS per FW-12) -> all 6 turns are turns-with-opportunities. Model build_city executed on turns 1-5 -> model-participation turns = 5 -> participation = 5/6 = 0.8333333333333334 >= 0.8. expansion domain share: executed = 5 build_city, all model -> 5/5 = 1.0; research/production: no executed decisions -> 'n/a'. Gate = 0.8333 >= 0.8 AND expansion 1.0 > 0.5 -> True. Pre-FW-12 these build_city-only turns would have offered no recognized opportunity domain and dropped out of the denominator entirely.",
+        "run_turns": [1, 6],
+        "participation": {"numerator": 5, "denominator": 6, "value": 0.8333333333333334, "status": "ok"},
+        "participation_gate_pass": true,
+        "domain_model_shares": {
+          "research": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"},
+          "production": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"},
+          "expansion": {"numerator": 5, "denominator": 5, "value": 1.0, "status": "ok"}
+        }
+      }
     }
   }
 }
