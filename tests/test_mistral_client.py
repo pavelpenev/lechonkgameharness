@@ -17,8 +17,10 @@ package-A surface (design-plan-freeciv-v1.1.md decision 4 + decision 8):
 - per-call logging fields (tokens, latency, cost, fingerprint data);
 - the no-secret assertion: the key never appears in any log line or
   serialized artifact;
-- the per-arm model fingerprint probe (fixed prompt, temperature 0, output
-  hash) and the P10 probe methods under a mock transport;
+- the per-arm model fingerprint probe (fixed prompt, the arm sampling,
+  output hash) and the P10 probe methods under a mock transport;
+- the arm sampling (FW-20): every call path — turn calls and probes alike —
+  carries temperature 1.0 and reasoning_effort "high" and never sends top_p;
 - the model package stays civrealm-free and MIT-marked (plan §7.1).
 """
 
@@ -26,11 +28,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
 import subprocess
 import sys
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,15 +89,19 @@ class MockTransport:
     outcomes: list = field(default_factory=list)
     calls: list = field(default_factory=list)
 
-    def complete(self, *, messages, model, temperature, max_tokens,
-                 response_format, random_seed, timeout_ms=None,
-                 disable_transport_retries=False):
+    def complete(self, *, messages, model, temperature, reasoning_effort,
+                 max_tokens, response_format, random_seed, timeout_ms=None,
+                 disable_transport_retries=False, **extra):
+        # extra captures any unexpected sampling kwarg (e.g. a forbidden
+        # top_p emission would surface here, never silently dropped)
         self.calls.append({
             "messages": list(messages), "model": model,
-            "temperature": temperature, "max_tokens": max_tokens,
+            "temperature": temperature, "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
             "response_format": response_format, "random_seed": random_seed,
             "timeout_ms": timeout_ms,
             "disable_transport_retries": disable_transport_retries,
+            **extra,
         })
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -393,8 +401,8 @@ class InternallyRetryingTransport:
     calls: list = field(default_factory=list)
     network_calls: int = 0
 
-    def complete(self, *, messages, model, temperature, max_tokens,
-                 response_format, random_seed, timeout_ms=None,
+    def complete(self, *, messages, model, temperature, reasoning_effort,
+                 max_tokens, response_format, random_seed, timeout_ms=None,
                  disable_transport_retries=False):
         self.calls.append({
             "messages": list(messages),
@@ -854,8 +862,11 @@ def test_fingerprint_probe_deterministic_and_fixed():
     expected = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
     assert probe.fingerprint == expected
     assert probe.output_hash == expected.removeprefix("sha256:")
-    # deterministic sampling: temperature 0, no response_format
-    assert transport.calls[0]["temperature"] == 0.0
+    # arm sampling (FW-20): temperature 1.0, reasoning_effort high,
+    # no response_format, never top_p
+    assert transport.calls[0]["temperature"] == 1.0
+    assert transport.calls[0]["reasoning_effort"] == "high"
+    assert "top_p" not in transport.calls[0]
     assert transport.calls[0]["response_format"] is None
     # the fixed probe prompt (versioned file) with its recorded hash
     assert probe.prompt_hash == prompts.prompt_hash(prompts.FINGERPRINT_PROBE)
@@ -919,7 +930,9 @@ def test_probe_json_schema_support_mock_supported():
             "strict": True,
         },
     }
-    assert transport.calls[0]["temperature"] == 0.0
+    assert transport.calls[0]["temperature"] == 1.0
+    assert transport.calls[0]["reasoning_effort"] == "high"
+    assert "top_p" not in transport.calls[0]
 
 
 def test_probe_json_schema_support_mock_unsupported():
@@ -940,6 +953,94 @@ def test_probe_json_schema_support_mock_transport_failure():
     assert probe.responded is False
     assert probe.json_schema_supported is False
     assert "503" in probe.error
+
+
+# ---------------------------------------------------------------------------
+# Arm sampling (FW-20: temperature 1.0, reasoning_effort high, never top_p)
+# ---------------------------------------------------------------------------
+
+
+def test_default_arm_sampling_settings():
+    """FW-20: the constructor defaults are the arm sampling — temperature
+    1.0 (previously 0.0) and reasoning_effort "high"."""
+    client = make_client(MockTransport())
+    assert client.temperature == 1.0
+    assert client.reasoning_effort == "high"
+    assert mc.DEFAULT_TEMPERATURE == 1.0
+    assert mc.DEFAULT_REASONING_EFFORT == "high"
+
+
+def test_every_call_path_carries_arm_sampling():
+    """ALL call paths — the turn path (initial AND repair attempts) and
+    every probe path (fingerprint, model-id, json-schema) — carry the arm
+    sampling: temperature 1.0, reasoning_effort "high", and NEVER a top_p
+    key (via a mock transport; FW-20 removed every temperature=0 override
+    and the greedy top_p=1.0 dict)."""
+    transport = MockTransport(outcomes=[
+        raw_completion("garbage"),  # turn attempt 1: schema error
+        raw_completion(VALID_BATCH),  # turn repair attempt
+        raw_completion("LECHONK-FINGERPRINT-7f3a91c2"),  # fingerprint probe
+        raw_completion("OK"),  # model-id probe
+        raw_completion(VALID_BATCH),  # json-schema probe
+    ])
+    client = make_client(transport)
+    result = client.action_batch(messages=turn_messages(),
+                                 prompt_hash="sha256:test",
+                                 attempts=TurnAttempts())
+    assert result.batch.turn_id == "run1/t1"
+    client.probe_fingerprint()
+    client.probe_model_id()
+    client.probe_json_schema_support(probe_prompt="return a batch")
+    assert len(transport.calls) == 5
+    assert [log.kind for log in client.call_logs] == [
+        "initial", "repair", "probe", "probe", "probe"]
+    for call in transport.calls:
+        assert call["temperature"] == 1.0
+        assert call["reasoning_effort"] == "high"
+        assert "top_p" not in call
+
+
+def test_call_log_records_reasoning_effort():
+    """CallLog records reasoning_effort (additive field, default "high",
+    freeze-safe)."""
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH)])
+    client = make_client(transport)
+    client.action_batch(messages=turn_messages(), prompt_hash="sha256:test",
+                        attempts=TurnAttempts())
+    log = client.call_logs[0]
+    assert log.reasoning_effort == "high"
+    assert log.to_dict()["reasoning_effort"] == "high"
+    assert log.temperature == 1.0
+
+
+def test_reasoning_effort_configurable_per_client():
+    """A client-level reasoning_effort override reaches the transport and
+    the call log (tests may override via mock transports)."""
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH)])
+    client = make_client(transport, reasoning_effort="low")
+    client.action_batch(messages=turn_messages(), prompt_hash="sha256:test",
+                        attempts=TurnAttempts())
+    assert transport.calls[0]["reasoning_effort"] == "low"
+    assert client.call_logs[0].reasoning_effort == "low"
+
+
+def test_installed_sdk_chat_complete_accepts_reasoning_effort():
+    """FW-20 offline SDK verification: the installed mistralai package's
+    Chat.complete accepts reasoning_effort as an explicit parameter and
+    "high" is a valid ReasoningEffort value. Skipped gracefully when the
+    package is absent."""
+    chat = pytest.importorskip("mistralai.client.chat")
+    effort = pytest.importorskip("mistralai.client.models.reasoningeffort")
+    sig = inspect.signature(chat.Chat.complete)
+    assert "reasoning_effort" in sig.parameters
+    # ReasoningEffort is Union[Literal[...], UnrecognizedStr]: unwrap the
+    # Literal member before checking the vocabulary
+    literals = [
+        arg for arg in typing.get_args(effort.ReasoningEffort)
+        if typing.get_origin(arg) is typing.Literal
+    ]
+    assert literals, "ReasoningEffort lost its Literal vocabulary"
+    assert all("high" in typing.get_args(lit) for lit in literals)
 
 
 # ---------------------------------------------------------------------------

@@ -34,10 +34,15 @@ provisional default is ``validated_parse`` (fail-safe: it does not depend on
 an unverified platform capability); ``scripts/wp2_spike.py`` re-decides with
 live evidence once a key is available.
 
+Arm sampling (decision 4, 2026-10-24 amendment): EVERY call — turn calls
+(including repairs) and capability probes alike — runs at the arm sampling:
+temperature 1.0 with ``reasoning_effort="high"``; the client NEVER sends
+``top_p`` (the previous greedy temperature-0 + ``top_p=1.0`` sampling is
+forbidden).
+
 Per-arm model fingerprint (decision 8): ``probe_fingerprint`` sends a FIXED
-probe prompt with deterministic sampling (temperature 0) and records the
-output hash; the fingerprint travels with every per-call log and goes into the
-run manifest.
+probe prompt under the arm sampling and records the output hash; the
+fingerprint travels with every per-call log and goes into the run manifest.
 
 This module never imports civrealm (plan §7.1). The official ``mistralai``
 SDK is imported lazily by ``MistralSDKTransport`` only — offline tests drive
@@ -80,6 +85,8 @@ MAX_REPAIRS_PER_TURN = 1
 # attempt must fit well inside it, leaving room for the repair attempt).
 DEFAULT_TIMEOUT_MS = 120_000
 DEFAULT_MAX_TOKENS = 8192
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_REASONING_EFFORT = "high"
 
 # Studio list prices, USD per million tokens. PROVISIONAL for
 # ``mistral-large-4``: carried from the published Mistral Large list price
@@ -259,7 +266,11 @@ class ChatTransport(Protocol):
     the harness-level attempt structure (attempt 1 + one repair) is the
     harness's retry policy, and a transport retry inside a budgeted repair
     would silently exceed the repair's budget. The initial attempt keeps the
-    transport's transparent retries."""
+    transport's transparent retries.
+
+    ``reasoning_effort``: the reasoning-effort setting passed through to the
+    API (decision 4 amendment: the arm runs ``"high"``). The transport NEVER
+    sends ``top_p``."""
 
     def complete(
         self,
@@ -267,6 +278,7 @@ class ChatTransport(Protocol):
         messages: list[Message],
         model: str,
         temperature: float,
+        reasoning_effort: str,
         max_tokens: int,
         response_format: Optional[dict[str, Any]],
         random_seed: Optional[int],
@@ -359,6 +371,7 @@ class MistralSDKTransport:
         messages: list[Message],
         model: str,
         temperature: float,
+        reasoning_effort: str,
         max_tokens: int,
         response_format: Optional[dict[str, Any]],
         random_seed: Optional[int],
@@ -373,19 +386,19 @@ class MistralSDKTransport:
 
         sdk = self._sdk_no_retries if disable_transport_retries else self._sdk
         try:
-            # Greedy sampling (temperature 0) requires top_p == 1 on the
-            # API (error 3054 otherwise); the SDK leaves top_p unset.
-            greedy: dict[str, Any] = (
-                {"top_p": 1.0} if temperature == 0 else {})
+            # Arm sampling (decision 4 amendment): reasoning_effort is passed
+            # through as an explicit Chat.complete parameter (offline-verified
+            # against mistralai 3.4.0); top_p is NEVER sent (omitting it is
+            # safe — the SDK leaves it unset).
             response = sdk.chat.complete(
                 model=model,
                 messages=messages,
                 temperature=temperature,
+                reasoning_effort=reasoning_effort,
                 max_tokens=max_tokens,
                 response_format=response_format,
                 random_seed=random_seed,
                 timeout_ms=timeout_ms,
-                **greedy,
             )
         except (NoResponseError, ResponseValidationError) as exc:
             raise TransportError(
@@ -481,6 +494,7 @@ class CallLog:
     transport_retries: int
     error: Optional[str]
     ts: str
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -492,6 +506,7 @@ class CallLog:
             "model_responded": self.model_responded,
             "enforcement": self.enforcement,
             "temperature": self.temperature,
+            "reasoning_effort": self.reasoning_effort,
             "latency_ms": self.latency_ms,
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
@@ -557,8 +572,9 @@ class AttemptOutcome:
 
 @dataclass
 class FingerprintProbe:
-    """Per-arm model fingerprint (decision 8): fixed probe prompt,
-    deterministic sampling (temperature 0), recorded output hash."""
+    """Per-arm model fingerprint (decision 8): fixed probe prompt, the arm's
+    own sampling (temperature 1.0, reasoning_effort high, no top_p),
+    recorded output hash."""
 
     fingerprint: str  # "sha256:<hex>" of the probe output
     output_hash: str
@@ -806,7 +822,8 @@ class MistralClient:
         pricing: Optional[dict[str, dict[str, float]]] = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = 0.0,
+        temperature: float = DEFAULT_TEMPERATURE,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         random_seed: Optional[int] = None,
         log_sink: Optional[Callable[[CallLog], None]] = None,
     ):
@@ -829,6 +846,7 @@ class MistralClient:
         self.pricing = pricing if pricing is not None else DEFAULT_PRICING_USD_PER_MTOK
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.reasoning_effort = reasoning_effort
         self.random_seed = random_seed
         self._transport: ChatTransport = (
             transport if transport is not None
@@ -866,6 +884,7 @@ class MistralClient:
         latency_ms: int,
         raw: Optional[RawCompletion],
         error: Optional[str],
+        reasoning_effort: str,
     ) -> CallLog:
         return CallLog(
             call_id=self._next_call_id(),
@@ -888,6 +907,7 @@ class MistralClient:
             transport_retries=raw.transport_retries if raw is not None else 0,
             error=error,
             ts=_utc_now_iso(),
+            reasoning_effort=reasoning_effort,
         )
 
     # -- one logical attempt -------------------------------------------------
@@ -919,6 +939,7 @@ class MistralClient:
         kind: str,
         prompt_hash: str,
         temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
         max_tokens: Optional[int] = None,
         response_format: Any = _KEEP,
         timeout_ms: Optional[int] = None,
@@ -932,10 +953,15 @@ class MistralClient:
         ``disable_transport_retries`` forces exactly one request attempt in
         the transport — used on budgeted repair attempts so their TOTAL
         duration stays within ``timeout_ms``; None/False keeps the transport's
-        transparent retries (attempt 1 behavior, unchanged)."""
+        transparent retries (attempt 1 behavior, unchanged).
+        ``reasoning_effort``: None = the configured arm effort; the transport
+        NEVER sends ``top_p``."""
         t0 = time.perf_counter()
         effective_temperature = (self.temperature if temperature is None
                                  else temperature)
+        effective_reasoning_effort = (self.reasoning_effort
+                                      if reasoning_effort is None
+                                      else reasoning_effort)
         effective_max_tokens = (self.max_tokens if max_tokens is None
                                 else max_tokens)
         effective_response_format = (self._response_format_payload()
@@ -946,6 +972,7 @@ class MistralClient:
                 messages=messages,
                 model=self.model,
                 temperature=effective_temperature,
+                reasoning_effort=effective_reasoning_effort,
                 max_tokens=effective_max_tokens,
                 response_format=effective_response_format,
                 random_seed=self.random_seed,
@@ -956,19 +983,22 @@ class MistralClient:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             self._emit_log(self._make_call_log(
                 attempt=attempt, kind=kind, prompt_hash=prompt_hash,
-                latency_ms=latency_ms, raw=None, error=str(exc)))
+                latency_ms=latency_ms, raw=None, error=str(exc),
+                reasoning_effort=effective_reasoning_effort))
             raise
         except Exception as exc:  # unexpected transport bug — same accounting
             latency_ms = int((time.perf_counter() - t0) * 1000)
             wrapped = TransportError(f"transport failure: {exc}")
             self._emit_log(self._make_call_log(
                 attempt=attempt, kind=kind, prompt_hash=prompt_hash,
-                latency_ms=latency_ms, raw=None, error=str(wrapped)))
+                latency_ms=latency_ms, raw=None, error=str(wrapped),
+                reasoning_effort=effective_reasoning_effort))
             raise wrapped from exc
         latency_ms = int((time.perf_counter() - t0) * 1000)
         self._emit_log(self._make_call_log(
             attempt=attempt, kind=kind, prompt_hash=prompt_hash,
-            latency_ms=latency_ms, raw=raw, error=None))
+            latency_ms=latency_ms, raw=raw, error=None,
+            reasoning_effort=effective_reasoning_effort))
         return raw
 
     # -- output enforcement ---------------------------------------------------
@@ -1157,10 +1187,12 @@ class MistralClient:
 
     def probe_fingerprint(self) -> FingerprintProbe:
         """Per-arm model fingerprint: a FIXED probe prompt (versioned file,
-        hash recorded) with deterministic sampling (temperature 0); the
-        recorded output hash is the fingerprint. Cached on the client
-        (``arm_fingerprint``) and carried by every subsequent per-call log.
-        One logical probe attempt (not a turn call)."""
+        hash recorded) under the arm's sampling (temperature 1.0,
+        reasoning_effort high, no top_p — decision 4 amendment: every call
+        runs at the arm sampling); the recorded output hash is the
+        fingerprint. Cached on the client (``arm_fingerprint``) and carried
+        by every subsequent per-call log. One logical probe attempt (not a
+        turn call)."""
         prompt_text = prompt_templates.fingerprint_probe_prompt()
         messages: list[Message] = [
             {"role": "system",
@@ -1172,7 +1204,7 @@ class MistralClient:
             messages=messages, attempt=0, kind="probe",
             prompt_hash=prompt_templates.prompt_hash(
                 prompt_templates.FINGERPRINT_PROBE),
-            temperature=0.0, max_tokens=256, response_format=None)
+            max_tokens=256, response_format=None)
         output_hash = hashlib.sha256(
             raw.content.encode("utf-8")).hexdigest()
         probe = FingerprintProbe(
@@ -1182,7 +1214,7 @@ class MistralClient:
             model_responded=raw.model,
             prompt_hash=prompt_templates.prompt_hash(
                 prompt_templates.FINGERPRINT_PROBE),
-            temperature=0.0,
+            temperature=self.temperature,
             tokens_in=raw.prompt_tokens,
             tokens_out=raw.completion_tokens,
             tokens_total=raw.total_tokens,
@@ -1207,7 +1239,7 @@ class MistralClient:
         try:
             raw = self._complete(
                 messages=messages, attempt=0, kind="probe",
-                prompt_hash="p10a-model-id", temperature=0.0, max_tokens=16,
+                prompt_hash="p10a-model-id", max_tokens=16,
                 response_format=None)
         except TransportError as exc:
             return ModelIdProbe(
@@ -1226,9 +1258,9 @@ class MistralClient:
         """P10b: test ``json_schema`` structured-output support on the exact
         model ID — a minimal ActionBatch-shaped request carrying the REAL
         ActionBatch JSON schema (candidate-ID-constrained ``ref`` fields),
-        strict mode, deterministic sampling. Evidence records the response
-        SHAPE (no raw model output beyond what evidences the decision).
-        Logged as a probe call."""
+        strict mode, the arm sampling (decision 4 amendment). Evidence
+        records the response SHAPE (no raw model output beyond what
+        evidences the decision). Logged as a probe call."""
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -1246,7 +1278,7 @@ class MistralClient:
         try:
             raw = self._complete(
                 messages=messages, attempt=0, kind="probe",
-                prompt_hash="p10b-json-schema", temperature=0.0,
+                prompt_hash="p10b-json-schema",
                 max_tokens=1024, response_format=response_format)
         except TransportError as exc:
             return JsonSchemaProbe(
