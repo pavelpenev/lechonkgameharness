@@ -2,7 +2,11 @@
 """lechonk.core.runner — the turn pipeline, state machine and supervisor (WP2).
 
 Implements design-plan-freeciv-v1.1.md §3 lines 32-35 and §7.1
-(core/runner.py module contract):
+(core/runner.py module contract). Turn-horizon note: when a run ends by
+reaching the turn horizon rather than by game-over or failure, the outcome
+is recorded as COMPLETED (an OUTCOME in the run result/manifest, not a
+state); its terminal state is NEXT_OWN_PHASE — no terminal
+state_transition event is emitted on horizon completion, by design.
 
 - Turn state machine: ACTING -> FINISH_SENT -> WAITING -> NEXT_OWN_PHASE |
   GAME_OVER | FAILED, with per-state progress deadlines enforced by the
@@ -521,6 +525,9 @@ class GameRunner:
             self._check_abort()
             turn = int(self._session.turn)
             if turn > self.config.max_turns:
+                # No terminal state_transition is emitted here by design:
+                # COMPLETED is an outcome, terminal state NEXT_OWN_PHASE
+                # (see the module docstring).
                 return "COMPLETED", (
                     f"horizon reached after {turns} own phases "
                     f"(max_turns={self.config.max_turns})"), turns
