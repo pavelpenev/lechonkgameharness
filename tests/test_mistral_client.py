@@ -17,8 +17,8 @@ package-A surface (design-plan-freeciv-v1.1.md decision 4 + decision 8):
 - per-call logging fields (tokens, latency, cost, fingerprint data);
 - the no-secret assertion: the key never appears in any log line or
   serialized artifact;
-- the per-arm model fingerprint probe (fixed prompt, the arm sampling,
-  output hash) and the P10 probe methods under a mock transport;
+- the per-arm model fingerprint probe (fixed prompt v2, the arm sampling,
+  the K=3 sample hash set) and the P10 probe methods under a mock transport;
 - the arm sampling (FW-20): every call path — turn calls and probes alike —
   carries temperature 1.0 and reasoning_effort "high" and never sends top_p;
 - the model package stays civrealm-free and MIT-marked (plan §7.1).
@@ -111,13 +111,40 @@ class MockTransport:
 
 def raw_completion(content, *, model=MODEL_ID, response_id="resp-1",
                    finish_reason="stop", prompt_tokens=100,
-                   completion_tokens=50, transport_retries=0):
+                   completion_tokens=50, transport_retries=0,
+                   sample_contents=None):
     return mc.RawCompletion(
         content=content, model=model, response_id=response_id, created=0,
         finish_reason=finish_reason, prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
-        transport_retries=transport_retries)
+        transport_retries=transport_retries,
+        sample_contents=sample_contents)
+
+
+@dataclass
+class MultiSampleMockTransport:
+    """Scripted transport DECLARING the multi-sample ``n`` parameter (the
+    SDK path's shape): one request returns K sample contents."""
+
+    outcomes: list = field(default_factory=list)
+    calls: list = field(default_factory=list)
+
+    def complete(self, *, messages, model, temperature, reasoning_effort,
+                 max_tokens, response_format, random_seed, n=None,
+                 timeout_ms=None, disable_transport_retries=False):
+        self.calls.append({
+            "messages": list(messages), "model": model,
+            "temperature": temperature, "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
+            "response_format": response_format, "random_seed": random_seed,
+            "n": n, "timeout_ms": timeout_ms,
+            "disable_transport_retries": disable_transport_retries,
+        })
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 def make_client(transport, *, key=CANARY_KEY, **kwargs):
@@ -838,7 +865,9 @@ def test_no_secret_in_any_log_line_or_sink(monkeypatch):
 
 def test_fingerprint_travels_with_call_logs_after_probe():
     transport = MockTransport(outcomes=[
-        raw_completion("LECHONK-FINGERPRINT-7f3a91c2"),
+        raw_completion("probe-sample-1"),
+        raw_completion("probe-sample-2"),
+        raw_completion("probe-sample-3"),
         raw_completion(VALID_BATCH),
     ])
     client = make_client(transport)
@@ -850,33 +879,117 @@ def test_fingerprint_travels_with_call_logs_after_probe():
 
 
 # ---------------------------------------------------------------------------
-# Fingerprint probe (decision 8) + P10 probes (mock transport)
+# Fingerprint probe (decision 8, FW-21: K=3 multi-sample, prompt v2) + P10
 # ---------------------------------------------------------------------------
 
 
-def test_fingerprint_probe_deterministic_and_fixed():
-    content = "LECHONK-FINGERPRINT-7f3a91c2"
-    transport = MockTransport(outcomes=[raw_completion(content)])
+def test_fingerprint_probe_k3_samples_sorted_hash_set():
+    """FW-21: the probe collects K=3 samples under the arm sampling and
+    records the sorted, deduplicated hash set; the probe uses prompt v2
+    with the raised max_tokens (recorded)."""
+    contents = ["alpha-output", "beta-output", "gamma-output"]
+    transport = MockTransport(outcomes=[raw_completion(c) for c in contents])
     client = make_client(transport)
     probe = client.probe_fingerprint()
-    expected = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
-    assert probe.fingerprint == expected
-    assert probe.output_hash == expected.removeprefix("sha256:")
-    # arm sampling (FW-20): temperature 1.0, reasoning_effort high,
-    # no response_format, never top_p
-    assert transport.calls[0]["temperature"] == 1.0
-    assert transport.calls[0]["reasoning_effort"] == "high"
-    assert "top_p" not in transport.calls[0]
-    assert transport.calls[0]["response_format"] is None
-    # the fixed probe prompt (versioned file) with its recorded hash
-    assert probe.prompt_hash == prompts.prompt_hash(prompts.FINGERPRINT_PROBE)
+    expected_hashes = sorted(
+        hashlib.sha256(c.encode("utf-8")).hexdigest() for c in contents)
+    assert mc.FINGERPRINT_PROBE_SAMPLES == 3
+    assert mc.FINGERPRINT_PROBE_MAX_TOKENS == 1024
+    assert probe.sample_attempts == 3
+    assert probe.sample_mode == mc.FINGERPRINT_MODE_SEQUENTIAL  # MockTransport declares no n
+    assert probe.output_hashes == expected_hashes
+    assert probe.fingerprint == "|".join(
+        f"sha256:{h}" for h in expected_hashes)
+    assert probe.max_tokens == 1024
+    # arm sampling on every probe request (FW-20) + the raised budget
+    assert len(transport.calls) == 3
+    for call in transport.calls:
+        assert call["temperature"] == 1.0
+        assert call["reasoning_effort"] == "high"
+        assert "top_p" not in call
+        assert call["response_format"] is None
+        assert call["max_tokens"] == 1024
+    # the fixed probe prompt v2 (versioned file) with its recorded hash
+    assert mc.FINGERPRINT_PROBE_PROMPT == "fingerprint_probe_v2"
+    assert probe.prompt_hash == prompts.prompt_hash("fingerprint_probe_v2")
+    assert (transport.calls[0]["messages"][-1]["content"]
+            == prompts.load_prompt("fingerprint_probe_v2"))
     assert probe.model_requested == MODEL_ID
     assert probe.model_responded == MODEL_ID
     # cached on the client and carried by later call logs
-    assert client.arm_fingerprint == expected
+    assert client.arm_fingerprint == probe.fingerprint
     # probe calls are logged too (decision 4: every call is logged)
+    assert [log.kind for log in client.call_logs] == ["probe"] * 3
+    assert all(log.attempt == 0 for log in client.call_logs)
+
+
+def test_fingerprint_probe_records_attempts_vs_unique_hashes():
+    """FW-21: K=3 attempts may yield fewer than three unique outputs —
+    the probe records attempts vs unique hashes (the deduplicated set)."""
+    transport = MockTransport(outcomes=[
+        raw_completion("same"), raw_completion("same"),
+        raw_completion("other")])
+    client = make_client(transport)
+    probe = client.probe_fingerprint()
+    assert probe.sample_attempts == 3
+    expected = sorted({hashlib.sha256(c.encode("utf-8")).hexdigest()
+                       for c in ("same", "other")})
+    assert len(probe.output_hashes) == 2
+    assert probe.output_hashes == expected
+    assert probe.fingerprint == "|".join(f"sha256:{h}" for h in expected)
+    assert probe.to_dict()["sample_attempts"] == 3
+    assert len(probe.to_dict()["output_hashes"]) == 2
+
+
+def test_fingerprint_probe_single_request_n3_mode():
+    """FW-21: when the transport supports multi-sample requests (the SDK
+    path: Chat.complete takes n — offline-verified), the K=3 samples come
+    from ONE request with n=3, and the mode is recorded."""
+    raw = raw_completion("first-choice",
+                         sample_contents=["s1", "s2", "s3"])
+    transport = MultiSampleMockTransport(outcomes=[raw])
+    client = make_client(transport)
+    probe = client.probe_fingerprint()
+    assert probe.sample_mode == mc.FINGERPRINT_MODE_SINGLE_REQUEST
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["n"] == 3
+    assert transport.calls[0]["max_tokens"] == 1024
+    assert transport.calls[0]["temperature"] == 1.0
+    assert transport.calls[0]["reasoning_effort"] == "high"
+    assert "top_p" not in transport.calls[0]
+    assert probe.sample_attempts == 3
+    expected = sorted(hashlib.sha256(s.encode("utf-8")).hexdigest()
+                      for s in ("s1", "s2", "s3"))
+    assert probe.output_hashes == expected
+    assert probe.fingerprint == "|".join(f"sha256:{h}" for h in expected)
+    assert len(client.call_logs) == 1
     assert client.call_logs[0].kind == "probe"
-    assert client.call_logs[0].attempt == 0
+
+
+def test_fingerprint_set_encoding_round_trip_and_legacy_scalar():
+    """FW-21: the persisted encoding is the sorted, deduplicated set of
+    'sha256:<hex>' hashes joined by '|'; a legacy scalar fingerprint is
+    exactly the one-element encoding (the documented fallback)."""
+    encoded = mc.encode_fingerprint_set(["bb", "aa", "bb"])
+    assert encoded == "sha256:aa|sha256:bb"
+    assert mc.decode_fingerprint_set(encoded) == ["sha256:aa", "sha256:bb"]
+    legacy = "sha256:" + "cd" * 32
+    assert mc.decode_fingerprint_set(legacy) == [legacy]
+    assert mc.decode_fingerprint_set(None) == []
+    assert mc.decode_fingerprint_set("") == []
+
+
+def test_fingerprint_probe_v2_prompt_file_present_and_v1_retained():
+    """FW-21: the v2 probe prompt exists on disk and is the one the probe
+    uses; v1 (the degenerate verbatim-echo prompt) is retained on disk."""
+    v2 = prompts.prompt_path("fingerprint_probe_v2")
+    v1 = prompts.prompt_path("fingerprint_probe_v1")
+    assert v2.is_file() and v1.is_file()
+    text = v2.read_text(encoding="utf-8")
+    for label in ("MODEL:", "LAB:", "PRODUCT:", "CAPITAL:", "SEQ:"):
+        assert label in text
+    # v2 is not the degenerate v1 verbatim echo
+    assert "LECHONK-FINGERPRINT-7f3a91c2" not in text
 
 
 def test_fingerprint_probe_transport_error_propagates():
@@ -979,7 +1092,9 @@ def test_every_call_path_carries_arm_sampling():
     transport = MockTransport(outcomes=[
         raw_completion("garbage"),  # turn attempt 1: schema error
         raw_completion(VALID_BATCH),  # turn repair attempt
-        raw_completion("LECHONK-FINGERPRINT-7f3a91c2"),  # fingerprint probe
+        raw_completion("probe-sample-1"),  # fingerprint probe (K=3,
+        raw_completion("probe-sample-2"),  # one request per sample:
+        raw_completion("probe-sample-3"),  # sequential mode)
         raw_completion("OK"),  # model-id probe
         raw_completion(VALID_BATCH),  # json-schema probe
     ])
@@ -991,9 +1106,9 @@ def test_every_call_path_carries_arm_sampling():
     client.probe_fingerprint()
     client.probe_model_id()
     client.probe_json_schema_support(probe_prompt="return a batch")
-    assert len(transport.calls) == 5
+    assert len(transport.calls) == 7
     assert [log.kind for log in client.call_logs] == [
-        "initial", "repair", "probe", "probe", "probe"]
+        "initial", "repair", "probe", "probe", "probe", "probe", "probe"]
     for call in transport.calls:
         assert call["temperature"] == 1.0
         assert call["reasoning_effort"] == "high"

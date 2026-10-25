@@ -692,7 +692,16 @@ class RunManifest(BaseModel):
     a plan amendment; ``extra="allow"`` is retained for forward-compat
     fields recorded by later packages. Optionality is retained because the
     manifest record is emitted at run start and WP3/eval owns populating
-    every field; the freeze is of the field set and its semantics."""
+    every field; the freeze is of the field set and its semantics.
+
+    ``model_fingerprint`` (decision 8, FW-21) persists the K=3 sample hash
+    SET, not a single hash: the sorted, deduplicated set of
+    ``sha256:<hex>`` sample output hashes joined by ``|`` (see
+    ``lechonk.model.mistral_client.encode_fingerprint_set``). A legacy
+    single-sample fingerprint (``sha256:<hex>``, the pre-FW-21 encoding)
+    is exactly the one-element set and remains loadable — the documented
+    fallback. The field set is unchanged; this note documents the string
+    encoding only."""
 
     model_config = ConfigDict(extra="allow")
 

@@ -103,6 +103,10 @@ IMAGE_DIGEST = ("sha256:4923253876a76d3c5f55c6007e530f6c3cd3120b9e2f37a"
 VENDORED_BASE_SHA = "1b144d6ec92a8aaa8e30eee64c881418208a4689"  # upstream dev
 PATCH_HEAD_SHA = "36ae456836015b22b086298430048fc51c317d50"  # PR #7 fork head
 CAPSTRING = "+Freeciv.Web.Devel-3.3"
+# FW-21: the reference fingerprint loaded from this artifact may be a
+# legacy scalar (a single "sha256:<hex>", the pre-FW-21 encoding) — it is
+# tolerated via the documented fallback: it decodes to a one-element hash
+# set and is compared by set intersection.
 SPIKE_ARTIFACT = os.path.join(
     REPO, "artifacts", "runs", "wp2-spike", "fingerprint_probe.json")
 OBSERVE_JS = os.path.join(REPO, "scripts", "wp0_observe_attach.js")
@@ -919,14 +923,20 @@ def cmd_arm(run_id, pair_index, policy, spectate):
                     "MISTRAL_API_KEY absent (presence-only check); bounded "
                     "fail-stop per decision 8 — the model arm cannot run")
             client = mc.MistralClient(enforcement="json_schema")
-            # The per-arm fingerprint (decision 8): the fixed probe prompt,
-            # deterministic sampling, recorded output hash — re-probed ONCE
-            # on a mismatch with the reference (the WP2 spike artifact).
+            # The per-arm fingerprint (decision 8, FW-21): the fixed probe
+            # prompt v2, K=3 samples under the arm sampling, the persisted
+            # sorted sample-hash SET — re-probed ONCE on a set-intersection
+            # mismatch with the reference (the WP2 spike artifact; a legacy
+            # scalar reference is tolerated — it decodes to a one-element
+            # set).
             reference = None
             try:
                 reference = read_json(SPIKE_ARTIFACT)["fingerprint"]
             except Exception as exc:
                 log(f"WARN: could not load the spike fingerprint: {exc!r}")
+            if reference is not None and "|" not in reference:
+                log("reference fingerprint is a legacy scalar (one hash); "
+                    "loaded via the documented one-element-set fallback")
             api_log_fh = open(api_log_path, "a", encoding="utf-8")
 
             def api_log(record):
@@ -937,24 +947,36 @@ def cmd_arm(run_id, pair_index, policy, spectate):
 
             probe1 = client.probe_fingerprint()
             fingerprint = probe1.fingerprint
+            probe1_probe_logs = [l for l in client.call_logs
+                                 if l.kind == "probe"]
             re_probe = None
-            status = ("match" if reference is None or fingerprint == reference
+            status = ("match" if reference is None
+                      or paired.fingerprint_match(reference, fingerprint)
                       else "mismatch")
-            if reference is not None and fingerprint != reference:
+            if reference is not None and status == "mismatch":
                 probe2 = client.probe_fingerprint()
                 re_probe = probe2.fingerprint
                 status = ("match_after_reprobe"
-                          if re_probe == reference else "mismatch_persistent")
+                          if paired.fingerprint_match(reference, re_probe)
+                          else "mismatch_persistent")
             log(f"arm fingerprint: {fingerprint} (reference={reference}, "
-                f"status={status}, re_probe={re_probe})")
+                f"status={status}, re_probe={re_probe}, "
+                f"samples={probe1.sample_attempts}, "
+                f"unique={len(probe1.output_hashes)}, "
+                f"mode={probe1.sample_mode})")
             # The probe is an API call too (decision 4) — logged with
             # kind="probe" (the WP2 logging pattern). The first probe's
             # result is a FingerprintProbe (no call_id/enforcement);
-            # a re-probe's record is the underlying CallLog (attempt 0).
+            # every individual probe request (the K=3 samples) is logged
+            # from the client's call logs, the re-probe's requests as
+            # kind="probe_reprobe".
             probe_records = [("probe", probe1.to_dict())]
-            if re_probe is not None:
-                probe_records.append(("probe_reprobe",
-                                      client.call_logs[-1].to_dict()))
+            reprobe_logs = [l for l in client.call_logs
+                            if l.kind == "probe"][len(probe1_probe_logs):]
+            for pl in probe1_probe_logs:
+                probe_records.append(("probe", pl.to_dict()))
+            for pl in reprobe_logs:
+                probe_records.append(("probe_reprobe", pl.to_dict()))
             for kind, pl in probe_records:
                 api_log({"call_id": pl.get("call_id", "probe"),
                          "turn": None, "attempt": 0,
@@ -981,6 +1003,11 @@ def cmd_arm(run_id, pair_index, policy, spectate):
                 "re_probe": re_probe,
                 "status": status,
                 "probe_1_details": probe1.to_dict(),
+                "sample_encoding": "FW-21: the fingerprint is the sorted, "
+                                   "deduplicated K=3 sample hash set "
+                                   "('sha256:<hex>' elements joined by "
+                                   "'|'); match = non-empty set "
+                                   "intersection (a canary rule)",
                 "note": "decision 8: the fingerprint is a canary (serving "
                         "nondeterminism can false-positive; an unchanged "
                         "output does not prove unchanged weights)",
@@ -1917,6 +1944,9 @@ def cmd_orchestrate(pairs, horizon, create_turns, seed, run_id, spectate):
                 re_probes[a] = fe["re_probe"]
         reference = None
         try:
+            # FW-21: the reference may be a legacy scalar fingerprint (one
+            # hash) — resolve_fingerprints tolerates it via the documented
+            # one-element-set fallback and compares by set intersection.
             reference = read_json(SPIKE_ARTIFACT)["fingerprint"]
         except Exception:
             pass

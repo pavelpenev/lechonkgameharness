@@ -10,10 +10,11 @@ SEQUENTIALLY under the same pinned username as the checkpoint creator
 (save/username coupling, §7.1); early-terminal reporting (an arm that
 terminates early reports its outcome + reason; the pair is never
 silently dropped); checkpoint checksums; arm-start timestamps; per-arm
-model fingerprint with the decision-8 drift policy (between-arm
-mismatch → re-probe once; persistent mismatch → drift-suspect pair,
-excluded from reproducibility claims, both arms still reported
-individually).
+model fingerprint with the decision-8 drift policy (FW-21: the fingerprint
+is the K=3 sample hash SET — match = non-empty intersection of the
+reference set and the arm's set; mismatch → re-probe once; persistent
+mismatch → drift-suspect pair, excluded from reproducibility claims,
+both arms still reported individually).
 
 Architecture (one env per process, §7.1): each arm runs in its OWN
 subprocess (``scripts/wp3_paired_smoke.py arm --policy ...``) because
@@ -64,6 +65,7 @@ from lechonk.core.schemas import (
     RunManifest,
     RunManifestRecord,
 )
+from lechonk.model.mistral_client import decode_fingerprint_set
 
 # The paired contract version (bump on any contract change; the hash in
 # the manifest proves the identity of the predeclared contract).
@@ -148,8 +150,9 @@ def build_paired_contract(*, arm_turns: int, username: str, horizon_turn: int,
                           "reports its outcome + reason in its manifest "
                           "and the pair manifest; the pair is never "
                           "silently dropped (§3 line 45)",
-        "drift_policy": "decision 8: a between-arm/reference model-"
-                        "fingerprint mismatch → re-probe once; a "
+        "drift_policy": "decision 8 (FW-21): the model fingerprint is the "
+                        "K=3 sample hash set; a between-arm/reference "
+                        "mismatch (no shared hash) → re-probe once; a "
                         "persistent mismatch marks the pair drift-suspect "
                         "— excluded from reproducibility claims, both "
                         "arms still reported individually",
@@ -284,6 +287,27 @@ def read_arm_manifest(transcript_path: str | Path) -> RunManifest:
 # the decision-8 drift policy
 # ---------------------------------------------------------------------------
 
+def fingerprint_hash_set(fingerprint: Optional[str]) -> list[str]:
+    """The decoded hash set of a persisted fingerprint (decision 8, FW-21).
+
+    A legacy scalar fingerprint (a single ``sha256:<hex>``, the pre-FW-21
+    encoding) decodes to a one-element set — the documented fallback;
+    None/blank decodes to the empty set."""
+    if not fingerprint:
+        return []
+    return decode_fingerprint_set(fingerprint)
+
+
+def fingerprint_match(reference: Optional[str],
+                      arm_fingerprint: Optional[str]) -> bool:
+    """The decision-8 canary rule (FW-21): a reference fingerprint and an
+    arm fingerprint MATCH iff their sample hash sets intersect (any shared
+    hash). Documented explicitly as a canary rule, NOT an equivalence
+    relation."""
+    return bool(set(fingerprint_hash_set(reference))
+                & set(fingerprint_hash_set(arm_fingerprint)))
+
+
 def resolve_fingerprints(*, arm_fingerprints: Mapping[str, Optional[str]],
                          reference: Optional[str],
                          re_probes: Optional[Mapping[str, Optional[str]]] = None
@@ -291,13 +315,18 @@ def resolve_fingerprints(*, arm_fingerprints: Mapping[str, Optional[str]],
     """The decision-8 drift policy over the per-arm model fingerprints.
 
     ``arm_fingerprints`` maps arm → the fingerprint the arm recorded (None
-    for a scripted arm: no model). ``reference`` is the reference
-    fingerprint (the WP2 spike artifact). ``re_probes`` maps arm → the
-    ONE re-probe fingerprint the arm performed after a mismatch (the
-    re-probe happens in the arm process; this function applies the
-    policy). A persistent mismatch (or a between-arm mismatch among
-    model arms) marks the pair drift-suspect: excluded from
-    reproducibility claims, both arms still reported individually.
+    for a scripted arm: no model). Each fingerprint is the persisted K=3
+    sample hash SET (FW-21; a legacy scalar is a one-element set — the
+    documented fallback). ``reference`` is the reference fingerprint (the
+    WP2 spike artifact, itself a K=3 sample set re-established under the
+    new sampling). ``re_probes`` maps arm → the ONE re-probe fingerprint
+    the arm performed after a mismatch (the re-probe happens in the arm
+    process; this function applies the policy). Match = non-empty
+    intersection of the reference set and the arm's set — a canary rule,
+    not an equivalence relation. A persistent mismatch (or a between-arm
+    mismatch among model arms, judged by the same intersection rule)
+    marks the pair drift-suspect: excluded from reproducibility claims,
+    both arms still reported individually.
     """
     re_probes = dict(re_probes or {})
     per_arm: dict[str, Any] = {}
@@ -313,24 +342,38 @@ def resolve_fingerprints(*, arm_fingerprints: Mapping[str, Optional[str]],
             continue
         entry: dict[str, Any] = {
             "arm": arm, "fingerprint": fp, "reference": reference,
+            "fingerprint_hashes": fingerprint_hash_set(fp),
+            "reference_hashes": fingerprint_hash_set(reference),
             "status": ("no_reference" if reference is None else
-                       "match" if fp == reference else "mismatch"),
+                       "match" if fingerprint_match(reference, fp)
+                       else "mismatch"),
         }
-        if fp != reference and arm in re_probes:
+        if (reference is not None and not fingerprint_match(reference, fp)
+                and arm in re_probes):
             rp = re_probes[arm]
             entry["re_probe_fingerprint"] = rp
+            entry["re_probe_hashes"] = fingerprint_hash_set(rp)
             entry["status"] = ("match_after_reprobe"
-                               if rp == reference else "mismatch_persistent")
+                               if fingerprint_match(reference, rp)
+                               else "mismatch_persistent")
         per_arm[arm] = entry
     model_arms = [a for a in ARMS if arm_fingerprints.get(a) is not None]
-    between_arm_mismatch = (
-        len({arm_fingerprints[a] for a in model_arms}) > 1
-        if len(model_arms) >= 2 else False)
+    between_arm_mismatch = False
+    if len(model_arms) >= 2:
+        # The same canary rule between model arms: any shared hash.
+        arm_sets = [set(fingerprint_hash_set(arm_fingerprints[a]))
+                    for a in model_arms]
+        between_arm_mismatch = not any(
+            arm_sets[i] & arm_sets[j]
+            for i in range(len(arm_sets))
+            for j in range(i + 1, len(arm_sets)))
     drift_suspect = (
         any(e["status"] == "mismatch_persistent" for e in per_arm.values())
         or between_arm_mismatch)
     return {
-        "policy": "decision 8: on a between-arm/reference mismatch, "
+        "policy": "decision 8 (FW-21): the fingerprint is the K=3 sample "
+                  "hash set; match = non-empty intersection of the "
+                  "reference set and the arm's set; on a mismatch, "
                   "re-probe once; a persistent mismatch marks the pair "
                   "drift-suspect — excluded from reproducibility claims, "
                   "both arms still reported individually",

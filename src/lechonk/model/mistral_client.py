@@ -40,9 +40,13 @@ temperature 1.0 with ``reasoning_effort="high"``; the client NEVER sends
 ``top_p`` (the previous greedy temperature-0 + ``top_p=1.0`` sampling is
 forbidden).
 
-Per-arm model fingerprint (decision 8): ``probe_fingerprint`` sends a FIXED
-probe prompt under the arm sampling and records the output hash; the
-fingerprint travels with every per-call log and goes into the run manifest.
+Per-arm model fingerprint (decision 8, FW-21): ``probe_fingerprint`` sends a
+FIXED probe prompt (v2, capacity-revealing) under the arm sampling and
+collects K=3 samples — one request with ``n=3`` when the SDK path supports
+it, else three sequential requests (the mode is recorded). The persisted
+fingerprint is the sorted, deduplicated SET of the sample output hashes
+(see ``encode_fingerprint_set``); it travels with every per-call log and
+goes into the run manifest.
 
 This module never imports civrealm (plan §7.1). The official ``mistralai``
 SDK is imported lazily by ``MistralSDKTransport`` only — offline tests drive
@@ -52,6 +56,7 @@ the client through a mock transport and never import the SDK.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -61,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 from pydantic import ValidationError
 
@@ -87,6 +92,25 @@ DEFAULT_TIMEOUT_MS = 120_000
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_REASONING_EFFORT = "high"
+
+# Per-arm fingerprint probe (decision 8, FW-21): K samples collected under
+# the arm sampling. The probe's max_tokens is raised from 256 to 1024
+# (reasoning_effort "high" may spend a small budget on reasoning before
+# output) and recorded on the probe.
+FINGERPRINT_PROBE_SAMPLES = 3
+FINGERPRINT_PROBE_MAX_TOKENS = 1024
+# The probe prompt is v2 (capacity-revealing). The v1 verbatim-echo prompt
+# is retained on disk: any compliant model satisfies it identically, which
+# degenerates the K-sample canary (deep-review finding).
+FINGERPRINT_PROBE_PROMPT = "fingerprint_probe_v2"
+# Sample-collection modes (recorded on the probe).
+FINGERPRINT_MODE_SINGLE_REQUEST = "single_request_n3"
+FINGERPRINT_MODE_SEQUENTIAL = "sequential_x3"
+# The persisted fingerprint encoding (decision 8 amendment, FW-21): the
+# sorted, deduplicated set of "sha256:<hex>" sample hashes joined by "|".
+# A legacy single-sample fingerprint ("sha256:<hex>") is exactly the
+# one-element encoding — old references remain loadable.
+FINGERPRINT_HASH_SEPARATOR = "|"
 
 # Studio list prices, USD per million tokens. PROVISIONAL for
 # ``mistral-large-4``: carried from the published Mistral Large list price
@@ -244,6 +268,10 @@ class RawCompletion:
     """Transparent retries performed INSIDE this logical attempt (SDK-level
     retries are not individually observable; the SDK debug logger records
     them). Never counted against the per-turn cap (decision 4)."""
+    sample_contents: Optional[list[str]] = None
+    """The per-choice output texts when the request asked for n>1 samples
+    (ONE multi-sample request, decision 8 fingerprint probe); None for a
+    single-sample request (``content`` carries the one output)."""
 
 
 class ChatTransport(Protocol):
@@ -270,7 +298,12 @@ class ChatTransport(Protocol):
 
     ``reasoning_effort``: the reasoning-effort setting passed through to the
     API (decision 4 amendment: the arm runs ``"high"``). The transport NEVER
-    sends ``top_p``."""
+    sends ``top_p``.
+
+    ``n``: optional multi-sample request — K samples in ONE request (the
+    decision-8 fingerprint probe). The transport returns a ``RawCompletion``
+    whose ``sample_contents`` carries the per-choice texts; None (the
+    default) is an ordinary single-sample request."""
 
     def complete(
         self,
@@ -282,6 +315,7 @@ class ChatTransport(Protocol):
         max_tokens: int,
         response_format: Optional[dict[str, Any]],
         random_seed: Optional[int],
+        n: Optional[int] = None,
         timeout_ms: Optional[int] = None,
         disable_transport_retries: bool = False,
     ) -> RawCompletion: ...
@@ -375,6 +409,7 @@ class MistralSDKTransport:
         max_tokens: int,
         response_format: Optional[dict[str, Any]],
         random_seed: Optional[int],
+        n: Optional[int] = None,
         timeout_ms: Optional[int] = None,
         disable_transport_retries: bool = False,
     ) -> RawCompletion:
@@ -385,6 +420,11 @@ class MistralSDKTransport:
         )
 
         sdk = self._sdk_no_retries if disable_transport_retries else self._sdk
+        # Multi-sample request kwargs (decision 8 fingerprint probe): n is
+        # passed ONLY when requested — offline-verified against mistralai
+        # 3.4.0 (Chat.complete takes n); the response then carries one
+        # choice per sample.
+        multi_sample: dict[str, Any] = {} if n is None else {"n": n}
         try:
             # Arm sampling (decision 4 amendment): reasoning_effort is passed
             # through as an explicit Chat.complete parameter (offline-verified
@@ -399,6 +439,7 @@ class MistralSDKTransport:
                 response_format=response_format,
                 random_seed=random_seed,
                 timeout_ms=timeout_ms,
+                **multi_sample,
             )
         except (NoResponseError, ResponseValidationError) as exc:
             raise TransportError(
@@ -421,7 +462,22 @@ class MistralSDKTransport:
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
+            sample_contents=(
+                [_message_content_text(c.message.content) for c in choices]
+                if n is not None else None),
         )
+
+
+def _sdk_chat_complete_accepts_n() -> bool:
+    """Whether the installed mistralai SDK's ``Chat.complete`` takes the
+    multi-sample ``n`` parameter (offline-verified against mistralai 3.4.0,
+    ``chat.py``). Re-checked lazily so an older SDK makes the fingerprint
+    probe fall back to sequential sampling instead of failing."""
+    try:
+        from mistralai.client.chat import Chat
+    except Exception:
+        return False
+    return "n" in inspect.signature(Chat.complete).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +525,32 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+# ---------------------------------------------------------------------------
+# The persisted fingerprint encoding (decision 8, FW-21)
+# ---------------------------------------------------------------------------
+
+
+def encode_fingerprint_set(output_hashes: Iterable[str]) -> str:
+    """The persisted fingerprint encoding: the sorted, deduplicated set of
+    sample output hashes as ``"sha256:<hex>"`` elements joined by ``|``.
+
+    A legacy single-sample fingerprint (``"sha256:<hex>"``, the pre-FW-21
+    encoding) is exactly the one-element encoding — old references remain
+    loadable (the documented fallback)."""
+    unique = sorted({f"sha256:{h}" for h in output_hashes})
+    return FINGERPRINT_HASH_SEPARATOR.join(unique)
+
+
+def decode_fingerprint_set(fingerprint: Optional[str]) -> list[str]:
+    """Decode a persisted fingerprint into its sorted, deduplicated hash
+    set. A legacy scalar fingerprint decodes to a one-element list (the
+    documented fallback); None/blank decodes to the empty list."""
+    if not fingerprint:
+        return []
+    return sorted({part for part in fingerprint.split(FINGERPRINT_HASH_SEPARATOR)
+                   if part})
+
+
 @dataclass
 class CallLog:
     """Per-call log record (decision 4 + decision 8). NEVER contains the API
@@ -490,7 +572,8 @@ class CallLog:
     cost_usd: Optional[float]
     finish_reason: Optional[str]
     response_id: Optional[str]
-    fingerprint: str  # arm model fingerprint (probe hash) or "unprobed"
+    fingerprint: str  # arm model fingerprint (the K=3 sample hash SET
+    # encoding, or "unprobed")
     transport_retries: int
     error: Optional[str]
     ts: str
@@ -572,12 +655,22 @@ class AttemptOutcome:
 
 @dataclass
 class FingerprintProbe:
-    """Per-arm model fingerprint (decision 8): fixed probe prompt, the arm's
+    """Per-arm model fingerprint (decision 8, FW-21): the FIXED probe prompt
+    v2 (capacity-revealing; versioned file, hash recorded) under the arm's
     own sampling (temperature 1.0, reasoning_effort high, no top_p),
-    recorded output hash."""
+    collecting K=3 samples. ``fingerprint`` is the PERSISTED encoding: the
+    sorted, deduplicated set of the sample output hashes (see
+    ``encode_fingerprint_set``). ``output_hashes`` records the same set as
+    bare hex hashes; ``sample_attempts`` vs ``len(output_hashes)`` records
+    attempts vs unique outputs (K=3 attempts may yield fewer than three
+    unique outputs). ``sample_mode`` records how the samples were collected
+    and ``max_tokens`` the probe's raised output budget."""
 
-    fingerprint: str  # "sha256:<hex>" of the probe output
-    output_hash: str
+    fingerprint: str  # the persisted set encoding (encode_fingerprint_set)
+    output_hashes: list[str]  # sorted, deduplicated bare hex sample hashes
+    sample_attempts: int  # K: the number of samples collected
+    sample_mode: str  # single_request_n3 | sequential_x3
+    max_tokens: int  # the probe's output budget (1024)
     model_requested: str
     model_responded: str
     prompt_hash: str
@@ -594,7 +687,10 @@ class FingerprintProbe:
     def to_dict(self) -> dict[str, Any]:
         return {
             "fingerprint": self.fingerprint,
-            "output_hash": self.output_hash,
+            "output_hashes": list(self.output_hashes),
+            "sample_attempts": self.sample_attempts,
+            "sample_mode": self.sample_mode,
+            "max_tokens": self.max_tokens,
             "model_requested": self.model_requested,
             "model_responded": self.model_responded,
             "prompt_hash": self.prompt_hash,
@@ -944,6 +1040,7 @@ class MistralClient:
         response_format: Any = _KEEP,
         timeout_ms: Optional[int] = None,
         disable_transport_retries: bool = False,
+        n: Optional[int] = None,
     ) -> RawCompletion:
         """One LOGICAL API attempt: calls the transport (SDK/transport
         retries inside it are transparent and never counted), logs the call.
@@ -955,7 +1052,10 @@ class MistralClient:
         duration stays within ``timeout_ms``; None/False keeps the transport's
         transparent retries (attempt 1 behavior, unchanged).
         ``reasoning_effort``: None = the configured arm effort; the transport
-        NEVER sends ``top_p``."""
+        NEVER sends ``top_p``. ``n``: None = an ordinary single-sample
+        request; an integer asks for that many samples in ONE request (the
+        decision-8 fingerprint probe; the transport must support it — see
+        ``_fingerprint_sample_mode``)."""
         t0 = time.perf_counter()
         effective_temperature = (self.temperature if temperature is None
                                  else temperature)
@@ -967,6 +1067,9 @@ class MistralClient:
         effective_response_format = (self._response_format_payload()
                                      if response_format is _KEEP
                                      else response_format)
+        # n is passed ONLY when a multi-sample request is made: every
+        # ordinary call keeps the exact pre-FW-21 transport call shape.
+        multi_sample: dict[str, Any] = {} if n is None else {"n": n}
         try:
             raw = self._transport.complete(
                 messages=messages,
@@ -978,6 +1081,7 @@ class MistralClient:
                 random_seed=self.random_seed,
                 timeout_ms=timeout_ms,
                 disable_transport_retries=disable_transport_retries,
+                **multi_sample,
             )
         except TransportError as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -1185,43 +1289,88 @@ class MistralClient:
 
     # -- per-arm model fingerprint (decision 8) --------------------------------
 
+    def _fingerprint_sample_mode(self) -> str:
+        """How the K=3 probe samples are collected: ONE request with n=3
+        when the transport supports multi-sample requests (the SDK path —
+        ``Chat.complete`` takes ``n``, offline-verified against mistralai
+        3.4.0), else three sequential requests. The mode is recorded on the
+        probe."""
+        try:
+            params = inspect.signature(self._transport.complete).parameters
+        except (TypeError, ValueError):
+            return FINGERPRINT_MODE_SEQUENTIAL
+        if "n" not in params:
+            return FINGERPRINT_MODE_SEQUENTIAL
+        if (isinstance(self._transport, MistralSDKTransport)
+                and not _sdk_chat_complete_accepts_n()):
+            return FINGERPRINT_MODE_SEQUENTIAL
+        return FINGERPRINT_MODE_SINGLE_REQUEST
+
     def probe_fingerprint(self) -> FingerprintProbe:
-        """Per-arm model fingerprint: a FIXED probe prompt (versioned file,
-        hash recorded) under the arm's sampling (temperature 1.0,
-        reasoning_effort high, no top_p — decision 4 amendment: every call
-        runs at the arm sampling); the recorded output hash is the
-        fingerprint. Cached on the client (``arm_fingerprint``) and carried
-        by every subsequent per-call log. One logical probe attempt (not a
-        turn call)."""
-        prompt_text = prompt_templates.fingerprint_probe_prompt()
+        """Per-arm model fingerprint (decision 8, FW-21): the FIXED probe
+        prompt v2 (capacity-revealing; versioned file, hash recorded) under
+        the arm's sampling (temperature 1.0, reasoning_effort high, no
+        top_p — decision 4 amendment: every call runs at the arm sampling),
+        collecting K=3 samples — one request with n=3 when the SDK path
+        supports it, else three sequential requests (the mode is recorded).
+        The probe's max_tokens is raised to 1024 (reasoning_effort high may
+        spend a small budget on reasoning before output) and recorded. The
+        persisted fingerprint is the sorted, deduplicated SET of the sample
+        output hashes (``encode_fingerprint_set``). Cached on the client
+        (``arm_fingerprint``) and carried by every subsequent per-call log.
+        K logical probe requests (not turn calls)."""
+        prompt_text = prompt_templates.load_prompt(FINGERPRINT_PROBE_PROMPT)
+        prompt_hash = prompt_templates.prompt_hash(FINGERPRINT_PROBE_PROMPT)
         messages: list[Message] = [
             {"role": "system",
-             "content": "You are a deterministic fingerprint probe. Follow "
-                        "the instruction exactly."},
+             "content": "You are answering a fixed model-fingerprint probe. "
+                        "Follow the template exactly."},
             {"role": "user", "content": prompt_text},
         ]
-        raw = self._complete(
-            messages=messages, attempt=0, kind="probe",
-            prompt_hash=prompt_templates.prompt_hash(
-                prompt_templates.FINGERPRINT_PROBE),
-            max_tokens=256, response_format=None)
-        output_hash = hashlib.sha256(
-            raw.content.encode("utf-8")).hexdigest()
+        mode = self._fingerprint_sample_mode()
+        logs_before = len(self.call_logs)
+        if mode == FINGERPRINT_MODE_SINGLE_REQUEST:
+            raw = self._complete(
+                messages=messages, attempt=0, kind="probe",
+                prompt_hash=prompt_hash,
+                max_tokens=FINGERPRINT_PROBE_MAX_TOKENS,
+                response_format=None, n=FINGERPRINT_PROBE_SAMPLES)
+            raws = [raw]
+            samples = list(raw.sample_contents or [raw.content])
+        else:
+            raws = []
+            samples = []
+            for _ in range(FINGERPRINT_PROBE_SAMPLES):
+                raw = self._complete(
+                    messages=messages, attempt=0, kind="probe",
+                    prompt_hash=prompt_hash,
+                    max_tokens=FINGERPRINT_PROBE_MAX_TOKENS,
+                    response_format=None)
+                raws.append(raw)
+                samples.append(raw.content)
+        probe_logs = self.call_logs[logs_before:]
+        output_hashes = sorted({
+            hashlib.sha256(sample.encode("utf-8")).hexdigest()
+            for sample in samples})
+        tokens_in = sum(r.prompt_tokens for r in raws)
+        tokens_out = sum(r.completion_tokens for r in raws)
         probe = FingerprintProbe(
-            fingerprint=f"sha256:{output_hash}",
-            output_hash=output_hash,
+            fingerprint=encode_fingerprint_set(output_hashes),
+            output_hashes=output_hashes,
+            sample_attempts=len(samples),
+            sample_mode=mode,
+            max_tokens=FINGERPRINT_PROBE_MAX_TOKENS,
             model_requested=self.model,
-            model_responded=raw.model,
-            prompt_hash=prompt_templates.prompt_hash(
-                prompt_templates.FINGERPRINT_PROBE),
+            model_responded=raws[-1].model,
+            prompt_hash=prompt_hash,
             temperature=self.temperature,
-            tokens_in=raw.prompt_tokens,
-            tokens_out=raw.completion_tokens,
-            tokens_total=raw.total_tokens,
-            latency_ms=self.call_logs[-1].latency_ms,
-            cost_usd=self._cost_usd(raw.prompt_tokens, raw.completion_tokens),
-            response_id=raw.response_id,
-            finish_reason=raw.finish_reason,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            tokens_total=sum(r.total_tokens for r in raws),
+            latency_ms=sum(log.latency_ms for log in probe_logs),
+            cost_usd=self._cost_usd(tokens_in, tokens_out),
+            response_id=raws[-1].response_id,
+            finish_reason=raws[-1].finish_reason,
             ts=_utc_now_iso(),
         )
         self.arm_fingerprint = probe.fingerprint

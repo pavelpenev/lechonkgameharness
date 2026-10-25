@@ -1,0 +1,10 @@
+You are answering a fixed model-fingerprint probe. Reply with EXACTLY the
+five lines below, in this order, each line filled in after its label, with
+no numbering, no blank lines, and no other text:
+
+MODEL: <the exact name of the model you are, as you would honestly report
+it to a user>
+LAB: <the name of the company or laboratory that created you>
+PRODUCT: <the decimal result of 127 multiplied by 113>
+CAPITAL: <the capital city of Japan>
+SEQ: <the next number in the sequence 3, 6, 12, 24, 48>

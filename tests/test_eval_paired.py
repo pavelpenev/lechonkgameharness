@@ -217,6 +217,100 @@ def test_drift_policy_no_reference():
 
 
 # ---------------------------------------------------------------------------
+# the decision-8 drift policy, FW-21 (K=3 sample hash sets)
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_match_helper_set_intersection():
+    """FW-21: match = non-empty intersection of the two hash sets (a
+    canary rule, not an equivalence relation)."""
+    assert paired.fingerprint_match("sha256:a|sha256:b", "sha256:b|sha256:c")
+    assert paired.fingerprint_match("sha256:a", "sha256:a")
+    assert not paired.fingerprint_match("sha256:a", "sha256:b")
+    assert not paired.fingerprint_match(None, "sha256:a")
+    assert not paired.fingerprint_match("sha256:a", None)
+    assert not paired.fingerprint_match(None, None)
+
+
+def test_drift_policy_intersecting_sample_sets_match():
+    d = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": None,
+                          "model": "sha256:a|sha256:b"},
+        reference="sha256:b|sha256:c")
+    assert d["per_arm"]["model"]["status"] == "match"
+    assert d["drift_suspect"] is False
+    assert d["reproducibility_claim"] is True
+    assert d["per_arm"]["model"]["fingerprint_hashes"] == [
+        "sha256:a", "sha256:b"]
+    assert d["per_arm"]["model"]["reference_hashes"] == [
+        "sha256:b", "sha256:c"]
+
+
+def test_drift_policy_disjoint_sets_reprobe_then_drift_suspect():
+    """FW-21: disjoint sample sets → mismatch → ONE re-probe → an
+    intersecting re-probe matches, a still-disjoint re-probe is a
+    persistent mismatch (drift-suspect)."""
+    d = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": None,
+                          "model": "sha256:a|sha256:b"},
+        reference="sha256:c|sha256:d",
+        re_probes={"model": "sha256:e|sha256:c"})
+    assert d["per_arm"]["model"]["status"] == "match_after_reprobe"
+    assert d["per_arm"]["model"]["re_probe_hashes"] == [
+        "sha256:c", "sha256:e"]
+    assert d["drift_suspect"] is False
+    assert d["reproducibility_claim"] is True
+    d2 = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": None,
+                          "model": "sha256:a|sha256:b"},
+        reference="sha256:c|sha256:d",
+        re_probes={"model": "sha256:e|sha256:f"})
+    assert d2["per_arm"]["model"]["status"] == "mismatch_persistent"
+    assert d2["drift_suspect"] is True
+    assert d2["reproducibility_claim"] is False
+    assert d2["both_arms_reported_individually"] is True
+
+
+def test_drift_policy_legacy_scalar_reference_fallback():
+    """FW-21: a legacy scalar reference (a single hash, the pre-FW-21
+    encoding) loads via the documented one-element-set fallback and
+    matches an arm sample set containing that hash."""
+    legacy = "sha256:" + "ab" * 32
+    d = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": None,
+                          "model": legacy + "|sha256:" + "cd" * 32},
+        reference=legacy)
+    assert d["per_arm"]["model"]["status"] == "match"
+    assert d["per_arm"]["model"]["fingerprint_hashes"] == [
+        legacy, "sha256:" + "cd" * 32]
+    assert d["per_arm"]["model"]["reference_hashes"] == [legacy]
+    assert d["drift_suspect"] is False
+    # a legacy scalar reference that no arm sample shares is a mismatch
+    d2 = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": None,
+                          "model": "sha256:" + "ef" * 32},
+        reference=legacy)
+    assert d2["per_arm"]["model"]["status"] == "mismatch"
+
+
+def test_drift_policy_between_arm_sets_use_the_same_canary_rule():
+    """FW-21: between-arm comparison uses the same intersection rule —
+    model arms whose sample sets share a hash do not drift-suspect each
+    other; disjoint sets do."""
+    d = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": "sha256:a|sha256:b",
+                          "model": "sha256:b|sha256:c"},
+        reference=None)
+    assert d["between_arm_mismatch"] is False
+    assert d["drift_suspect"] is False
+    d2 = paired.resolve_fingerprints(
+        arm_fingerprints={"comparator": "sha256:a",
+                          "model": "sha256:b"},
+        reference=None)
+    assert d2["between_arm_mismatch"] is True
+    assert d2["drift_suspect"] is True
+
+
+# ---------------------------------------------------------------------------
 # early-terminal reporting
 # ---------------------------------------------------------------------------
 
