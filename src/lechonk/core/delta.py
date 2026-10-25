@@ -28,11 +28,18 @@ def compute_delta(prev: Optional[Snapshot], cur: Snapshot) -> Delta:
 
     prev_units = {u.id: u for u in prev.units if u.is_own}
     cur_units = {u.id: u for u in cur.units if u.is_own}
-    for uid in sorted(set(prev_units) - set(cur_units)):
+    # Elision honesty (§3, C6): a unit listed in a snapshot's
+    # omitted.elided_unit_ids was dropped by the observation budget, not by
+    # the game — it is NOT comparable across that snapshot's boundary, so it
+    # produces neither a loss nor an appearance. Genuinely vanished own units
+    # (absent from cur and not elided) still report as losses.
+    cur_elided = set(cur.omitted.elided_unit_ids)
+    prev_elided = set(prev.omitted.elided_unit_ids)
+    for uid in sorted(set(prev_units) - set(cur_units) - cur_elided):
         events.append(DeltaEvent(
             kind="unit_lost_own", subject=f"unit:{uid}",
             detail=f"own unit {uid} ({prev_units[uid].type_name}) is gone"))
-    for uid in sorted(set(cur_units) - set(prev_units)):
+    for uid in sorted(set(cur_units) - set(prev_units) - prev_elided):
         u = cur_units[uid]
         events.append(DeltaEvent(
             kind="unit_changed", subject=f"unit:{uid}",
