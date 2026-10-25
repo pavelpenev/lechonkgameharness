@@ -214,6 +214,106 @@ def test_export_turn_save_waits_for_the_file(tmp_path, fake_docker,
     assert polls["n"] >= 3
 
 
+def test_export_turn_save_stable_file_exits_early(tmp_path, fake_docker,
+                                                  monkeypatch):
+    """A file that never changes exits as soon as stability is reached,
+    well before the deadline."""
+    save_dir = cp.save_dir_for("myagent")
+    name = "myagent_T5_2026-10-24-17_32.sav.xz"
+    content = _save_bytes()
+    fake_docker.files[f"{save_dir}/{name}"] = content
+    polls = {"n": 0}
+    real_run = fake_docker.run
+
+    def run(args, *, timeout=60.0):
+        if args[:3] == ["exec", cp.DEFAULT_CONTAINER, "ls"]:
+            polls["n"] += 1
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(cp, "run_docker", run)
+    now = [1000.0]
+    result = cp.export_turn_save(
+        username="myagent", turn=5, dest_dir=tmp_path,
+        deadline_s=100.0, stable_polls=3, poll_interval_s=0.1,
+        clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s))
+    assert result.sha256 == _sha(content)
+    assert polls["n"] == 3  # one poll per required identical stat
+    assert len(result.stability_stats) == 3
+
+
+def test_export_turn_save_change_then_stable_exports(tmp_path, fake_docker,
+                                                     monkeypatch):
+    """One mid-series change observed by the stability poll itself (not
+    consumed by the _newest stat call), then long stability: the rolling
+    baseline recovers and the export completes, with copied_stat taken
+    from the stable window so the post-copy compare passes."""
+    save_dir = cp.save_dir_for("myagent")
+    name = "myagent_T5_2026-10-24-17_32.sav.xz"
+    content = _save_bytes()
+    path = f"{save_dir}/{name}"
+    fake_docker.files[path] = content
+    torn = content[:-1]
+    stat_calls = {"n": 0}
+    real_run = fake_docker.run
+
+    def run(args, *, timeout=60.0):
+        if args[:3] == ["exec", cp.DEFAULT_CONTAINER, "stat"] \
+                and args[5] == path:
+            stat_calls["n"] += 1
+            if stat_calls["n"] == 2:
+                # the first stability poll sees the still-writing file
+                return subprocess.CompletedProcess(
+                    args, 0, f"{len(torn)} 999.0\n", "")
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(cp, "run_docker", run)
+    now = [1000.0]
+    result = cp.export_turn_save(
+        username="myagent", turn=5, dest_dir=tmp_path,
+        deadline_s=100.0, stable_polls=3, poll_interval_s=0.1,
+        clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s))
+    # the change is visible in the stability history ...
+    assert any(s.size == len(torn) and s.mtime == 999.0
+               for s in result.stability_stats)
+    # ... but the export used the stable window's stat
+    assert result.copied_stat.size == len(content)
+    assert result.copied_stat.mtime == 1000.0
+    assert result.sha256 == _sha(content)
+    assert result.restat.size == result.copied_stat.size
+    assert result.restat.mtime == result.copied_stat.mtime
+    assert cp.verify_local_checkpoint(result.path, result.sha256)
+
+
+def test_export_turn_save_never_stable_raises(tmp_path, fake_docker,
+                                              monkeypatch):
+    """A file that changes on every poll never stabilizes (no two
+    consecutive identical stats) — CheckpointError at the deadline."""
+    save_dir = cp.save_dir_for("myagent")
+    name = "myagent_T5_2026-10-24-17_32.sav.xz"
+    path = f"{save_dir}/{name}"
+    fake_docker.files[path] = _save_bytes()
+    stat_calls = {"n": 0}
+    real_run = fake_docker.run
+
+    def run(args, *, timeout=60.0):
+        if args[:3] == ["exec", cp.DEFAULT_CONTAINER, "stat"] \
+                and args[5] == path:
+            stat_calls["n"] += 1
+            # the file grows on every observation: never two identical polls
+            return subprocess.CompletedProcess(
+                args, 0, f"{len(_save_bytes()) + stat_calls['n']} 1000.0\n", "")
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(cp, "run_docker", run)
+    now = [1000.0]
+    with pytest.raises(cp.CheckpointError, match="no stable save"):
+        cp.export_turn_save(
+            username="myagent", turn=5, dest_dir=tmp_path,
+            deadline_s=2.0, stable_polls=3, poll_interval_s=0.5,
+            clock=lambda: now[0],
+            sleep=lambda s: now.__setitem__(0, now[0] + s))
+
+
 def test_export_turn_save_no_save_raises(tmp_path, fake_docker):
     now = [1000.0]
     with pytest.raises(cp.CheckpointError, match="no stable save"):

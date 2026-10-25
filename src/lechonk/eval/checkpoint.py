@@ -298,9 +298,12 @@ def export_turn_save(*, username: str, turn: int, dest_dir: str | Path,
             stat = _exec_stat(container, f"{save_dir}/{target}")
             if stat is not None:
                 stats.append(stat)
+                # rolling baseline: the last stable_polls polls must agree
+                # with each other (not with the first observation), so one
+                # mid-series change cannot pin a stale stats[0] baseline.
                 if len(stats) >= stable_polls and \
-                        all(s.size == stats[0].size and s.mtime == stats[0].mtime
-                            for s in stats):
+                        all(s.size == stats[-1].size and s.mtime == stats[-1].mtime
+                            for s in stats[-stable_polls:]):
                     break  # stable: the begin-turn /save completed
         sleep(poll_interval_s)
     else:
@@ -308,7 +311,8 @@ def export_turn_save(*, username: str, turn: int, dest_dir: str | Path,
             f"no stable save for {username}_T{turn}_* in {container}:{save_dir} "
             f"within {deadline_s:.0f}s (candidates seen: {candidates})")
     assert target is not None
-    copied_stat = stats[0]
+    # the stable window's stat (the file may have changed early in the series)
+    copied_stat = stats[-1]
 
     # 3. copy out (to a temp name, then rename into place).
     container_path = f"{save_dir}/{target}"
