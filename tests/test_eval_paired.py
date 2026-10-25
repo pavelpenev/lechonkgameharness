@@ -27,10 +27,13 @@ from lechonk.core.model_client import ModelResponse, TurnPrompt
 from lechonk.core.schemas import (
     ActionBatch,
     ActionItem,
+    Candidate,
+    CandidateTable,
     RunManifest,
     RunManifestRecord,
 )
 from lechonk.eval import paired
+from tests.runner_fixtures import FakeSession, turn_world
 
 REPO = Path(__file__).resolve().parents[1]
 EVAL_DIR = REPO / "src" / "lechonk" / "eval"
@@ -378,6 +381,103 @@ def test_scripted_comparator_client_repair_is_defensive():
         error_class="schema_error"))
     assert resp.error is not None
     assert "repair not applicable" in resp.error
+
+
+# ---------------------------------------------------------------------------
+# W2-1: the comparator arm reproduces the runner's contact protection and
+# offered (capped) set — both arms see identical candidate membership
+# ---------------------------------------------------------------------------
+
+def _over_cap_table(turn, real_candidates):
+    """A table over the 1,200-token cap: thirteen ~91-token filler
+    candidates admitted first, the real fixture candidates appended after
+    the budget is exhausted (elided — armed-in-contact candidates
+    excepted, once the contact protection has marked them)."""
+    fillers = [
+        Candidate(id=f"unit:9{i:02d}:wait", domain="unit",
+                  actor_id=f"9{i:02d}", verb="wait", summary="x" * 348)
+        for i in range(13)]
+    return CandidateTable(turn=turn, candidates=fillers + list(real_candidates))
+
+
+class _BigTableSession(FakeSession):
+    """A FakeSession whose candidate table is over the cap."""
+
+    def __init__(self, worlds, table):
+        super().__init__(worlds)
+        self._table = table
+
+    def build_candidate_table(self):
+        return self._table.model_copy(deep=True)
+
+
+def test_scripted_comparator_decides_from_the_offered_capped_set():
+    """W2-1: the comparator arm decides from the OFFERED (capped) surface,
+    never the uncapped table: the scripted policy's pick over the full
+    table (control) references a cap-elided candidate; the client's batch
+    references only the offered set — the same surface the model arm saw."""
+    from lechonk.comparator import scripted
+
+    session = _BigTableSession(
+        [turn_world(1), turn_world(2), turn_world(3)],
+        _over_cap_table(1, _fake_session().build_candidate_table().candidates))
+    # The runner-side reconstruction of the offered surface: the same
+    # marking + offered() the client applies.
+    from lechonk.adapter.obs_extract import extract_snapshot
+    extraction = extract_snapshot(
+        session.obs, session.info, my_player_id=session.player_id,
+        ruleset=session.ruleset, action_probs=session.action_probs)
+    runner_table = session.build_candidate_table()
+    paired.mark_armed_in_contact(runner_table, extraction.snapshot)
+    offered_ids = set(runner_table.offered().by_id())
+    full_ids = set(runner_table.by_id())
+    elided_ids = full_ids - offered_ids
+    assert elided_ids  # the cap engaged: real candidates were elided
+
+    # Control: deciding from the UNCAPPED table WOULD emit elided refs.
+    control_log = scripted.decide(extraction.snapshot, runner_table)
+    assert any(d.candidate_id in elided_ids for d in control_log.decisions)
+
+    # The comparator arm: every emitted ref is within the runner's offered
+    # surface (identical membership — the symmetry), never an elided ref.
+    client = paired.ScriptedComparatorClient(lambda: session)
+    prompt = TurnPrompt(
+        call_id="run/t1/call1", turn_id="run/t1",
+        memory="mem", snapshot=session_obs_snapshot(session),
+        delta="delta", candidates="cands")
+    resp = client.complete_turn(prompt)
+    assert resp.error is None and resp.batch is not None
+    emitted = {a.ref for a in resp.batch.actions}
+    assert emitted <= offered_ids
+    assert not (emitted & elided_ids)
+
+
+def test_mark_armed_in_contact_protects_the_offered_set():
+    """W2-1/FW-13: the shared contact protection keeps an armed-in-contact
+    unit's candidates in the offered set past the cap; unmarked, the same
+    candidates elide."""
+    from lechonk.core.runner import mark_armed_in_contact
+    from lechonk.core.schemas import (
+        MapView, PlayerView, Snapshot, UnitView)
+
+    contact_unit = UnitView(id=7, owner_id=1, is_own=True,
+                           type_name="Warriors", x=2, y=2, in_contact=True)
+    snapshot = Snapshot(turn=1, player=PlayerView(player_id=1),
+                        map_view=MapView(width=4, height=4),
+                        units=[contact_unit])
+    late = [
+        Candidate(id="unit:7:attack_e", domain="unit", actor_id="7",
+                  verb="attack_e", summary="attack east"),
+        Candidate(id="unit:7:fortify", domain="unit", actor_id="7",
+                  verb="fortify", summary="fortify"),
+    ]
+    big = _over_cap_table(1, late)
+    # Unmarked: the cap elides unit 7's candidates.
+    assert not {"unit:7:attack_e", "unit:7:fortify"} \
+        <= set(big.offered().by_id())
+    mark_armed_in_contact(big, snapshot)
+    assert {"unit:7:attack_e", "unit:7:fortify"} \
+        <= set(big.offered().by_id())
 
 
 def session_obs_snapshot(session):

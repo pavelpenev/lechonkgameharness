@@ -59,6 +59,9 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.model_client import ModelResponse, RepairPrompt, TurnPrompt
+# W2-1: the comparator arm reuses the runner's contact-protection helper so
+# both arms reconstruct the identical offered candidate surface.
+from lechonk.core.runner import mark_armed_in_contact
 from lechonk.core.schemas import (
     ActionBatch,
     ActionItem,
@@ -472,7 +475,11 @@ class ScriptedComparatorClient:
                 tokens_in=0, tokens_out=0, cost_usd=0.0,
                 fingerprint="n/a:scripted-comparator")
         table = session.build_candidate_table()
-        log = scripted.decide(extraction.snapshot, table)
+        # W2-1: reproduce the runner's contact protection and offered set —
+        # the scripted policy must see the same candidate surface the model
+        # saw (armed-in-contact candidates never elided; the rest capped).
+        mark_armed_in_contact(table, extraction.snapshot)
+        log = scripted.decide(extraction.snapshot, table.offered())
         batch = ActionBatch(
             turn_id=prompt.turn_id,
             actions=[ActionItem(ref=d.candidate_id) for d in log.decisions],

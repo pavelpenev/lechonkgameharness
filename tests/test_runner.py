@@ -20,7 +20,12 @@ from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
 from lechonk.core.metrics import commitment_board
 from lechonk.core.model_client import ModelResponse
-from lechonk.core.runner import ENTITY_ID_RE, GameRunner
+from lechonk.core.runner import (
+    ENTITY_ID_RE,
+    GameRunner,
+    _StandingOrder,
+    mark_armed_in_contact,
+)
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
@@ -1811,3 +1816,174 @@ def test_execute_planned_has_no_origin_seqs_parameter():
     passed it; origin_seq stays None on _execute_one)."""
     params = inspect.signature(GameRunner._execute_planned).parameters
     assert "origin_seqs" not in params
+
+
+# ---------------------------------------------------------------------------
+# W2-1: capped-set (offered) membership — ingest, standing orders, the
+# degraded default, and the shared contact protection
+# ---------------------------------------------------------------------------
+
+
+def _over_cap_table(turn, real_candidates):
+    """A table over the 1,200-token cap: thirteen ~91-token filler
+    candidates admitted first, the real fixture candidates appended after
+    the budget is exhausted (elided — armed-in-contact candidates
+    excepted, once the contact protection has marked them)."""
+    fillers = [
+        Candidate(id=f"unit:9{i:02d}:wait", domain="unit",
+                  actor_id=f"9{i:02d}", verb="wait", summary="x" * 348)
+        for i in range(13)]
+    return CandidateTable(turn=turn, candidates=fillers + list(real_candidates))
+
+
+def _fixture_snapshot(session):
+    """The snapshot the runner would build for the fake session's current
+    world (the real read-only extraction)."""
+    from lechonk.adapter.obs_extract import extract_snapshot
+    extraction = extract_snapshot(
+        session.obs, session.info, my_player_id=session.player_id,
+        ruleset=session.ruleset, action_probs=session.action_probs)
+    assert extraction.snapshot is not None
+    return extraction.snapshot
+
+
+def test_runner_ingest_rejects_cap_elided_ref_as_state_fog_error(tmp_path):
+    """W2-1: ingest validates against the OFFERED (capped) set — a
+    well-formed ref to a cap-elided candidate is state the model could not
+    see: rejected state_fog_error, never planned."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    real = session.build_candidate_table()
+    elided_ref = "unit:10:goto_e"
+    big = _over_cap_table(1, real.candidates)
+    # The cap genuinely engaged: the ref is in the FULL table but elided.
+    assert elided_ref in real.by_id()
+    assert elided_ref not in big.offered().by_id()
+
+    resp = ok_response([elided_ref], turn_id="t1", with_memory=False)
+    result = runner._ingest(resp, turn=1, table=big, call_seq=0,
+                            snapshot_seq=0, candidates_seq=0)
+    assert result.invalid == [(elided_ref, "state_fog_error")]
+    assert not result.planned
+    rejected = [a for a in _actions(_records(runner.ledger.path))
+                if a.outcome == "rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].rejection_class == "state_fog_error"
+    assert "cap-elided" in rejected[0].detail
+
+    # Control: the SAME ref against the under-cap table is offered and
+    # plans normally — only the cap elides it.
+    result_ok = runner._ingest(
+        ok_response([elided_ref], turn_id="t1", with_memory=False),
+        turn=1, table=real, call_seq=0, snapshot_seq=0, candidates_seq=0)
+    assert [p.ref for p in result_ok.planned] == [elided_ref]
+
+
+def test_runner_standing_order_cap_elided_ref_is_a_lookup_miss(tmp_path):
+    """W2-1: the standing-order re-issue resolves against the OFFERED set —
+    a cap-elided ref is a lookup miss (re-resolve within the offered set,
+    else drop): never executed from the uncapped table, never a
+    state_fog_error."""
+    worlds = [turn_world(1),
+              turn_world(2, unit_overrides=[(11, {"activity": 0})])]
+    session = FakeSession(worlds)
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    adapter = runner._load_adapter()
+    runner._session = session  # direct-call tests: run() never ran
+    session._index = 1  # the turn-2 world: unit 11 idle, order not in effect
+    snapshot = _fixture_snapshot(session)
+    real = session.build_candidate_table()
+    assert "unit:11:sentry" in real.by_id()
+    big = _over_cap_table(2, real.candidates)
+    assert "unit:11:sentry" not in big.offered().by_id()  # cap-elided
+
+    runner._standing["11"] = _StandingOrder(
+        actor_id="11", verb="sentry", ref="unit:11:sentry", origin_seq=1)
+    runner._continue_standing_orders(
+        adapter, turn=2, table=big, snapshot=snapshot,
+        acted_actors=set(), snapshot_seq=0, candidates_seq=0)
+    # Lookup miss: the order was dropped, nothing was executed from the
+    # uncapped table, and no state_fog_error was emitted.
+    assert "11" not in runner._standing
+    assert not [c for c in session.calls if c[0] == ("unit", 11, "sentry")]
+    assert not [a for a in _actions(_records(runner.ledger.path))
+                if a.rejection_class == "state_fog_error"]
+
+    # Control: the same order against the under-cap table (the ref IS
+    # offered) re-issues once as continued_model_order.
+    runner._standing["11"] = _StandingOrder(
+        actor_id="11", verb="sentry", ref="unit:11:sentry", origin_seq=1)
+    runner._continue_standing_orders(
+        adapter, turn=2, table=real, snapshot=snapshot,
+        acted_actors=set(), snapshot_seq=0, candidates_seq=0)
+    assert [c for c in session.calls if c[0] == ("unit", 11, "sentry")]
+    continuations = [a for a in _actions(_records(runner.ledger.path))
+                     if a.provenance_class == "continued_model_order"]
+    assert len(continuations) == 1
+    assert continuations[0].ref == "unit:11:sentry"
+    assert continuations[0].readback == "verified"
+
+
+def test_runner_degraded_default_selects_only_from_offered_set(tmp_path):
+    """W2-1: the degraded default selects from the OFFERED set — a
+    priority-list pick whose candidate the cap elided is never executed;
+    over the full surface the same pick executes (control)."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    adapter = runner._load_adapter()
+    runner._session = session  # direct-call tests: run() never ran
+    snapshot = _fixture_snapshot(session)
+    real = session.build_candidate_table()
+    big = _over_cap_table(1, real.candidates)
+    tech_refs = {c.id for c in real.candidates if c.domain == "tech"}
+    assert tech_refs
+    assert not (tech_refs & set(big.offered().by_id()))  # all elided
+
+    executed_big = runner._execute_degraded(
+        adapter, turn=1, table=big, snapshot=snapshot,
+        snapshot_seq=0, candidates_seq=0, why="test: degraded")
+    assert executed_big == set()
+    offered_ids = set(big.offered().by_id())
+    for a in _actions(_records(runner.ledger.path)):
+        if a.outcome == "executed":
+            assert a.ref in offered_ids
+
+    # Control: over the full (under-cap) surface the same default executes
+    # the research pick — the cap was the only difference.
+    executed_small = runner._execute_degraded(
+        adapter, turn=1, table=real, snapshot=snapshot,
+        snapshot_seq=0, candidates_seq=0, why="test: degraded")
+    assert executed_small
+    small_offered = set(real.offered().by_id())
+    for a in _actions(_records(runner.ledger.path)):
+        if a.outcome == "executed" and a.provenance_class == "scripted_default":
+            assert a.ref in small_offered
+    assert [a for a in _actions(_records(runner.ledger.path))
+            if a.outcome == "executed" and a.domain == "tech"]
+
+
+def test_mark_armed_in_contact_protects_offered_membership():
+    """W2-1/FW-13: mark_armed_in_contact is the shared contact protection —
+    an armed-in-contact unit's candidates stay in the offered set past the
+    cap; without the marking the same candidates elide."""
+    contact_unit = UnitView(id=7, owner_id=1, is_own=True,
+                            type_name="Warriors", x=2, y=2, in_contact=True)
+    snapshot = Snapshot(turn=1, player=PlayerView(player_id=1),
+                        map_view=MapView(width=4, height=4),
+                        units=[contact_unit])
+    late = [
+        Candidate(id="unit:7:attack_e", domain="unit", actor_id="7",
+                  verb="attack_e", summary="attack east"),
+        Candidate(id="unit:7:fortify", domain="unit", actor_id="7",
+                  verb="fortify", summary="fortify"),
+    ]
+    big = _over_cap_table(1, late)
+    # Unmarked: the cap elides unit 7's candidates.
+    assert not {"unit:7:attack_e", "unit:7:fortify"} \
+        <= set(big.offered().by_id())
+    mark_armed_in_contact(big, snapshot)
+    assert {"unit:7:attack_e", "unit:7:fortify"} \
+        <= set(big.offered().by_id())

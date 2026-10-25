@@ -342,6 +342,18 @@ class StallWatchdog:
         self._stop.set()
 
 
+def mark_armed_in_contact(table: CandidateTable, snapshot: Snapshot) -> None:
+    """FW-13: candidates of armed-in-contact own units are never elided
+    by the candidate-table cap (the §3 overflow policy keeps the tactical
+    surface intact; idle/distant candidates elide first). Shared with the
+    comparator arm's reconstruction of the runner's offered surface
+    (eval/paired) so both arms see the same candidate membership."""
+    contact = {str(u.id) for u in snapshot.units if u.in_contact}
+    for cand in table.candidates:
+        if cand.domain == "unit" and cand.actor_id in contact:
+            cand.in_contact = True
+
+
 class GameRunner:
     """The turn pipeline + state machine + supervisor (§3 lines 32-34).
 
@@ -579,7 +591,7 @@ class GameRunner:
                 snapshot.render().encode("utf-8")).hexdigest(),
             token_count=snapshot.estimated_tokens()))
         table = self._session.build_candidate_table()
-        self._mark_armed_in_contact(table, snapshot)
+        mark_armed_in_contact(table, snapshot)
         offered = table.offered()
         by_domain: dict[str, int] = {}
         for cand in offered.candidates:
@@ -735,16 +747,6 @@ class GameRunner:
     # ------------------------------------------------------------------
     # game-over classification
     # ------------------------------------------------------------------
-
-    def _mark_armed_in_contact(self, table: CandidateTable,
-                               snapshot: Snapshot) -> None:
-        """FW-13: candidates of armed-in-contact own units are never elided
-        by the candidate-table cap (the §3 overflow policy keeps the
-        tactical surface intact; idle/distant candidates elide first)."""
-        contact = {str(u.id) for u in snapshot.units if u.in_contact}
-        for cand in table.candidates:
-            if cand.domain == "unit" and cand.actor_id in contact:
-                cand.in_contact = True
 
     def _session_game_over_flags(self) -> tuple[bool, bool, bool]:
         """The session-cached game-over flags: (terminated, truncated,
@@ -962,8 +964,9 @@ class GameRunner:
                 candidates_seq: int, provenance: str = "model") -> _IngestResult:
         """Validate one model response; emit action_result records for
         every model-emitted attempt (schema-error rejections for malformed
-        outputs; table rejections for invalid refs). Returns the planned
-        (executable) actions after group-abort filtering."""
+        outputs; table rejections for refs outside the OFFERED candidate
+        set — cap-elided or never legal). Returns the planned (executable)
+        actions after group-abort filtering."""
         if resp.error is not None:
             # Transport-level failure: no parseable attempts (the model_call
             # record carries the error).
@@ -985,7 +988,12 @@ class GameRunner:
             return _IngestResult(batch=None, failed=True,
                                  invalid=[(r, "schema_error") for r in refs])
         batch = resp.batch
-        by_id = table.by_id()
+        # W2-1: validate against the OFFERED (deterministically capped) set —
+        # the model could only ever see the capped rendering, so a well-formed
+        # ref to a cap-elided candidate is state it could not see
+        # (state_fog_error), never an executable action. Mid-batch legality is
+        # a separate check (_execute_planned, full refreshed table).
+        by_id = table.offered().by_id()
         result = _IngestResult(batch=batch)
         aborted_actors: set[str] = set()
         for item in batch.actions:
@@ -998,8 +1006,8 @@ class GameRunner:
                     provenance=provenance,
                     call_seq=call_seq, snapshot_seq=snapshot_seq,
                     candidates_seq=candidates_seq,
-                    detail=(f"ref not in the offered candidate table "
-                            f"({'never legal this turn — state_fog_error' if cls == 'state_fog_error' else 'not a candidate ID — schema_error'})"))
+                    detail=(f"ref not in the turn's offered candidate table "
+                            f"({'cap-elided or never legal this turn — state_fog_error' if cls == 'state_fog_error' else 'not a candidate ID — schema_error'})"))
                 result.invalid.append((item.ref, cls))
                 actor = _actor_of_ref(item.ref)
                 if actor is not None:
@@ -1102,11 +1110,13 @@ class GameRunner:
                           why: str) -> set[str]:
         """The degraded default (§3 line 44): the model is unresponsive
         after the repair cap → comparator/defaults.decide, logged
-        scripted_default with reason."""
-        log = defaults_mod.decide(snapshot, table)
+        scripted_default with reason. Selects from the OFFERED (capped)
+        set so both arms act with identical capability (W2-1)."""
+        offered = table.offered()
+        log = defaults_mod.decide(snapshot, offered)
         planned: list[_PlannedAction] = []
         for decision in log.decisions:
-            cand = table.by_id().get(decision.candidate_id)
+            cand = offered.by_id().get(decision.candidate_id)
             if cand is None:
                 continue  # stale default resolution: logged, never executed
             planned.append(_PlannedAction(ref=decision.candidate_id,
@@ -1533,7 +1543,11 @@ class GameRunner:
         exactly once, only when the model's batch contains no action for
         that actor AND the current state proves the order is no longer in
         effect (mutations are never re-sent without read-back proof of
-        non-execution, §3 line 32)."""
+        non-execution, §3 line 32). The re-issue resolves against the
+        OFFERED (capped) candidate set (W2-1): a cap-elided ref is a lookup
+        miss — re-resolve within the offered set or drop; never a
+        state_fog_error and never executed from the uncapped table."""
+        offered = table.offered()
         for actor in sorted(self._standing):
             self._check_abort()
             standing = self._standing[actor]
@@ -1544,9 +1558,9 @@ class GameRunner:
             if standing.reissued:
                 del self._standing[actor]  # one re-issue per order
                 continue
-            cand = table.by_id().get(standing.ref)
+            cand = offered.by_id().get(standing.ref)
             if cand is None:
-                for candidate in table.candidates:
+                for candidate in offered.candidates:
                     if (candidate.domain == "unit"
                             and candidate.actor_id == actor
                             and candidate.verb == standing.verb):
