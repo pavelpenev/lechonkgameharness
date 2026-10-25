@@ -16,7 +16,11 @@ state_transition event is emitted on horizon completion, by design.
   its deadline → FAILED/TRUNCATED with artifacts.
 - Run-level stall watchdog: no transcript event for 10 minutes → the
   ordered shutdown path (abort + guarded session close; the unwind emits
-  TRUNCATED with the reason).
+  TRUNCATED with the reason). Pure backstop (D14): it fires on a stall
+  only once the current phase's deadline has also passed (terminal
+  states publish no deadline — the plain stall rule applies); a legal
+  WAITING interval is never aborted before its WAITING deadline, which
+  ends the wait itself (D7).
 - Batch semantics (§3 line 33): after each executed mutation the remaining
   batch actions are revalidated against refreshed state; actions are
   grouped per acting entity; a stale or illegal action aborts only that
@@ -311,17 +315,24 @@ def _default_session_factory(config: RunnerConfig) -> Any:
 
 class StallWatchdog:
     """Run-level stall watchdog (§3 line 34): no transcript event for
-    ``stall_s`` → the ordered shutdown path. Watches the ledger's
-    last-event clock reading."""
+    ``stall_s`` → the ordered shutdown path. Pure backstop (D14): it
+    fires on a stall only once the current phase's deadline has also
+    passed — or when the phase publishes no deadline (terminal states).
+    A legal WAITING interval is never aborted before its WAITING
+    deadline, which ends the wait itself (D7). Watches the ledger's
+    last-event clock reading; it never enforces a phase deadline itself
+    and never writes to the ledger."""
 
     def __init__(self, *, stall_s: float, interval_s: float,
                  clock: Callable[[], float], ledger: TranscriptLedger,
-                 on_stall: Callable[[str], None]):
+                 on_stall: Callable[[str], None],
+                 phase_state: Callable[[], tuple[int, Optional[float]]]):
         self._stall_s = stall_s
         self._interval_s = interval_s
         self._clock = clock
         self._ledger = ledger
         self._on_stall = on_stall
+        self._phase_state = phase_state
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -330,12 +341,28 @@ class StallWatchdog:
             target=self._loop, name="lechonk-stall-watchdog", daemon=True)
         self._thread.start()
 
+    def _tick(self) -> bool:
+        """One watchdog evaluation: True iff the stall abort was
+        requested. Fires iff stalled AND the phase deadline has passed
+        (or none is published). The (generation, deadline) pair is
+        captured at tick start and re-verified before the abort request:
+        a stale tick cannot abort a newly entered phase."""
+        now = self._clock()
+        if now - self._ledger.last_event <= self._stall_s:
+            return False
+        generation, deadline = self._phase_state()
+        if deadline is not None and now < deadline:
+            return False
+        if self._phase_state() != (generation, deadline):
+            return False  # a phase was entered mid-tick: stale tick
+        self._on_stall(
+            f"run-level stall watchdog: no transcript event for "
+            f"{self._stall_s:.0f}s")
+        return True
+
     def _loop(self) -> None:
         while not self._stop.is_set():
-            if self._clock() - self._ledger.last_event > self._stall_s:
-                self._on_stall(
-                    f"run-level stall watchdog: no transcript event for "
-                    f"{self._stall_s:.0f}s")
+            if self._tick():
                 return
             self._stop.wait(self._interval_s)
 
@@ -378,6 +405,20 @@ class GameRunner:
         self._adapter: Optional[_AdapterModules] = None
         self._state = RunState.STARTUP
         self._state_entered: float = clock()
+        # D7/D14: the stall watchdog's phase view — the state generation
+        # (bumped by every _transition; the stale-tick guard) and the
+        # current phase's absolute deadline published by _transition
+        # (None in terminal states: the plain stall rule applies). Plain
+        # attributes shared with the watchdog thread (the
+        # ledger.last_event precedent).
+        self._state_generation = 0
+        self._phase_deadline_at: Optional[float] = (
+            self._state_entered + config.startup_deadline_s)
+        # The ACTING deadline's single source (W3-2 reuses this
+        # attribute; it creates no second source). Published by
+        # _transition(ACTING); its value coincides with the acting_entered
+        # _run_turn captures from the same transition instant.
+        self._acting_deadline_at: Optional[float] = None
         self._abort = threading.Event()
         self._abort_reason: Optional[str] = None
         self._session: Any = None
@@ -418,6 +459,24 @@ class GameRunner:
         prev = self._state
         self._state = state
         self._state_entered = self._clock()
+        # D7/D14: publish the phase's absolute deadline for the stall
+        # watchdog. FINISH_SENT is transient but gets the waiting
+        # deadline, not the plain rule; terminal states publish None.
+        if state is RunState.STARTUP:
+            self._phase_deadline_at = (
+                self._state_entered + self.config.startup_deadline_s)
+        elif state is RunState.ACTING:
+            self._phase_deadline_at = (
+                self._state_entered + self.config.acting_deadline_s)
+            self._acting_deadline_at = self._phase_deadline_at
+        elif state in (RunState.FINISH_SENT, RunState.WAITING):
+            self._phase_deadline_at = (
+                self._state_entered + self.config.waiting_deadline_s)
+        else:  # GAME_OVER / FAILED / NEXT_OWN_PHASE: terminal
+            self._phase_deadline_at = None
+        # Bumped AFTER the deadline publication: a watchdog tick that
+        # observes the new generation also observes the new deadline.
+        self._state_generation += 1
         self.ledger.append(MetricEventRecord(
             name="state_transition", value=f"{prev.value}->{state.value}"))
 
@@ -449,6 +508,12 @@ class GameRunner:
         if self._abort.is_set():
             raise _AbortRun(self._abort_reason or "abort requested")
 
+    def _watchdog_phase_state(self) -> tuple[int, Optional[float]]:
+        """The stall watchdog's phase view: (state generation, phase
+        deadline). Plain attributes read by the watchdog thread (the
+        ledger.last_event precedent)."""
+        return self._state_generation, self._phase_deadline_at
+
     # ------------------------------------------------------------------
     # supervision
     # ------------------------------------------------------------------
@@ -476,7 +541,8 @@ class GameRunner:
             stall_s=self.config.stall_watchdog_s,
             interval_s=self.config.watchdog_interval_s,
             clock=self._clock, ledger=self.ledger,
-            on_stall=self._request_abort)
+            on_stall=self._request_abort,
+            phase_state=self._watchdog_phase_state)
         self._watchdog.start()
         close_status = "not_attempted"
         try:

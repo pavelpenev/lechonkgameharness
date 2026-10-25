@@ -4,7 +4,8 @@ watchdog, driven offline by a fake session (real adapter read-backs) and a
 fake model client — including the fault injection the WP2 acceptance
 requires (timeout, malformed output, invalid action → the right repair
 class or the degraded fallback; batch abort-group semantics; ledger
-durability; the watchdog firing).
+durability; the deadline-aware stall watchdog (D7/D14: the legal-wait
+and genuine-stall firing rule, the generation guard).
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from lechonk.core.model_client import ModelResponse
 from lechonk.core.runner import (
     ENTITY_ID_RE,
     GameRunner,
+    RunState,
+    StallWatchdog,
     _QuarantineFailStop,
     _StandingOrder,
     mark_armed_in_contact,
@@ -731,7 +734,131 @@ def test_runner_acting_deadline_exceeded_fails_bounded(tmp_path):
     assert session.closed
 
 
-def test_runner_stall_watchdog_fires_on_silent_pipeline(tmp_path):
+class _WatchdogLedger:
+    """Duck-typed ledger for the watchdog: only ``last_event`` (the stall
+    input). Any write attempt fails the test — the watchdog never writes
+    to the ledger (D14)."""
+
+    def __init__(self, last_event: float):
+        self.last_event = last_event
+
+    def append(self, *args, **kwargs):
+        raise AssertionError("the stall watchdog must never write to the ledger")
+
+
+class _PhaseState:
+    """A mutable (generation, deadline) holder — the watchdog's
+    phase_state callable."""
+
+    def __init__(self, generation: int = 0, deadline=None):
+        self.generation = generation
+        self.deadline = deadline
+
+    def __call__(self):
+        return (self.generation, self.deadline)
+
+
+class _TransitioningPhaseState:
+    """A phase_state that transitions mid-tick: the first call (the
+    tick's capture) reports the OLD phase; later calls (the re-verify)
+    report the NEW phase — simulating a phase transition landing between
+    the two reads."""
+
+    def __init__(self, old, new):
+        self._old = old
+        self._new = new
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self._old if self.calls == 1 else self._new
+
+
+class _WatchdogDriver:
+    """Drives a StallWatchdog tick-by-tick (no thread): a fake clock, a
+    stub ledger, a mutable phase-state holder and a recorded stall
+    list."""
+
+    def __init__(self, *, stall_s=600.0, deadline=None, generation=0,
+                 last_event=0.0):
+        self.clock = FakeClock(start=last_event)
+        self.ledger = _WatchdogLedger(last_event)
+        self.phase = _PhaseState(generation=generation, deadline=deadline)
+        self.stalls: list[str] = []
+        self.watchdog = StallWatchdog(
+            stall_s=stall_s, interval_s=0.02, clock=self.clock,
+            ledger=self.ledger, on_stall=self.stalls.append,
+            phase_state=self.phase)
+
+    def tick(self) -> bool:
+        return self.watchdog._tick()
+
+
+class _SlowFinishSession(FakeSession):
+    """A finish step that consumes a scripted fake-clock interval (a
+    WAITING window: longer than the stall threshold, shorter than the
+    WAITING deadline) before completing — the watchdog sees the stall
+    while the window is legally open."""
+
+    def __init__(self, worlds, clock, *, finish_delay_s):
+        super().__init__(worlds)
+        self._clock = clock
+        self._finish_delay_s = finish_delay_s
+        self.finish_delays = 0
+
+    def step(self, action, *, deadline=None):
+        if action is None:
+            self._clock.advance(self._finish_delay_s)
+            self.finish_delays += 1
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_watchdog_ignores_legal_waiting_window(tmp_path):
+    """D7: the watchdog must not abort a legal WAITING interval before
+    its WAITING deadline. The finish step consumes 605 s of fake time —
+    past the 600 s stall threshold, inside the 900 s WAITING deadline —
+    and the watchdog never fires: the run completes normally."""
+    clock = FakeClock()
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = _SlowFinishSession(worlds, clock, finish_delay_s=605.0)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    assert "stall watchdog" not in result.reason
+    assert session.finish_delays == 2
+    assert session.closed
+
+
+def test_runner_waiting_deadline_ends_the_wait_not_the_watchdog(tmp_path):
+    """D7: at the WAITING deadline it is the WAITING deadline mechanism —
+    not the watchdog — that ends the wait. The finish step outlasts the
+    900 s WAITING deadline (the stall threshold sits far above it, so the
+    watchdog cannot fire): the run ends TRUNCATED with the WAITING
+    deadline reason."""
+    clock = FakeClock()
+    session = _SlowFinishSession([turn_world(1)], clock,
+                                 finish_delay_s=905.0)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock,
+                         config_overrides={"stall_watchdog_s": 10000.0})
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "WAITING exceeded its deadline of 900.0s" in result.reason
+    assert "stall watchdog" not in result.reason
+
+
+def test_runner_stall_watchdog_fires_once_phase_deadline_passed(tmp_path):
+    """D14: the watchdog is a pure backstop — a blocked finish whose
+    WAITING deadline has ALSO passed is a genuine stall: the watchdog
+    fires and the ordered shutdown closes the session."""
     worlds = [turn_world(1), turn_world(2), turn_world(3)]
     # The finish step blocks until close() — no transcript event flows.
     session = FakeSession(worlds, block_step=True)
@@ -741,6 +868,7 @@ def test_runner_stall_watchdog_fires_on_silent_pipeline(tmp_path):
     runner = make_runner(
         tmp_path, client=client, session=session, max_turns=2,
         config_overrides={"stall_watchdog_s": 0.2,
+                          "waiting_deadline_s": 0.1,
                           "watchdog_interval_s": 0.02})
     result = runner.run()
     assert result.outcome == "TRUNCATED"
@@ -750,6 +878,144 @@ def test_runner_stall_watchdog_fires_on_silent_pipeline(tmp_path):
     assert records[-1].outcome == "TRUNCATED"
     assert "stall watchdog" in records[-1].reason
     assert session.closed  # the ordered shutdown closed the session
+
+
+def test_watchdog_legal_waiting_window_does_not_fire():
+    """D7 at the firing rule: a stall inside a legal WAITING interval
+    never fires — the WAITING deadline mechanism ends the wait, not the
+    watchdog. A 605 s stall with the phase deadline at +900 s does not
+    fire; at/after the deadline (>= 900 s) the backstop fires."""
+    driver = _WatchdogDriver(deadline=900.0, last_event=0.0)
+    driver.clock.advance(605.0)  # stalled past 600 s, inside the deadline
+    assert driver.tick() is False
+    assert driver.stalls == []
+    driver.clock.advance(294.0)  # 899 s: still inside the deadline
+    assert driver.tick() is False
+    assert driver.stalls == []
+    driver.clock.advance(1.0)  # 900 s: the deadline has passed
+    assert driver.tick() is True
+    assert len(driver.stalls) == 1
+    assert "stall watchdog" in driver.stalls[0]
+
+
+def test_watchdog_acting_hang_fires_after_deadline():
+    """D14: an ACTING hang is a genuine stall once the ACTING deadline
+    (180 s) has also passed — the watchdog fires at the 600 s stall
+    threshold (the backstop is preserved)."""
+    driver = _WatchdogDriver(deadline=180.0, last_event=0.0)
+    driver.clock.advance(605.0)  # stalled; the deadline passed at 180 s
+    assert driver.tick() is True
+    assert len(driver.stalls) == 1
+
+
+def test_watchdog_uses_the_new_deadline_after_a_transition():
+    """A phase transition mid-stall republishes the deadline: the next
+    tick evaluates the NEW phase's deadline (both directions)."""
+    # Stalled inside a WAITING deadline: no fire; the wait ends and the
+    # phase advances to a terminal state (no deadline) — the plain stall
+    # rule applies again on the next tick.
+    driver = _WatchdogDriver(deadline=900.0, last_event=0.0)
+    driver.clock.advance(605.0)
+    assert driver.tick() is False
+    driver.phase.generation += 1
+    driver.phase.deadline = None  # terminal: no deadline published
+    assert driver.tick() is True
+    assert len(driver.stalls) == 1
+    # The reverse: stalled in a terminal state, then a transition into a
+    # phase whose deadline is still 900 s out suspends the backstop.
+    driver = _WatchdogDriver(deadline=None, last_event=0.0)
+    driver.clock.advance(605.0)
+    driver.phase.generation += 1
+    driver.phase.deadline = driver.clock() + 900.0  # a fresh WAITING
+    assert driver.tick() is False
+    assert driver.stalls == []
+    driver.clock.advance(900.0)  # the new deadline has passed
+    assert driver.tick() is True
+
+
+def test_watchdog_terminal_state_uses_the_plain_stall_rule():
+    """D14: terminal states publish no deadline, so the plain stall rule
+    applies — a stall fires (605 s would be a legal WAITING window)."""
+    driver = _WatchdogDriver(deadline=None, last_event=0.0)
+    driver.clock.advance(605.0)
+    assert driver.tick() is True
+    assert len(driver.stalls) == 1
+    assert "stall watchdog" in driver.stalls[0]
+
+
+def test_watchdog_stale_tick_cannot_abort_a_new_phase():
+    """The generation guard: a stale tick cannot abort a newly entered
+    phase. The tick captures a terminal phase (no deadline — it would
+    fire), but a transition lands before the abort request: the
+    re-verified generation differs, so the tick is discarded. The NEXT
+    tick evaluates the new phase on its own terms and fires."""
+    clock = FakeClock(start=0.0)
+    stalls: list[str] = []
+    # The tick's capture: terminal (no deadline). The re-verify: a fresh
+    # ACTING phase whose deadline is still 180 s out.
+    phase = _TransitioningPhaseState((0, None), (1, 180.0))
+    watchdog = StallWatchdog(
+        stall_s=600.0, interval_s=0.02, clock=clock,
+        ledger=_WatchdogLedger(0.0), on_stall=stalls.append,
+        phase_state=phase)
+    clock.advance(605.0)  # stalled past the threshold
+    assert watchdog._tick() is False
+    assert stalls == []  # the stale tick did not abort
+    assert phase.calls == 2  # captured, then re-verified
+    # The next tick evaluates the new phase on its own terms: stalled and
+    # past its deadline — the backstop fires.
+    assert watchdog._tick() is True
+    assert len(stalls) == 1
+
+
+def test_watchdog_never_enforces_the_deadline_itself():
+    """D14: no active deadline enforcement — the watchdog fires only on
+    a stall (no transcript event for stall_s) once the deadline has
+    passed. The deadline alone, with events flowing, never fires; and
+    the watchdog never writes to the ledger (the stub ledger's append
+    fails the test)."""
+    driver = _WatchdogDriver(deadline=900.0, last_event=0.0)
+    for _ in range(3):
+        driver.clock.advance(300.0)  # 300 s, 600 s, 900 s — the deadline
+        driver.ledger.last_event = driver.clock()  # an event just flowed
+        assert driver.tick() is False
+    assert driver.stalls == []
+
+
+def test_runner_transition_publishes_phase_deadlines(tmp_path):
+    """_transition publishes the current phase's absolute deadline for
+    the watchdog: STARTUP +startup, ACTING +acting (also the single
+    source _acting_deadline_at), FINISH_SENT/WAITING +waiting (FINISH_SENT
+    gets the waiting deadline, not the plain rule), terminal states
+    None. The generation bumps on every transition."""
+    clock = FakeClock()
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=FakeSession([turn_world(1)]),
+                         max_turns=1, clock=clock)
+    assert runner._acting_deadline_at is None  # before any ACTING
+
+    def published(state):
+        generation_before = runner._state_generation
+        runner._transition(state)
+        assert runner._state_generation == generation_before + 1
+        return runner._phase_deadline_at
+
+    entered = clock()
+    assert published(RunState.STARTUP) == entered + 120.0
+    clock.advance(10.0)
+    entered = clock()
+    deadline = published(RunState.ACTING)
+    assert deadline == entered + 180.0
+    assert runner._acting_deadline_at == deadline  # the single source
+    clock.advance(10.0)
+    entered = clock()
+    assert published(RunState.FINISH_SENT) == entered + 900.0
+    clock.advance(10.0)
+    entered = clock()
+    assert published(RunState.WAITING) == entered + 900.0
+    for terminal in (RunState.GAME_OVER, RunState.FAILED,
+                     RunState.NEXT_OWN_PHASE):
+        assert published(terminal) is None
 
 
 # ---------------------------------------------------------------------------
