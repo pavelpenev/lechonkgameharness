@@ -37,7 +37,7 @@ import pytest
 
 from lechonk.core.schemas import (
     ACTION_BATCH_MAX_ACTIONS,
-    CANDIDATE_ID_REGEX,
+    CANDIDATE_ID_FIELD_PATTERN,
     ActionBatch,
 )
 from lechonk.model import mistral_client as mc
@@ -563,7 +563,7 @@ def test_json_schema_path_sends_strict_structured_output_request():
     assert schema == ActionBatch.model_json_schema()
     # the ref field is constrained to candidate IDs
     ref_pattern = schema["$defs"]["ActionItem"]["properties"]["ref"]["pattern"]
-    assert ref_pattern == CANDIDATE_ID_REGEX
+    assert ref_pattern == CANDIDATE_ID_FIELD_PATTERN
 
 
 def test_validated_parse_path_requests_json_object():
