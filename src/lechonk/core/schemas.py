@@ -30,11 +30,12 @@ strategy memory ≤ 1,500.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from lechonk.core.jsonutil import strict_dumps
 
 # §3 numeric budgets (falsifiable commitments).
 SNAPSHOT_TOKEN_BUDGET = 8000
@@ -239,9 +240,10 @@ class Snapshot(BaseModel):
     omitted: OmittedDisclosure = Field(default_factory=OmittedDisclosure)
 
     def render(self) -> str:
-        """Compact JSON rendering (the policy-facing surface)."""
-        return json.dumps(self.model_dump(mode="json"), separators=(",", ":"),
-                          ensure_ascii=False)
+        """Compact JSON rendering (the policy-facing surface). Strict
+        canonical semantics: NaN/Infinity rejected, lone surrogates
+        escaped (core.jsonutil)."""
+        return strict_dumps(self.model_dump(mode="json"))
 
     def estimated_tokens(self) -> int:
         return estimate_tokens(self.render())
@@ -276,8 +278,7 @@ class Delta(BaseModel):
     events: list[DeltaEvent] = Field(default_factory=list)
 
     def render(self) -> str:
-        return json.dumps(self.model_dump(mode="json"), separators=(",", ":"),
-                          ensure_ascii=False)
+        return strict_dumps(self.model_dump(mode="json"))
 
     def estimated_tokens(self) -> int:
         return estimate_tokens(self.render())

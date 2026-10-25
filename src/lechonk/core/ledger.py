@@ -49,6 +49,7 @@ from typing import Any, Callable, Mapping, Union
 
 from pydantic import TypeAdapter
 
+from lechonk.core.jsonutil import canonical_json
 from lechonk.core.schemas import TranscriptRecord, TranscriptRecordBase
 
 # One TypeAdapter for the frozen union (validation + discrimination by kind).
@@ -59,13 +60,6 @@ class LedgerCorruptionError(RuntimeError):
     """A transcript line before the trailing partial record failed
     validation or checksum verification — the transcript is not silently
     truncated."""
-
-
-def canonical_json(payload: Mapping[str, Any]) -> str:
-    """Canonical JSON rendering for transcript lines and checksums:
-    sorted keys, compact separators, UTF-8, non-ASCII preserved."""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
 
 
 def compute_checksum(record_dict: Mapping[str, Any]) -> str:

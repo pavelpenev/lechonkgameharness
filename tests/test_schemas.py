@@ -18,6 +18,7 @@ from lechonk.core.schemas import (
     Commitment,
     Delta,
     DeltaEvent,
+    CityView,
     OmittedDisclosure,
     RunManifest,
     RunManifestRecord,
@@ -207,6 +208,33 @@ def test_snapshot_render_is_json_and_token_estimate():
     assert parsed["player"]["research"]["current_target"] == "Alphabet"
     assert snap.estimated_tokens() == estimate_tokens(rendered)
     assert snap.estimated_tokens() >= 1
+
+
+def test_snapshot_render_rejects_nan():
+    # FW-09: a NaN in the payload (pydantic float fields admit it) raises a
+    # deterministic ValueError on render — never a bare NaN token.
+    snap = _mini_snapshot()
+    snap.cities = [CityView(id=1, name="Roma", x=2, y=3, is_own=True,
+                            production_progress=float("nan"))]
+    with pytest.raises(ValueError):
+        snap.render()
+
+
+def test_snapshot_render_clean_payloads_byte_identical():
+    # FW-09 regression: the strict helper must not change the bytes for
+    # clean payloads (the policy-facing surface).
+    snap = _mini_snapshot()
+    assert snap.render() == json.dumps(
+        snap.model_dump(mode="json"), separators=(",", ":"),
+        ensure_ascii=False)
+
+
+def test_delta_render_clean_payloads_byte_identical():
+    delta = Delta(turn=2, events=[
+        DeltaEvent(kind="unit_changed", subject="unit:7", detail="moved N")])
+    assert delta.render() == json.dumps(
+        delta.model_dump(mode="json"), separators=(",", ":"),
+        ensure_ascii=False)
 
 
 def test_estimate_tokens_rounds_up():

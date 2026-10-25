@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -75,6 +76,54 @@ def test_checksum_is_order_independent_and_canonical():
                           "seq": 0, "checksum": ""})
     assert a == b  # canonical JSON: sorted keys
     assert a != compute_checksum({**rec, "turn": 4})
+
+
+# ---------------------------------------------------------------------------
+# FW-09: strict canonical JSON (reject NaN, escape lone surrogates)
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_json_rejects_nan_and_infinity():
+    # allow_nan=False semantics: a deterministic ValueError, never a bare
+    # NaN/Infinity token in the output.
+    with pytest.raises(ValueError):
+        canonical_json({"x": float("nan")})
+    with pytest.raises(ValueError):
+        canonical_json({"x": float("inf")})
+    with pytest.raises(ValueError):
+        canonical_json({"x": float("-inf")})
+
+
+def test_canonical_json_escapes_lone_surrogates():
+    payload = {"s": "a\ud800b"}
+    text = canonical_json(payload)
+    # The surrogate is escaped, never emitted raw — valid JSON whose utf-8
+    # encoding (the checksum path) cannot hit UnicodeEncodeError.
+    assert text == '{"s":"a\\ud800b"}'
+    assert json.loads(text) == payload
+    checksum = compute_checksum(payload)
+    assert checksum == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_canonical_json_clean_payloads_byte_identical():
+    # Regression: for clean (non-NaN, surrogate-free) payloads the helper
+    # must produce exactly the pre-FW-09 bytes (recorded-artifact
+    # checksums depend on it).
+    payload = {"b": 1, "a": [1, 2, {"c": "café — ü"}], "d": None, "e": True}
+    assert canonical_json(payload) == json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_append_record_with_lone_surrogate_roundtrips(tmp_path):
+    # End to end: a surrogate-carrying record checksums on write, and the
+    # read-back recomputes the same checksum (no UnicodeEncodeError).
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(MetricEventRecord(name="n\ud800", value="v"))
+    ledger.close()
+    load = load_transcript(path)
+    assert not load.discarded_trailing_partial
+    assert load.records[0].name == "n\ud800"
 
 
 def test_append_rejects_records_outside_the_frozen_union(tmp_path):
