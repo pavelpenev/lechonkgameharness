@@ -46,11 +46,15 @@ port_busy() {
 echo "==> Vendored civrealm submodule"
 CIVREALM_BASE="1b144d6"
 CIVREALM_HEAD="36ae456"
-if [ -e vendor/civrealm ] && [ ! -d vendor/civrealm/.git ]; then
+# A submodule checkout is initialized when vendor/civrealm/.git exists
+# as either a directory (full clone) or a file (standard gitfile layout
+# pointing at the parent's module gitdir). A vendor/civrealm present
+# without any .git is stray content, not a checkout.
+if [ -e vendor/civrealm ] && [ ! -e vendor/civrealm/.git ]; then
   echo "vendor/civrealm exists but is not a git checkout; refusing to touch it" >&2
   exit 1
 fi
-if [ ! -d vendor/civrealm/.git ]; then
+if [ ! -e vendor/civrealm/.git ]; then
   git submodule update --init --recursive vendor/civrealm
 fi
 CIVREALM_GITLINK="$(git rev-parse ':vendor/civrealm')"
