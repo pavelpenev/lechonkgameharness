@@ -10,9 +10,11 @@ durability; the watchdog firing).
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import replace
 from pathlib import Path
 
+from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
 from lechonk.core.schemas import (
     ActionResultRecord,
@@ -26,6 +28,7 @@ from lechonk.core.schemas import (
     TurnStartRecord,
 )
 
+from tests.lifecycle_fixtures import LifecycleSession
 from tests.runner_fixtures import (
     FakeClock,
     FakeModelClient,
@@ -840,3 +843,382 @@ def test_runner_reports_true_turns_completed_after_mid_turn_death(tmp_path):
     records = _records(runner.ledger.path)
     assert isinstance(records[-1], OutcomeRecord)
     assert records[-1].outcome == "TRUNCATED"
+
+
+# ---------------------------------------------------------------------------
+# FW-14a (A3): game-over flag plumbing — the acting boundary and the
+# mid-batch / phase-boundary classifications
+# ---------------------------------------------------------------------------
+
+GOTO_REF = "unit:10:goto_e"
+# The raw CivRealm action tuple for the goto_e candidate (action key
+# goto_4 = dir8 E — the same table the read-back verifier uses).
+GOTO_ACTION = ("unit", 10, "goto_4")
+
+
+class _ActingBoundaryGameOverSession(FakeSession):
+    """The session cache at the ACTING boundary holds the game-over
+    state: an EMPTY observation plus the step flags the real
+    AdapterSession caches (terminated/truncated + the env's defeat
+    signal). The acting-boundary extraction must classify by the flags
+    — never raise ValueError into the generic infrastructure handler."""
+
+    def __init__(self, worlds, *, terminated, truncated, defeated,
+                 empty_obs=True):
+        super().__init__(worlds)
+        self._terminated = terminated
+        self._truncated = truncated
+        self._defeated = defeated
+        self._empty_obs = empty_obs
+
+    @property
+    def obs(self):
+        return {} if self._empty_obs else super().obs
+
+    @property
+    def info(self):
+        if self._empty_obs:
+            return {"turn": 2, "available_actions": {}}
+        return super().info
+
+    @property
+    def terminated(self):
+        return self._terminated
+
+    @property
+    def truncated(self):
+        return self._truncated
+
+    @property
+    def my_player_is_defeated(self):
+        return self._defeated
+
+
+def test_runner_acting_boundary_empty_game_over_obs_defeated(tmp_path):
+    """A3a: an empty game-over observation at the acting boundary with
+    terminated=True + the env's defeat signal True classifies as
+    DEFEATED by the flags — not TRUNCATED "infrastructure failure" (the
+    pre-fix ValueError path through the generic handler)."""
+    session = _ActingBoundaryGameOverSession(
+        [turn_world(1)], terminated=True, truncated=False, defeated=True)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "DEFEATED"
+    assert result.reason == "my player is defeated"
+    assert "infrastructure failure" not in result.reason
+    records = _records(runner.ledger.path)
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "DEFEATED"
+
+
+def test_runner_acting_boundary_empty_obs_truncated_stays_distinct(tmp_path):
+    """The env flag values reach classification: truncated=True (not
+    terminated) classifies as TRUNCATED infrastructure — distinct from
+    DEFEATED, never confused with a defeat."""
+    session = _ActingBoundaryGameOverSession(
+        [turn_world(1)], terminated=False, truncated=True, defeated=False)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.outcome != "DEFEATED"
+    assert "truncated=True" in result.reason
+    assert "infrastructure failure" not in result.reason
+
+
+def test_runner_acting_boundary_missing_record_never_false_victory(tmp_path):
+    """A3b: an empty game-over observation at the acting boundary with
+    terminated=True but NO provable defeat status (no player record, no
+    positive env defeat signal) is TRUNCATED/inconclusive — never a
+    false VICTORY."""
+    session = _ActingBoundaryGameOverSession(
+        [turn_world(1)], terminated=True, truncated=False, defeated=False)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.outcome != "VICTORY"
+    assert "unknown defeat status" in result.reason
+
+
+def test_runner_acting_boundary_victory_needs_a_live_record(tmp_path):
+    """The VICTORY branch is evidence-gated: terminated=True with the
+    env's defeat signal False AND a well-formed live player record in
+    the observation classifies as VICTORY."""
+    session = _ActingBoundaryGameOverSession(
+        [turn_world(1)], terminated=True, truncated=False, defeated=False,
+        empty_obs=False)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "VICTORY"
+    assert "defeated=False" in result.reason
+
+
+class _MidBatchEmptyGameOverSession(FakeSession):
+    """A FakeSession caching the latest step's observation and game-over
+    flags exactly like the real AdapterSession (FW-14a plumbing): the
+    game-ending mutation returns an EMPTY observation (the real env's
+    game-over observation) with terminated=True. The mid-batch
+    classification (runner.py:632) must consult the env's defeat flag —
+    never default to not-defeated on a missing player record."""
+
+    def __init__(self, worlds, *, terminate_on, defeated):
+        super().__init__(worlds)
+        self._terminate_on = terminate_on
+        self._defeated = defeated
+        self._terminated = False
+        self._truncated = False
+        self._step_obs = None
+
+    @property
+    def obs(self):
+        if self._step_obs is not None:
+            return self._step_obs
+        return super().obs
+
+    @property
+    def terminated(self):
+        return self._terminated
+
+    @property
+    def truncated(self):
+        return self._truncated
+
+    @property
+    def my_player_is_defeated(self):
+        return self._defeated if (self._terminated or self._truncated) else None
+
+    def step(self, action, *, deadline=None):
+        outcome = super().step(action, deadline=deadline)
+        if action is not None and tuple(action) == self._terminate_on:
+            outcome = replace(outcome, observation={}, terminated=True,
+                              truncated=False)
+        self._step_obs = outcome.observation
+        self._terminated = bool(outcome.terminated)
+        self._truncated = bool(outcome.truncated)
+        return outcome
+
+
+def test_runner_game_over_mid_batch_empty_obs_defeated(tmp_path):
+    """A3b at runner.py:632: a mutation ends the game mid-batch with an
+    EMPTY observation; the defeat status is proven by the env's defeat
+    flag (True) -> DEFEATED — not a false VICTORY from the missing
+    player record."""
+    session = _MidBatchEmptyGameOverSession(
+        [turn_world(1)], terminate_on=GOTO_ACTION, defeated=True)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "DEFEATED"
+    assert "game over mid-batch (defeated=True)" in result.reason
+    records = _records(runner.ledger.path)
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "DEFEATED"
+
+
+def test_runner_game_over_mid_batch_empty_obs_unknown_never_victory(tmp_path):
+    """A3b at runner.py:632: the same empty game-over observation with
+    NO provable defeat status (the env's defeat signal False — the
+    vendor method returns False both when provably alive and when the
+    record is missing) is TRUNCATED/inconclusive — never a false
+    VICTORY."""
+    session = _MidBatchEmptyGameOverSession(
+        [turn_world(1)], terminate_on=GOTO_ACTION, defeated=False)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.outcome != "VICTORY"
+    assert "unknown defeat status" in result.reason
+    assert "game over mid-batch" in result.reason
+
+
+class _PhaseBoundaryEmptyGameOverSession(FakeSession):
+    """The finish step ends the game with an EMPTY observation (the real
+    env's game-over observation); the session caches the flags. The
+    phase-boundary classification (runner.py:647) must consult the env's
+    defeat flag — never default to not-defeated on a missing player
+    record."""
+
+    def __init__(self, worlds, *, defeated, truncated=False):
+        super().__init__(worlds, final_terminated=not truncated,
+                         final_truncated=truncated)
+        self._defeated = defeated
+        self._terminated = False
+        self._truncated = False
+
+    @property
+    def terminated(self):
+        return self._terminated
+
+    @property
+    def truncated(self):
+        return self._truncated
+
+    @property
+    def my_player_is_defeated(self):
+        return self._defeated if (self._terminated or self._truncated) else None
+
+    def step(self, action, *, deadline=None):
+        outcome = super().step(action, deadline=deadline)
+        if outcome.terminated or outcome.truncated:
+            outcome = replace(outcome, observation={})
+        self._terminated = bool(outcome.terminated)
+        self._truncated = bool(outcome.truncated)
+        return outcome
+
+
+def test_runner_game_over_at_phase_boundary_empty_obs_defeated(tmp_path):
+    """A3b at runner.py:647: the finish step ends the game with an
+    EMPTY observation; the defeat status is proven by the env's defeat
+    flag (True) -> DEFEATED — not a false VICTORY from the missing
+    player record."""
+    session = _PhaseBoundaryEmptyGameOverSession([turn_world(1)],
+                                                 defeated=True)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=5)
+    result = runner.run()
+    assert result.outcome == "DEFEATED"
+    assert "game over at the phase boundary (defeated=True)" in result.reason
+
+
+def test_runner_game_over_at_phase_boundary_empty_obs_never_victory(tmp_path):
+    """A3b at runner.py:647: the same empty game-over observation with
+    NO provable defeat status is TRUNCATED/inconclusive — never a false
+    VICTORY."""
+    session = _PhaseBoundaryEmptyGameOverSession([turn_world(1)],
+                                                 defeated=False)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=5)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.outcome != "VICTORY"
+    assert "unknown defeat status" in result.reason
+
+
+def test_runner_truncated_at_phase_boundary_stays_truncated(tmp_path):
+    """The env flag values reach classification at runner.py:647:
+    truncated=True (not terminated) stays TRUNCATED infrastructure —
+    distinct from DEFEATED, never confused with a defeat."""
+    session = _PhaseBoundaryEmptyGameOverSession(
+        [turn_world(1)], defeated=False, truncated=True)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=5)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "infrastructure truncation at the phase boundary" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# FW-14a (A5): an INCONCLUSIVE resend read-back quarantines (§3 line 35)
+# ---------------------------------------------------------------------------
+
+
+class _InconclusiveResendSession(LifecycleSession):
+    """The resubmission's read-back is INCONCLUSIVE: the reconnect read
+    proved non-execution (the resend is permitted), but the resend's own
+    post-state can neither verify nor contradict the move (the unit
+    vanished server-side). The §3 line 35 quarantine path must fire —
+    the run never continues on an inconclusive settlement."""
+
+    def __init__(self, worlds, **kwargs):
+        super().__init__(worlds, **kwargs)
+        self._goto_sends = 0
+
+    def step(self, action, *, deadline=None):
+        if action == GOTO_ACTION:
+            self._goto_sends += 1
+            if self._goto_sends >= 2:
+                # The resend: the unit vanished server-side — the
+                # read-back can neither verify nor contradict the move.
+                self.calls.append((action, deadline))
+                obs, info = self._worlds[self._index]
+                new_obs = copy.deepcopy(obs)
+                del new_obs["unit"][10]
+                self._worlds[self._index] = (new_obs, info)
+                self._advance_cache(new_obs, info)
+                return StepOutcome(observation=new_obs, reward=0.0,
+                                   terminated=False, truncated=False,
+                                   info=info, action=action,
+                                   elapsed_s=0.01)
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_inconclusive_resend_readback_quarantines(tmp_path):
+    """A5: the ONE permitted resubmission's read-back is INCONCLUSIVE
+    (the execution state is unknown) — the same quarantine path as an
+    exception or a CONTRADICTED resend: the read-back record is
+    emitted, a mutation_quarantine metric event is emitted, and the run
+    takes the bounded fail-stop (TRUNCATED) — it never continues."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = _InconclusiveResendSession(
+        worlds, disconnect_on=GOTO_ACTION, effect_applied=False)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert "quarantined" in result.reason
+    assert "read back inconclusive" in result.reason
+    assert "never resent" in result.reason
+    # Exactly two sends: the failed dispatch + the one resubmission —
+    # never a third.
+    assert session._goto_sends == 2
+    assert len([c for c in session.calls if c[0] == GOTO_ACTION]) == 2
+
+    records = _records(runner.ledger.path)
+    by_ref = [a for a in _actions(records) if a.ref == GOTO_REF]
+    assert len(by_ref) == 2
+    # The uncertain attempt + the resubmission (both sent, both
+    # inconclusive) — and nothing else.
+    assert all(a.outcome == "executed" for a in by_ref)
+    assert all(a.readback == "inconclusive" for a in by_ref)
+    assert by_ref[0].provenance_class == "model"
+    assert by_ref[1].provenance_class == "continued_model_order"
+    assert by_ref[1].origin_seq == by_ref[0].seq
+    # The first reconciliation proved non-execution (permitting the one
+    # resubmission).
+    reconciliations = [r for r in records
+                       if isinstance(r, MetricEventRecord)
+                       and r.name == "mutation_reconciliation"]
+    assert len(reconciliations) == 1
+    assert f"{GOTO_REF}: non_execution_verified" in reconciliations[0].value
+    # The inconclusive resend read-back took the quarantine path: one
+    # mutation_quarantine event naming the inconclusive read-back.
+    quarantines = [r for r in records
+                   if isinstance(r, MetricEventRecord)
+                   and r.name == "mutation_quarantine"]
+    assert len(quarantines) == 1
+    assert "read back inconclusive" in quarantines[0].value
+    assert GOTO_REF in quarantines[0].value
+    # Bounded fail-stop with artifacts: the outcome record is ledgered;
+    # the run did NOT continue (turn 1 never completed).
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "TRUNCATED"
+    assert "quarantined" in records[-1].reason
+    assert result.turns_completed == 0
+    assert session.closed

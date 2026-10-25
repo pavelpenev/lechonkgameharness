@@ -533,8 +533,14 @@ class GameRunner:
         provenance = getattr(self.client, "provenance_class", "model")
 
         # --- snapshot + candidate table (the policy-facing surface) -----
+        # The env's game-over flags ride the session cache: an empty
+        # game-over observation is classified by them (DEFEATED /
+        # VICTORY / TRUNCATED), never by the dict alone.
+        terminated, truncated, defeated = self._session_game_over_flags()
         extraction = adapter.obs_extract.extract_snapshot(
             self._session.obs, self._session.info,
+            terminated=terminated, truncated=truncated,
+            my_player_is_defeated=defeated,
             my_player_id=self._session.player_id,
             ruleset=self._session.ruleset,
             action_probs=self._session.action_probs,
@@ -630,6 +636,12 @@ class GameRunner:
                         "infrastructure truncation mid-batch — artifacts "
                         "intact", None)
             defeated = self._my_player_defeated(self._session.obs)
+            if defeated is None:
+                return ("TRUNCATED",
+                        "game over mid-batch with unknown defeat status "
+                        "(no well-formed player record, no positive env "
+                        "defeat signal) — never a false VICTORY — "
+                        "artifacts intact", None)
             return ("DEFEATED" if defeated else "VICTORY",
                     f"game over mid-batch (defeated={defeated})", None)
 
@@ -649,6 +661,12 @@ class GameRunner:
                 return ("TRUNCATED",
                         "infrastructure truncation at the phase boundary "
                         "(server timeout) — artifacts intact", None)
+            if defeated is None:
+                return ("TRUNCATED",
+                        "game over at the phase boundary with unknown "
+                        "defeat status (no well-formed player record, no "
+                        "positive env defeat signal) — never a false "
+                        "VICTORY — artifacts intact", None)
             return ("DEFEATED" if defeated else "VICTORY",
                     "game over at the phase boundary "
                     f"(defeated={defeated})", None)
@@ -659,30 +677,67 @@ class GameRunner:
     # game-over classification
     # ------------------------------------------------------------------
 
+    def _session_game_over_flags(self) -> tuple[bool, bool, bool]:
+        """The session-cached game-over flags: (terminated, truncated,
+        my_player_is_defeated). The real AdapterSession caches them from
+        the latest step (the defeat signal is read from the controller at
+        the game-over boundary — it is not in the step tuple); a
+        duck-typed session that does not expose them defaults to no
+        game-over."""
+        terminated = bool(getattr(self._session, "terminated", False))
+        truncated = bool(getattr(self._session, "truncated", False))
+        defeated = getattr(self._session, "my_player_is_defeated", None)
+        return (terminated, truncated,
+                defeated if isinstance(defeated, bool) else False)
+
     def _game_over_outcome(self, outcome: Any, reason: str
                            ) -> tuple[Optional[str], str, Optional[Snapshot]]:
-        mapping = {
-            "terminated_game_over": ("VICTORY", "game over (not defeated)"),
-            "terminated_defeated": ("DEFEATED", "my player is defeated"),
-            "truncated_infra": ("TRUNCATED", reason or "infrastructure "
-                                              "truncation"),
-        }
-        # ExtractOutcome is a str Enum: str(member) is "ExtractOutcome.X",
-        # so the mapping is keyed by the VALUE (mixed-in str equality would
-        # also work, but .value is explicit).
-        mapped = mapping.get(getattr(outcome, "value", outcome))
+        """Map the extraction outcome (classified by the env's game-over
+        flags) to the run outcome. The VICTORY branch is evidence-gated:
+        ``terminated_game_over`` means the env's defeat flag said
+        not-defeated, but a False flag is not positive proof of survival
+        (the vendor method returns False both when the player is
+        provably alive AND when the player record is missing —
+        civ_controller.py:303-330), so the defeat status must be provable
+        or the run reports TRUNCATED — never a false VICTORY."""
+        value = getattr(outcome, "value", outcome)
         self._transition(RunState.GAME_OVER)
-        if mapped is None:
-            return ("TRUNCATED", reason or "unknown extraction outcome", None)
-        return (mapped[0], mapped[1], None)
+        if value == "terminated_defeated":
+            # terminated=True with the env's defeat flag True: positive
+            # evidence of defeat.
+            return ("DEFEATED", "my player is defeated", None)
+        if value == "truncated_infra":
+            return ("TRUNCATED", reason or "infrastructure truncation", None)
+        if value == "terminated_game_over":
+            defeated = self._my_player_defeated(self._session.obs)
+            if defeated is None:
+                return ("TRUNCATED",
+                        "game over with unknown defeat status (no "
+                        "well-formed player record, no positive env "
+                        "defeat signal) — never a false VICTORY", None)
+            return ("DEFEATED" if defeated else "VICTORY",
+                    f"game over (defeated={defeated})", None)
+        return ("TRUNCATED", reason or "unknown extraction outcome", None)
 
-    def _my_player_defeated(self, obs: Any) -> bool:
+    def _my_player_defeated(self, obs: Any) -> Optional[bool]:
+        """The defeat status at a game-over boundary: True/False when
+        provable, None when unknown (never a false VICTORY).
+
+        A well-formed player record (is_alive a bool) is authoritative.
+        When the record is missing or malformed, the env's defeat flag
+        decides — but only positively: the vendor method returns False
+        both when the player is provably alive and when the record is
+        missing (civ_controller.py:303-330), so anything but a True flag
+        leaves the status unknown."""
         players = (obs or {}).get("player") or {}
         pid = self._session.player_id
         me = players.get(pid)
-        if isinstance(me, dict):
-            return me.get("is_alive") is False
-        return False
+        if isinstance(me, dict) and isinstance(me.get("is_alive"), bool):
+            return me["is_alive"] is False
+        flag = getattr(self._session, "my_player_is_defeated", None)
+        if flag is True:
+            return True
+        return None
 
     # ------------------------------------------------------------------
     # the model phase
@@ -1123,8 +1178,9 @@ class GameRunner:
         resent exactly once, linked to its origin. The provenance mirrors
         the origin attempt's class (``continued_model_order`` only for a
         model arm — a scripted arm's resubmission is never mislabeled as
-        model-originated). A second disconnect — or a contradicted resend
-        — quarantines; the resubmission is never repeated."""
+        model-originated). A second disconnect, a contradicted resend, or
+        an inconclusive resend read-back quarantines; the resubmission is
+        never repeated."""
         # Provenance honesty (§3 line 45): continued_model_order is a
         # MODEL-arm label — a scripted arm's resubmission mirrors its
         # origin attempt's provenance class, with the same origin linkage.
@@ -1179,6 +1235,31 @@ class GameRunner:
                 f"{cand.id}'s resubmission read back contradicted "
                 f"({result.detail}) — the one resubmission is spent, "
                 f"never resent (never blind replay, §3 line 35)")
+        if readback != adapter.execute.VERIFIED:
+            # INCONCLUSIVE: the resend's execution state is unknown —
+            # the same quarantine path as an exception or a contradicted
+            # resend (§3 line 35 / the module docstring: an unknown
+            # mutation is NEVER resent again; the run takes the bounded
+            # fail-stop, never continues on an inconclusive settlement).
+            self._emit_action_result(
+                turn=turn, ref=cand.id, domain=cand.domain, verb=cand.verb,
+                target=target, affected=affected, actor_tile=actor_tile,
+                outcome="executed",
+                provenance_class=resend_provenance, origin_seq=origin_seq,
+                reason="pipeline resubmission after verified non-execution",
+                snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+                call_seq=None, readback=readback, detail=result.detail,
+                durable=True)
+            self._emit(MetricEventRecord(
+                name="mutation_quarantine",
+                value=(f"{cand.id}: the resubmission read back {readback} "
+                       f"— quarantined, never resent again (never blind "
+                       f"replay, §3 line 35)")))
+            raise _QuarantineFailStop(
+                f"uncertain mutation quarantined after disconnect: "
+                f"{cand.id}'s resubmission read back {readback} "
+                f"({result.detail}) — never resent again (never blind "
+                f"replay, §3 line 35)")
         seq = self._emit_action_result(
             turn=turn, ref=cand.id, domain=cand.domain, verb=cand.verb,
             target=target, affected=affected, actor_tile=actor_tile,

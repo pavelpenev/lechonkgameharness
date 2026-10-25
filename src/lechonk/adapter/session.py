@@ -102,6 +102,12 @@ class StepOutcome:
     info: Mapping[str, Any]
     action: Any  # action tuple | None (finish) | 'pass'
     elapsed_s: float
+    # The env's defeat signal (my_player_is_defeated), read from the
+    # controller at a game-over step — it is NOT part of the env's step
+    # tuple (vendor: civ_controller.py:303, a read-only CivController
+    # property reached via env.civ_controller). None unless the step
+    # ended the game.
+    my_player_is_defeated: Optional[bool] = None
 
 
 def _snapshot(value: Any) -> Any:
@@ -252,6 +258,12 @@ class AdapterSession:
         self._ruleset: Optional[RulesetNames] = None
         self._action_probs: Mapping[int, Any] = {}
         self._unit_flags: Mapping[int, Any] = {}
+        # The latest completed step's game-over flags: terminated/truncated
+        # come from the env's step tuple; the defeat signal is read from
+        # the controller at the game-over boundary (see _dispatch).
+        self._terminated = False
+        self._truncated = False
+        self._my_player_is_defeated: Optional[bool] = None
 
         self._failed: Optional[str] = None
         self._closed = False
@@ -329,6 +341,22 @@ class AdapterSession:
         return self._turn
 
     @property
+    def terminated(self) -> bool:
+        """The latest completed step's terminated flag (game over)."""
+        return self._terminated
+
+    @property
+    def truncated(self) -> bool:
+        """The latest completed step's truncated flag (infra/horizon)."""
+        return self._truncated
+
+    @property
+    def my_player_is_defeated(self) -> Optional[bool]:
+        """The env's defeat signal read at the latest game-over step, or
+        None (mid-game, or a game-over step whose signal read failed)."""
+        return self._my_player_is_defeated
+
+    @property
     def player_id(self) -> Optional[int]:
         return self._player_id
 
@@ -382,8 +410,10 @@ class AdapterSession:
 
         ``action`` is a CivRealm action tuple (ctrl_type, actor_id,
         action_key), None (finish phase), or 'pass' (no-op). The cached
-        obs/info/turn advance to this step's result — the runner calls
-        execute per action with refreshed state.
+        obs/info/turn advance to this step's result — and so do the
+        game-over flags (terminated/truncated plus the env's defeat
+        signal), so the runner can classify an empty game-over
+        observation at the next decision point.
         """
         outcome = self._rpc("step", action,
                             timeout=deadline if deadline is not None
@@ -391,6 +421,10 @@ class AdapterSession:
         self._obs = outcome.observation
         self._info = outcome.info
         self._turn = int(outcome.info.get("turn", self._turn) or self._turn)
+        self._terminated = bool(outcome.terminated)
+        self._truncated = bool(outcome.truncated)
+        self._my_player_is_defeated = getattr(
+            outcome, "my_player_is_defeated", None)
         return outcome
 
     def refresh(self) -> Mapping[str, Any]:
@@ -503,11 +537,25 @@ class AdapterSession:
         if kind == "step":
             t0 = time.monotonic()
             obs, reward, terminated, truncated, info = self._env.step(payload)
+            defeated = None
+            if terminated or truncated:
+                # The defeat signal is NOT in the env's step tuple (vendor:
+                # civ_controller.py:303 — a read-only CivController property
+                # reached via env.civ_controller): read it once, at the
+                # game-over boundary, and carry it on the outcome so the
+                # session can cache it with the flags. A failed read is
+                # None (unknown) — never a fabricated signal.
+                try:
+                    defeated = bool(
+                        self._env.civ_controller.my_player_is_defeated())
+                except Exception:
+                    defeated = None
             return StepOutcome(
                 observation=_snapshot(obs), reward=reward,
                 terminated=terminated, truncated=truncated,
                 info=_snapshot(info), action=payload,
-                elapsed_s=time.monotonic() - t0)
+                elapsed_s=time.monotonic() - t0,
+                my_player_is_defeated=defeated)
         if kind == "refresh":
             # Seed the read first: _get_info()'s leading lock_control() only
             # returns once a server packet arrives; the action-probability
