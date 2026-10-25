@@ -1178,6 +1178,23 @@ def test_runner_acting_boundary_victory_needs_a_live_record(tmp_path):
     assert "defeated=False" in result.reason
 
 
+def test_runner_game_over_victory_positive_pin(tmp_path):
+    """F5 ruling A: the terminated_game_over branch reached with
+    reliable provenance — the env's game-over flags plumbed through the
+    session cache (terminated=True, truncated=False, defeat signal
+    False) plus a well-formed ALIVE player record classify the run as
+    VICTORY."""
+    session = _ActingBoundaryGameOverSession(
+        [turn_world(1)], terminated=True, truncated=False, defeated=False,
+        empty_obs=False)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "VICTORY"
+    assert "defeated=False" in result.reason
+
+
 class _MidBatchEmptyGameOverSession(FakeSession):
     """A FakeSession caching the latest step's observation and game-over
     flags exactly like the real AdapterSession (FW-14a plumbing): the
