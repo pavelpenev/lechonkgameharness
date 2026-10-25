@@ -60,6 +60,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from pydantic import ValidationError
 
+from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.schemas import ActionBatch
 from lechonk.model import prompts as prompt_templates
 
@@ -669,8 +670,7 @@ def action_batch_json_schema() -> dict[str, Any]:
 def action_batch_schema_hash() -> str:
     """``sha256:<hex>`` over the canonical JSON of the ActionBatch schema —
     the schema hash recorded by the WP2 spike artifact (decision 8)."""
-    canonical = json.dumps(action_batch_json_schema(), sort_keys=True,
-                           separators=(",", ":"), ensure_ascii=False)
+    canonical = strict_dumps(action_batch_json_schema(), sort_keys=True)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

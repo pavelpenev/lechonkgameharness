@@ -48,6 +48,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.ledger import load_transcript
 from lechonk.core.metrics import commitment_board
 from lechonk.core.schemas import (
@@ -857,19 +858,13 @@ def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
             .replace("__TITLE__", _html_escape(html_title))
             .replace("__TRANSCRIPT_JSONL__", _embed(raw_text))
             .replace("__TURNS_JSONL__",
-                     _embed(json.dumps(turns_summaries, ensure_ascii=False,
-                                       default=str))
+                     _embed(strict_dumps(turns_summaries))
                      if turns_summaries is not None else "null")
-            .replace("__COMMITMENTS_JSON__",
-                     _embed(json.dumps(board, ensure_ascii=False,
-                                       default=str)))
-            .replace("__META_JSON__",
-                     _embed(json.dumps(meta, ensure_ascii=False,
-                                       default=str))))
+            .replace("__COMMITMENTS_JSON__", _embed(strict_dumps(board)))
+            .replace("__META_JSON__", _embed(strict_dumps(meta))))
     (out / "index.html").write_text(html, encoding="utf-8")
     (out / "bundle_meta.json").write_text(
-        json.dumps(meta, indent=2, sort_keys=True, ensure_ascii=False,
-                   default=str) + "\n", encoding="utf-8")
+        strict_dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
     return {"bundle_dir": str(out), "meta": meta,
             "index_html": str(out / "index.html")}
 

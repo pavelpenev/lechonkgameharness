@@ -24,6 +24,7 @@ package-A surface (design-plan-freeciv-v1.1.md decision 4 + decision 8):
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -955,6 +956,41 @@ def test_action_batch_schema_hash_stable_and_derived():
     assert mc.action_batch_schema_hash() == expected
     assert mc.action_batch_schema_hash() == mc.action_batch_schema_hash()
     assert mc.action_batch_json_schema() == schema
+
+
+# ---------------------------------------------------------------------------
+# strict JSON emission in the schema hash (FW-19)
+# ---------------------------------------------------------------------------
+
+def test_action_batch_schema_hash_nan_raises(monkeypatch):
+    """The schema hash canonicalizes via strict_dumps: a NaN anywhere in
+    the payload raises ValueError deterministically — a bare NaN token
+    can never enter the hashed canonical form. (The lru_cache wrapper is
+    bypassed: earlier tests may already have warmed it; the schema dict
+    is deep-copied: mutating the cached dict would leak into later
+    tests.)"""
+    schema = copy.deepcopy(mc.action_batch_json_schema())
+    schema["properties"]["__probe__"] = float("nan")
+    monkeypatch.setattr(mc, "action_batch_json_schema", lambda: schema)
+    monkeypatch.setattr(mc, "action_batch_schema_hash",
+                        mc.action_batch_schema_hash.__wrapped__)
+    with pytest.raises(ValueError):
+        mc.action_batch_schema_hash()
+
+
+def test_action_batch_schema_hash_lone_surrogate_escaped(monkeypatch):
+    """A lone surrogate in the schema is escaped as \\udXXX in the
+    canonical form — the utf-8 encode inside the hash never sees a raw
+    surrogate, and the hash stays deterministic (deep copy: the cached
+    schema dict is shared across tests)."""
+    schema = copy.deepcopy(mc.action_batch_json_schema())
+    schema["description"] = "lone \ud800 surrogate"
+    monkeypatch.setattr(mc, "action_batch_json_schema", lambda: schema)
+    monkeypatch.setattr(mc, "action_batch_schema_hash",
+                        mc.action_batch_schema_hash.__wrapped__)
+    first = mc.action_batch_schema_hash()
+    assert first.startswith("sha256:")
+    assert mc.action_batch_schema_hash() == first
 
 
 def test_spike_decision_provisional_while_blocked():

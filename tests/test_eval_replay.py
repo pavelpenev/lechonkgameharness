@@ -338,3 +338,48 @@ def test_main_cli(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "[replay]" in captured.out
     assert "test-run" not in captured.out  # the CLI prints counts, not data
+
+
+# ---------------------------------------------------------------------------
+# strict JSON emission in the bundle renderer (FW-19)
+# ---------------------------------------------------------------------------
+
+def test_render_bundle_nan_in_turns_raises(tmp_path):
+    """The bundle writer emits via strict_dumps: a NaN in the recorded
+    turns (json.loads accepts the bare NaN token) raises ValueError
+    deterministically — invalid JSON is never embedded."""
+    transcript = _build_transcript(tmp_path)
+    turns = tmp_path / "turns.jsonl"
+    turns.write_text('{"turn": 1, "score": NaN}\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        replay.render_bundle(transcript, tmp_path / "out", turns_path=turns)
+
+
+def test_render_bundle_lone_surrogate_escaped_and_round_trips(tmp_path):
+    """A lone surrogate in the turns summaries is escaped as \\udXXX in
+    the embedded block — valid JSON that never reaches the utf-8
+    encoder, and json.loads round-trips it to the surrogate string."""
+    transcript = _build_transcript(tmp_path)
+    turns = tmp_path / "turns.jsonl"
+    turns.write_text('{"turn": 1, "note": "lone \\ud800 surrogate"}\n',
+                     encoding="utf-8")
+    out = tmp_path / "out"
+    replay.render_bundle(transcript, out, turns_path=turns)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    embedded = json.loads(_script_block(html, "lechonk-turns"))
+    assert embedded == [{"turn": 1, "note": "lone \ud800 surrogate"}]
+
+
+def test_render_bundle_clean_turns_round_trip(tmp_path):
+    """Clean input: the embedded turns block is byte-stable strict JSON
+    that json.loads round-trips to the source summaries."""
+    transcript = _build_transcript(tmp_path)
+    turns = tmp_path / "turns.jsonl"
+    summary = {"turn": 1, "score": 10, "gold": 5, "cities_own": 1,
+               "units_own": 2, "techs_researched": 0,
+               "research_target": "Alphabet"}
+    turns.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    out = tmp_path / "out"
+    replay.render_bundle(transcript, out, turns_path=turns)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert json.loads(_script_block(html, "lechonk-turns")) == [summary]

@@ -53,6 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from lechonk.core.jsonutil import strict_dumps
+
 # The pinned container (HANDOFF: docker run --name freeciv-web ...).
 DEFAULT_CONTAINER = "freeciv-web"
 # The webapp save directory inside the container (HANDOFF session
@@ -360,8 +362,7 @@ def append_export_log(dest_dir: str | Path, record: dict[str, Any]) -> str:
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / EXPORT_LOG_NAME
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True, ensure_ascii=False,
-                            default=str) + "\n")
+        fh.write(strict_dumps(record, sort_keys=True) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return str(path)

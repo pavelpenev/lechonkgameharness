@@ -352,3 +352,34 @@ def test_run_docker_failure_raises(monkeypatch):
         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "boom"))
     with pytest.raises(cp.CheckpointError, match="boom"):
         cp.run_docker(["ps"])
+
+
+# ---------------------------------------------------------------------------
+# strict JSON emission in the export log (FW-19)
+# ---------------------------------------------------------------------------
+
+def test_append_export_log_nan_raises(tmp_path):
+    """The export log is written via strict_dumps: a NaN in the record
+    raises ValueError deterministically — a bare NaN token never lands
+    in the log (json.loads on the next read would die on it)."""
+    with pytest.raises(ValueError):
+        cp.append_export_log(tmp_path, {"sha256": float("nan")})
+
+
+def test_append_export_log_lone_surrogate_escaped_and_round_trips(tmp_path):
+    """A lone surrogate in the record is escaped as \\udXXX in the log
+    line — valid JSON that never reaches the utf-8 encoder, and
+    json.loads round-trips it to the surrogate string."""
+    record = {"tool": "lechonk.eval.checkpoint",
+              "note": "lone \ud800 surrogate"}
+    path = Path(cp.append_export_log(tmp_path, record))
+    text = path.read_text(encoding="utf-8")
+    assert "\\ud800" in text
+    assert json.loads(text) == record
+
+
+def test_append_export_log_clean_record_round_trips(tmp_path):
+    record = {"tool": "lechonk.eval.checkpoint", "turn": 5,
+              "sha256": "sha256:" + "ab" * 32, "size_bytes": 120}
+    path = Path(cp.append_export_log(tmp_path, record))
+    assert json.loads(path.read_text(encoding="utf-8")) == record
