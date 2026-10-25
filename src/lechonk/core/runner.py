@@ -153,7 +153,7 @@ _ACTIVITY_FOR_VERB = {
 # Structured threat-entity IDs (the metric never parses free text, §3
 # line 41): non-conforming memory_update.threats entries are dropped at
 # emission.
-ENTITY_ID_RE = re.compile(r"^(unit|city|player):[0-9]+$")
+ENTITY_ID_RE = re.compile(r"^(unit|city|player):[0-9]+\Z")
 
 
 class RunState(str, Enum):
@@ -1570,19 +1570,47 @@ class GameRunner:
                          snapshot: Snapshot) -> list[ThreatMention]:
         """Structured threat hypotheses (entity IDs only — the metric never
         parses free text, §3 line 41); non-conforming entries are dropped
-        at emission. The tile is resolved from the snapshot when visible."""
+        at emission. A threat is an opponent/barbarian entity: mentions of
+        own entities or of self are dropped, as are unresolvable ids
+        (never counted). The tile is resolved from the snapshot when
+        visible."""
         mentions: list[ThreatMention] = []
         seen: set[str] = set()
+        self_id = snapshot.player.player_id
         for raw in threats:
             if not isinstance(raw, str) or not ENTITY_ID_RE.match(raw):
                 continue  # not a structured entity ID: dropped, not parsed
-            if raw in seen:
+            if raw in seen or not self._is_threat_entity(raw, snapshot,
+                                                          self_id):
                 continue
             seen.add(raw)
             mentions.append(ThreatMention(
                 entity_id=raw, turn=turn,
                 tile=self._entity_tile(raw, snapshot)))
         return mentions
+
+    def _is_threat_entity(self, entity_id: str, snapshot: Snapshot,
+                          self_id: int) -> bool:
+        """§3 line 41: only opponent/barbarian entities count as threats —
+        own entities and entities owned by self are dropped; ids that do
+        not resolve in the current snapshot are dropped, never counted.
+        Player ids resolve against self only."""
+        kind, _, raw_id = entity_id.partition(":")
+        try:
+            entity = int(raw_id)
+        except ValueError:
+            return False
+        if kind == "player":
+            return entity != self_id
+        if kind == "unit":
+            for unit in snapshot.units:
+                if unit.id == entity:
+                    return not unit.is_own and unit.owner_id != self_id
+        elif kind == "city":
+            for city in snapshot.cities:
+                if city.id == entity:
+                    return not city.is_own and city.owner_id != self_id
+        return False  # unresolvable id: dropped, never counted
 
     def _entity_tile(self, entity_id: str,
                      snapshot: Snapshot) -> Optional[tuple[int, int]]:

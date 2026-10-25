@@ -16,16 +16,22 @@ from pathlib import Path
 
 from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
+from lechonk.core.runner import ENTITY_ID_RE
 from lechonk.core.schemas import (
     ActionResultRecord,
     CandidatesRefRecord,
+    CityView,
     CommitmentRecord,
+    MapView,
     MetricEventRecord,
     ModelCallRecord,
     OutcomeRecord,
+    PlayerView,
     RunManifestRecord,
+    Snapshot,
     SnapshotRefRecord,
     TurnStartRecord,
+    UnitView,
 )
 
 from tests.lifecycle_fixtures import LifecycleSession
@@ -1222,3 +1228,73 @@ def test_runner_inconclusive_resend_readback_quarantines(tmp_path):
     assert "quarantined" in records[-1].reason
     assert result.turns_completed == 0
     assert session.closed
+
+
+# ---------------------------------------------------------------------------
+# threat mentions: opponent/barbarian conformance (B3, §3 line 41) and the
+# ENTITY_ID_RE end anchor (C5 runner-side piece)
+# ---------------------------------------------------------------------------
+
+
+def _threat_snapshot() -> Snapshot:
+    """Self is player 0; entities cover own, enemy-owned, owner-unknown
+    (fogged foreign), and unresolvable ids."""
+    return Snapshot(
+        turn=1,
+        player=PlayerView(player_id=0),
+        map_view=MapView(width=8, height=8),
+        units=[
+            UnitView(id=10, is_own=True, type_name="Settlers", x=1, y=1),
+            UnitView(id=20, is_own=False, owner_id=1,
+                     type_name="Warriors", x=2, y=2),
+            UnitView(id=30, is_own=False, owner_id=None,
+                     type_name="Warriors", x=3, y=3),
+        ],
+        cities=[
+            CityView(id=1, name="Rome", x=1, y=1, is_own=True),
+            CityView(id=2, name="Carthage", x=4, y=4, is_own=False,
+                     owner_id=1),
+        ],
+    )
+
+
+def _threat_runner(tmp_path):
+    return make_runner(tmp_path, client=FakeModelClient([]),
+                       session=FakeSession([turn_world(1)]))
+
+
+def test_threat_own_entity_mentions_not_counted(tmp_path):
+    runner = _threat_runner(tmp_path)
+    snap = _threat_snapshot()
+    mentions = runner._threat_mentions(["unit:10", "city:1"], 1, snap)
+    assert mentions == []
+
+
+def test_threat_self_player_mention_dropped(tmp_path):
+    runner = _threat_runner(tmp_path)
+    snap = _threat_snapshot()
+    assert runner._threat_mentions(["player:0"], 1, snap) == []
+
+
+def test_threat_unresolvable_id_dropped(tmp_path):
+    runner = _threat_runner(tmp_path)
+    snap = _threat_snapshot()
+    assert runner._threat_mentions(["unit:99", "city:99"], 1, snap) == []
+
+
+def test_threat_opponent_barbarian_mentions_counted(tmp_path):
+    runner = _threat_runner(tmp_path)
+    snap = _threat_snapshot()
+    mentions = runner._threat_mentions(
+        ["unit:20", "city:2", "player:1", "unit:30"], 1, snap)
+    assert [m.entity_id for m in mentions] == [
+        "unit:20", "city:2", "player:1", "unit:30"]
+    assert mentions[0].tile == (2, 2)
+    assert mentions[1].tile == (4, 4)
+    assert mentions[3].tile == (3, 3)
+
+
+def test_entity_id_re_rejects_trailing_newline():
+    assert ENTITY_ID_RE.match("unit:7\n") is None
+    assert ENTITY_ID_RE.match("city:8\n") is None
+    assert ENTITY_ID_RE.match("unit:7") is not None
