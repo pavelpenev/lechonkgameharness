@@ -24,7 +24,9 @@ Proven afterwards (§3 line 34):
   tail out of the FILE and the next append continues at last valid
   seq + 1 (seq continuity).
 
-Run standalone (persists evidence under artifacts/runs/wp3-kill/):
+Run standalone (persists evidence under a per-run unique subdirectory
+of artifacts/runs/wp3-kill/ — the recurring root is never rewritten,
+so prior evidence is never deleted or overwritten):
     .venv/bin/python scripts/wp3_kill_test.py
 The pytest suite drives the same scenario via run_kill_scenario()
 (tests/test_lifecycle_kill.py).
@@ -49,6 +51,14 @@ sys.path.insert(0, str(REPO))
 
 RUN = "wp3-kill"
 RUNDIR = REPO / "artifacts" / "runs" / RUN
+
+
+def _default_outdir() -> Path:
+    """A per-run unique subdirectory under the recurring wp3-kill root
+    (timestamp-pid): a manual rerun never rewrites prior evidence; the
+    recurring root itself stays frozen."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return RUNDIR / f"{stamp}-{os.getpid()}"
 
 # 8 MiB records: each write takes long enough (~10-30 ms of progressive
 # growth) for the parent's size polling to catch it mid-stride, while
@@ -358,12 +368,15 @@ def main() -> int:
     parser.add_argument("path", nargs="?", default=None)
     parser.add_argument("count", nargs="?", type=int, default=None)
     parser.add_argument("payload_bytes", nargs="?", type=int, default=None)
-    parser.add_argument("--outdir", default=str(RUNDIR))
+    parser.add_argument("--outdir", default=None,
+                        help="evidence directory (default: a per-run "
+                             "unique subdir of artifacts/runs/wp3-kill/)")
     args = parser.parse_args()
     if args.child:
         return child_main(args.path, args.count or RECORDS,
                           args.payload_bytes or PAYLOAD_BYTES)
-    evidence = run_kill_scenario(args.outdir)
+    outdir = args.outdir if args.outdir is not None else _default_outdir()
+    evidence = run_kill_scenario(outdir)
     return 0 if evidence["verdict"] == "PASS" else 1
 
 

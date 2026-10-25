@@ -6,8 +6,8 @@ injections.
 P11: "timeout/disconnect/mid-mutation/teardown-kill injection → no
 duplicate mutation, no takeover, bounded FAILED, transcript intact".
 
-For every audited transcript (artifacts/runs/wp3-kill/transcript.jsonl,
-artifacts/runs/wp3-teardown/case-*/transcript.jsonl,
+For every audited transcript (the latest kill-test transcript under
+artifacts/runs/wp3-kill/, artifacts/runs/wp3-teardown/case-*/transcript.jsonl,
 artifacts/runs/wp3-disconnect/transcript.jsonl, plus the WP2 fault run
 as a control when present):
 
@@ -32,13 +32,22 @@ as a control when present):
 
 Usage:
     .venv/bin/python scripts/wp3_p11_audit.py
+    .venv/bin/python scripts/wp3_p11_audit.py --kill-transcript PATH
 
 Artifacts: artifacts/runs/wp3-p11/p11_audit.json + p11_audit.md.
 The audit logic is unit-tested offline (tests/test_lifecycle_p11.py).
+
+Note: the pytest suite no longer refreshes wp3-kill evidence (the kill
+test writes a per-run unique tmp_path directory; the standalone kill
+test writes a per-run unique subdir of artifacts/runs/wp3-kill/) — the
+P11 audit of kill evidence is a standalone-CLI activity, and this
+script resolves the LATEST kill-test run subdirectory by default
+(--kill-transcript pins one specific run).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -52,8 +61,16 @@ RUNDIR = REPO / "artifacts" / "runs" / RUN
 
 # The transcripts under audit (run dir -> transcript name). The WP2
 # fault run is included as a control when present.
+#
+# The wp3-kill entry is the KILL_LATEST sentinel (None): the latest
+# kill-test transcript is resolved at audit time (see
+# _latest_kill_transcript). The suite no longer refreshes wp3-kill
+# evidence — auditing kill evidence is a standalone-CLI activity, and
+# every run (suite or standalone) writes a per-run unique subdirectory,
+# so there is no fixed transcript path to hard-code. Pass
+# --kill-transcript to audit one specific run instead of the latest.
 AUDIT_RUNS = [
-    ("wp3-kill", "artifacts/runs/wp3-kill/transcript.jsonl"),
+    ("wp3-kill", None),
     ("wp3-teardown/case-teardown-stop",
      "artifacts/runs/wp3-teardown/case-teardown-stop/transcript.jsonl"),
     ("wp3-teardown/case-finish-kill",
@@ -64,6 +81,25 @@ AUDIT_RUNS = [
 ]
 
 WALL_BOUND_S = 240.0
+
+# Sentinel for AUDIT_RUNS: resolve the latest kill-test transcript at
+# audit time (the wp3-kill evidence root is frozen — the suite no longer
+# refreshes it, and every run writes its own subdirectory).
+KILL_LATEST = None
+
+
+def latest_kill_transcript(kill_root: Path) -> Path | None:
+    """The most recently modified kill-test transcript under kill_root:
+    the frozen root's own transcript.jsonl (pre-isolation legacy
+    evidence) competes with every per-run subdir's transcript.jsonl;
+    the newest mtime wins. None when nothing exists."""
+    candidates = [kill_root / "transcript.jsonl"]
+    if kill_root.is_dir():
+        candidates.extend(sorted(kill_root.glob("*-*/transcript.jsonl")))
+    present = [p for p in candidates if p.is_file()]
+    if not present:
+        return None
+    return max(present, key=lambda p: p.stat().st_mtime)
 
 
 def audit_transcript(path) -> dict:
@@ -274,6 +310,12 @@ def audit_run(run_dir: Path) -> dict:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--kill-transcript", default=None,
+                        help="explicit wp3-kill transcript path (default: "
+                             "the latest kill-test transcript under "
+                             "artifacts/runs/wp3-kill/)")
+    args = parser.parse_args()
     RUNDIR.mkdir(parents=True, exist_ok=True)
     log_path = RUNDIR / "audit_stdout.log"
     log_fh = open(log_path, "w", encoding="utf-8")
@@ -286,7 +328,21 @@ def main() -> int:
     results = {}
     all_ok = True
     for name, rel in AUDIT_RUNS:
-        transcript = REPO / rel
+        if rel is KILL_LATEST:
+            if args.kill_transcript is not None:
+                transcript = Path(args.kill_transcript)
+            else:
+                transcript = latest_kill_transcript(
+                    REPO / "artifacts" / "runs" / "wp3-kill")
+            if transcript is None:
+                log("  MISSING: no kill-test transcript under "
+                    "artifacts/runs/wp3-kill/ — skipped (not produced "
+                    "this session)")
+                results[name] = {"missing": True}
+                continue
+            rel = transcript.relative_to(REPO).as_posix()
+        else:
+            transcript = REPO / rel
         run_dir = transcript.parent
         log(f"=== auditing {name}: {rel}")
         if not transcript.exists():

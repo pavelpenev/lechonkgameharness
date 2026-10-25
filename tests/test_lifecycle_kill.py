@@ -10,8 +10,11 @@ parent SIGKILLs the child the moment the file size is mid-stride (a
 record write in progress). The test asserts the full §3 line 34
 contract: every complete record survives and checksum-verifies, the
 trailing partial record is discarded on reload, and the ledger resumes
-cleanly (seq continuity). Evidence is persisted under
-artifacts/runs/wp3-kill/.
+cleanly (seq continuity). Evidence is persisted under a per-run unique
+tmp_path directory: the suite never writes to (and never refreshes) the
+recurring artifacts/runs/wp3-kill/ evidence root — refreshing that
+evidence is a standalone-CLI activity only (scripts/wp3_kill_test.py,
+which also writes a per-run unique subdirectory).
 """
 
 from __future__ import annotations
@@ -27,9 +30,9 @@ wp3_kill_test = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wp3_kill_test)
 
 
-def test_sigkill_mid_write_survival_and_torn_tail_discard():
+def test_sigkill_mid_write_survival_and_torn_tail_discard(tmp_path):
     """The mid-write SIGKILL scenario end to end (see module docstring)."""
-    outdir = REPO / "artifacts" / "runs" / "wp3-kill"
+    outdir = tmp_path / "wp3-kill"
     evidence = wp3_kill_test.run_kill_scenario(outdir)
 
     checks = evidence["checks"]
