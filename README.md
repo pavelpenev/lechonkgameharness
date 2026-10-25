@@ -513,6 +513,22 @@ evaluation recorded none (no TRUNCATED arms, no strategic terminals).
    cut ladder (plan §4 line 58) was **never invoked**: the run's `--pairs/--horizon`
    parameters reached the ladder shapes directly.
 
+## Known seams
+
+Agreed simplifications in the current implementation, documented rather than hidden:
+
+- **Elided units and the candidate table.** The candidate table is the legal-action
+  surface: every unit visible in the snapshot is offered, including units the
+  observation budget would otherwise elide from summaries. Elision disclosure applies
+  to the snapshot's unit list (`omitted.elided_unit_ids`), not to the candidate
+  enumeration itself.
+- **Turn identity is positional.** A turn is identified by its index within the run
+  (`<run_id>/t<turn>`), not by a game-side turn number; re-mapping to in-game turn
+  counters is left to the consumer.
+- **Requests timeout guard is process-global.** The adapter's outbound HTTP timeout
+  wrapping is applied process-wide and intentionally never restored (one harness
+  environment per process; see the rationale in `src/lechonk/adapter/session.py`).
+
 ## Video and development story
 
 - **Video:** [`artifacts/submission/video.mp4`](artifacts/submission/video.mp4) — 99.1 s,
