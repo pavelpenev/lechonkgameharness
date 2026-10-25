@@ -45,21 +45,19 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from lechonk.adapter.obs_extract import DIR8_DELTAS
+from lechonk.core.activities import (
+    ACTIVITY_IDLE,
+    ACTIVITY_IRRIGATE,
+    ACTIVITY_MINE,
+    ACTIVITY_SENTRY,
+    ACTIVITY_FORTIFIED,
+    ACTIVITY_FORTIFYING,
+    ACTIVITY_GEN_ROAD,
+)
 from lechonk.core.schemas import Candidate, is_candidate_id
 
-# Upstream activity ids (version/v14.py:50-65) for activity read-backs.
-ACTIVITY_IDLE = 0
-ACTIVITY_MINE = 2
-ACTIVITY_IRRIGATE = 3
-ACTIVITY_FORTIFIED = 4
-ACTIVITY_SENTRY = 5
-ACTIVITY_GEN_ROAD = 13
-# freeciv's in-turn fortify state: a unit ordered to fortify shows
-# ACTIVITY_FORTIFYING within the same turn and completes to
-# ACTIVITY_FORTIFIED at the next turn start (live evidence: the WP2 model
-# run — units fortified with partial moves left show 10 in the
-# post-observation).
-ACTIVITY_FORTIFYING = 10
+# Upstream activity ids (version/v14.py:50-65) are the canonical constants in
+# lechonk.core.activities, imported above.
 
 # The documented no-op action (civ_controller.py:385-386).
 PASS_ACTION = "pass"

@@ -87,6 +87,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from lechonk.core.activities import ACTIVITY_NAMES
 from lechonk.comparator import defaults as defaults_mod
 from lechonk.core.ledger import TranscriptLedger
 from lechonk.core.memory import StrategyMemory
@@ -1689,10 +1690,6 @@ def _actor_of_ref(ref: str) -> Optional[str]:
 def _activity_name(activity_id: Any) -> Optional[str]:
     """The snapshot's activity name for a raw activity id (obs_extract
     ACTIVITY_NAMES)."""
-    names = {0: "idle", 1: "cultivate", 2: "mine", 3: "irrigate",
-             4: "fortified", 5: "sentry", 6: "pillage", 7: "goto",
-             8: "explore", 9: "transform", 10: "fortifying", 11: "clean",
-             12: "base", 13: "road", 14: "convert", 15: "plant"}
     if isinstance(activity_id, bool) or not isinstance(activity_id, int):
         return None
-    return names.get(activity_id)
+    return ACTIVITY_NAMES.get(activity_id)

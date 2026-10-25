@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Optional
 
+from lechonk.core.activities import ACTIVITY_NAMES
 from lechonk.core.schemas import (
     SNAPSHOT_TOKEN_BUDGET,
     AttackCandidate,
@@ -68,13 +69,6 @@ DIR8_NAMES: tuple[str, ...] = ("NW", "N", "NE", "W", "E", "SW", "S", "SE")
 DIR8_DELTAS: tuple[tuple[int, int], ...] = (
     (-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1))
 DIR8_INDEX = {name: i for i, name in enumerate(DIR8_NAMES)}
-# version/v14.py:50-65
-ACTIVITY_NAMES = {
-    0: "idle", 1: "cultivate", 2: "mine", 3: "irrigate", 4: "fortified",
-    5: "sentry", 6: "pillage", 7: "goto", 8: "explore", 9: "transform",
-    10: "fortifying", 11: "clean", 12: "base", 13: "road", 14: "convert",
-    15: "plant",
-}
 SSA_NONE = 0
 # version/v14.py:472-478
 VUT_NONE = 0
