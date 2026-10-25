@@ -56,7 +56,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 from pydantic import ValidationError
