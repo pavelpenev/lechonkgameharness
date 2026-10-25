@@ -54,6 +54,8 @@ from lechonk.model.prompts import PromptBudgetExceeded
 
 from tests.lifecycle_fixtures import LifecycleSession
 from tests.fog_fixtures import (
+    ENEMY,
+    MY_PLAYER,
     NUM_IMPROVEMENTS,
     SETTLERS,
     VUT_UTYPE,
@@ -2256,3 +2258,412 @@ def test_runner_game_ending_resend_marks_game_over(tmp_path):
     assert result.terminated and not result.truncated
     assert result.readback.status == "verified"
     assert runner._game_over == (True, False)
+
+
+# ---------------------------------------------------------------------------
+# W3-11 (D11): record-authoritative defeat precedence at EVERY boundary
+# ---------------------------------------------------------------------------
+
+
+def _d11_player_alive(obs):
+    obs["player"][MY_PLAYER]["is_alive"] = True
+
+
+def _d11_player_dead(obs):
+    obs["player"][MY_PLAYER]["is_alive"] = False
+
+
+def _d11_player_missing(obs):
+    # The player domain carries no entry for my player at all.
+    obs["player"] = {ENEMY: obs["player"][ENEMY]}
+
+
+def _d11_player_malformed(obs):
+    # A malformed my-player entry: no well-formed is_alive record AND a
+    # non-numeric researching id — _extract_player's int(researching_id)
+    # raises mid-parsing, so full snapshot construction cannot complete.
+    obs["player"][MY_PLAYER] = {"player_id": MY_PLAYER, "name": "Caesar",
+                                "researching": "not-a-tech-id"}
+
+
+def _d11_player_malformed_alive(obs):
+    # A well-formed ALIVE record plus a malformed field: the record wins
+    # the classification even though snapshot construction raises.
+    obs["player"][MY_PLAYER] = {"player_id": MY_PLAYER, "name": "Caesar",
+                                "is_alive": True,
+                                "researching": "not-a-tech-id"}
+
+
+def _d11_player_string_key(obs, *, alive):
+    # The player domain keyed by the SERIALIZED-STRING player id (a JSON
+    # round-trip), as int-keyed observations do not always survive.
+    me = obs["player"].pop(MY_PLAYER)
+    me["is_alive"] = alive
+    obs["player"][str(MY_PLAYER)] = me
+
+
+_D11_CASES = [
+    pytest.param(_d11_player_alive, True, "VICTORY",
+                 id="alive-record_flag-true_record-wins"),
+    pytest.param(_d11_player_dead, False, "DEFEATED",
+                 id="dead-record_flag-false"),
+    pytest.param(_d11_player_dead, True, "DEFEATED",
+                 id="dead-record_flag-true"),
+    pytest.param(_d11_player_missing, True, "DEFEATED",
+                 id="missing-record_flag-true_positive-fallback"),
+    pytest.param(_d11_player_missing, False, "TRUNCATED",
+                 id="missing-record_flag-false_never-victory"),
+    pytest.param(_d11_player_missing, None, "TRUNCATED",
+                 id="missing-record_flag-none_never-victory"),
+    pytest.param(_d11_player_malformed, True, "DEFEATED",
+                 id="malformed-entry_flag-true_graceful"),
+    pytest.param(_d11_player_malformed, False, "TRUNCATED",
+                 id="malformed-entry_flag-false_graceful"),
+    pytest.param(_d11_player_malformed_alive, True, "VICTORY",
+                 id="malformed-entry_alive-record_flag-true_record-wins"),
+    pytest.param(lambda obs: _d11_player_string_key(obs, alive=False),
+                 False, "DEFEATED", id="string-key_dead-record"),
+    pytest.param(lambda obs: _d11_player_string_key(obs, alive=True),
+                 True, "VICTORY",
+                 id="string-key_alive-record_flag-true_record-wins"),
+]
+
+
+class _D11TurnStartSession(FakeSession):
+    """The session cache at the ACTING boundary holds the game-over
+    state with the case's TERMINAL observation (non-empty, possibly
+    malformed): the turn-start classification must be
+    record-authoritative (D11) and a malformed player entry must never
+    raise into the generic infra handler."""
+
+    def __init__(self, worlds, *, player_mutator, env_defeated):
+        super().__init__(worlds)
+        terminal_obs = copy.deepcopy(worlds[0][0])
+        player_mutator(terminal_obs)
+        self._terminal_obs = terminal_obs
+        self._env_defeated = env_defeated
+
+    @property
+    def obs(self):
+        return self._terminal_obs
+
+    @property
+    def terminated(self):
+        return True
+
+    @property
+    def truncated(self):
+        return False
+
+    @property
+    def my_player_is_defeated(self):
+        return self._env_defeated
+
+
+class _D11MidBatchSession(FakeSession):
+    """The named mutation ends the game mid-batch: its step returns the
+    case's terminal observation with terminated=True and the session
+    caches the env's defeat flag — the mid-batch classification must be
+    record-authoritative (D11)."""
+
+    def __init__(self, worlds, *, player_mutator, env_defeated):
+        super().__init__(worlds)
+        self._mutator = player_mutator
+        self._env_defeated = env_defeated
+        self._terminated = False
+        self._terminal_obs = None
+
+    @property
+    def obs(self):
+        if self._terminal_obs is not None:
+            return self._terminal_obs
+        return super().obs
+
+    @property
+    def terminated(self):
+        return self._terminated
+
+    @property
+    def truncated(self):
+        return False
+
+    @property
+    def my_player_is_defeated(self):
+        return self._env_defeated if self._terminated else None
+
+    def step(self, action, *, deadline=None):
+        outcome = super().step(action, deadline=deadline)
+        if action is not None and tuple(action) == GOTO_ACTION:
+            terminal_obs = copy.deepcopy(outcome.observation)
+            self._mutator(terminal_obs)
+            self._terminal_obs = terminal_obs
+            self._terminated = True
+            outcome = replace(outcome, observation=terminal_obs,
+                              terminated=True, truncated=False)
+        return outcome
+
+
+class _D11ContinuationSession(FakeSession):
+    """The standing-order continuation ends the game: the SECOND send of
+    the sentry action (the turn-1 model order is the first) returns the
+    case's terminal observation with terminated=True; the session caches
+    the env's defeat flag."""
+
+    def __init__(self, worlds, *, player_mutator, env_defeated):
+        super().__init__(worlds)
+        self._mutator = player_mutator
+        self._env_defeated = env_defeated
+        self._terminated = False
+        self._terminal_obs = None
+        self._sentry_sends = 0
+
+    @property
+    def obs(self):
+        if self._terminal_obs is not None:
+            return self._terminal_obs
+        return super().obs
+
+    @property
+    def terminated(self):
+        return self._terminated
+
+    @property
+    def truncated(self):
+        return False
+
+    @property
+    def my_player_is_defeated(self):
+        return self._env_defeated if self._terminated else None
+
+    def step(self, action, *, deadline=None):
+        if action is not None and tuple(action) == ("unit", 10, "sentry"):
+            self._sentry_sends += 1
+            if self._sentry_sends >= 2:
+                outcome = super().step(action, deadline=deadline)
+                terminal_obs = copy.deepcopy(outcome.observation)
+                self._mutator(terminal_obs)
+                self._terminal_obs = terminal_obs
+                self._terminated = True
+                return replace(outcome, observation=terminal_obs,
+                               terminated=True, truncated=False)
+        return super().step(action, deadline=deadline)
+
+
+class _D11ResendSession(LifecycleSession):
+    """The verified resubmission ends the game: the first goto send
+    disconnects with the effect NOT applied (reconciliation proves
+    non-execution, permitting the one resend); the resend's step returns
+    the case's terminal observation with terminated=True."""
+
+    def __init__(self, worlds, *, player_mutator, env_defeated):
+        super().__init__(worlds, disconnect_on=GOTO_ACTION,
+                         effect_applied=False)
+        self._mutator = player_mutator
+        self._env_defeated = env_defeated
+        self._terminated = False
+        self._goto_sends = 0
+
+    @property
+    def my_player_is_defeated(self):
+        return self._env_defeated if self._terminated else None
+
+    def step(self, action, *, deadline=None):
+        if action == GOTO_ACTION:
+            self._goto_sends += 1
+            if self._goto_sends >= 2:
+                # The resend: the game ends with the terminal observation.
+                outcome = super().step(action, deadline=deadline)
+                terminal_obs = copy.deepcopy(outcome.observation)
+                self._mutator(terminal_obs)
+                self._advance_cache(terminal_obs, outcome.info)
+                self._terminated = True
+                return replace(outcome, observation=terminal_obs,
+                               terminated=True, truncated=False)
+        return super().step(action, deadline=deadline)
+
+
+class _D11FinishSession(FakeSession):
+    """The finish step ends the game with the case's terminal observation
+    (non-empty here, unlike the real env's empty game-over observation);
+    the session caches the env's defeat flag — the phase-boundary
+    classification must be record-authoritative (D11)."""
+
+    def __init__(self, worlds, *, player_mutator, env_defeated):
+        super().__init__(worlds)
+        self._mutator = player_mutator
+        self._env_defeated = env_defeated
+        self._terminated = False
+
+    @property
+    def my_player_is_defeated(self):
+        return self._env_defeated if self._terminated else None
+
+    def step(self, action, *, deadline=None):
+        outcome = super().step(action, deadline=deadline)
+        if action is None and outcome.terminated:
+            terminal_obs = copy.deepcopy(outcome.observation)
+            self._mutator(terminal_obs)
+            self._terminated = True
+            outcome = replace(outcome, observation=terminal_obs)
+        return outcome
+
+
+@pytest.mark.parametrize("boundary", [
+    "turn_start", "mid_batch", "standing_continuation", "verified_resend",
+    "finish",
+])
+@pytest.mark.parametrize("player_mutator,env_defeated,expected", _D11_CASES)
+def test_runner_d11_record_authoritative_at_every_boundary(
+        tmp_path, boundary, player_mutator, env_defeated, expected):
+    """W3-11 (D11): at EVERY game-over boundary (turn-start, an ordinary
+    mid-batch mutation, a standing-order continuation, a verified resend,
+    the finish phase) the defeat verdict is record-authoritative — a
+    well-formed player record decides (an alive record OVERRIDES a
+    positive env defeat flag; a dead record is DEFEATED), the env flag is
+    a positive-only fallback when the record is missing or malformed,
+    and an unknown status is TRUNCATED — never a false VICTORY. A
+    malformed player entry in a terminal observation never raises into
+    the generic infra handler, and serialized-string player IDs are
+    honored."""
+    if boundary == "turn_start":
+        session = _D11TurnStartSession(
+            [turn_world(1)], player_mutator=player_mutator,
+            env_defeated=env_defeated)
+        client = FakeModelClient([])
+        max_turns = 1
+    elif boundary == "mid_batch":
+        session = _D11MidBatchSession(
+            [turn_world(1)], player_mutator=player_mutator,
+            env_defeated=env_defeated)
+        client = FakeModelClient([
+            ok_response([GOTO_REF], turn_id="t1", with_memory=False)])
+        max_turns = 1
+    elif boundary == "standing_continuation":
+        worlds = [
+            turn_world(1),
+            turn_world(2, unit_overrides=[(10, {"activity": 0}),
+                                          (11, {"activity": 0})]),
+            turn_world(3),
+        ]
+        session = _D11ContinuationSession(
+            worlds, player_mutator=player_mutator, env_defeated=env_defeated)
+        client = FakeModelClient([
+            ok_response(["unit:10:sentry", "unit:11:sentry"],
+                        turn_id="t1", with_memory=False),
+            ok_response([], turn_id="t2", with_memory=False),
+        ])
+        max_turns = 2
+    elif boundary == "verified_resend":
+        session = _D11ResendSession(
+            [turn_world(1)], player_mutator=player_mutator,
+            env_defeated=env_defeated)
+        client = FakeModelClient([
+            ok_response([GOTO_REF], turn_id="t1", with_memory=False)])
+        max_turns = 2
+    else:  # finish
+        session = _D11FinishSession(
+            [turn_world(1)], player_mutator=player_mutator,
+            env_defeated=env_defeated)
+        client = FakeModelClient([
+            ok_response([GOTO_REF], turn_id="t1", with_memory=False)])
+        max_turns = 5
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=max_turns)
+    result = runner.run()
+    assert result.outcome == expected
+    # The classification is graceful at every boundary: never the generic
+    # infrastructure handler, never a false VICTORY.
+    assert "infrastructure failure" not in result.reason
+    if expected == "VICTORY":
+        assert "defeated=False" in result.reason
+    elif expected == "DEFEATED":
+        assert ("my player is defeated" in result.reason
+                or "defeated=True" in result.reason)
+    else:
+        assert "unknown defeat status" in result.reason
+    records = _records(runner.ledger.path)
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == expected
+
+
+def test_d11_my_player_defeated_never_raises_on_malformed_obs(tmp_path):
+    """W3-11 hardening: _my_player_defeated never raises on a malformed
+    observation or player mapping — a malformed record counts as a
+    missing record (the positive-only env fallback)."""
+    session = FakeSession([turn_world(1)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    runner._session = session  # direct-call tests: run() never ran
+    # A non-mapping observation.
+    assert runner._my_player_defeated(None) is None
+    assert runner._my_player_defeated([1, 2, 3]) is None
+    assert runner._my_player_defeated("observation") is None
+    # A player domain that is not a mapping.
+    assert runner._my_player_defeated({"player": [1, 2]}) is None
+    assert runner._my_player_defeated({"player": "players"}) is None
+    # My entry not a mapping / is_alive not a bool.
+    assert runner._my_player_defeated({"player": {MY_PLAYER: [1, 2]}}) is None
+    assert runner._my_player_defeated(
+        {"player": {MY_PLAYER: {"is_alive": "yes"}}}) is None
+    # A well-formed record is still authoritative over the env flag.
+    alive = {"player": {MY_PLAYER: {"is_alive": True}}}
+    session.my_player_is_defeated = True
+    assert runner._my_player_defeated(alive) is False
+    session.my_player_is_defeated = False
+    assert runner._my_player_defeated(alive) is False
+    # The positive-only env fallback on a missing record.
+    assert runner._my_player_defeated({}) is None
+    session.my_player_is_defeated = True
+    assert runner._my_player_defeated({}) is True
+    session.my_player_is_defeated = None
+    assert runner._my_player_defeated({}) is None
+
+
+def test_d11_my_player_defeated_string_player_ids(tmp_path):
+    """W3-11: serialized-string player IDs are honored — the my-player
+    entry is found whether the observation keys the player domain by
+    integer or by string (a JSON round-trip)."""
+    session = FakeSession([turn_world(1)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    runner._session = session  # direct-call tests: run() never ran
+    dead = {"player": {str(MY_PLAYER): {"is_alive": False},
+                       str(ENEMY): {"is_alive": True}}}
+    assert runner._my_player_defeated(dead) is True
+    alive = {"player": {str(MY_PLAYER): {"is_alive": True}}}
+    session.my_player_is_defeated = True  # the record overrides the flag
+    assert runner._my_player_defeated(alive) is False
+    # Mixed key types in one domain.
+    mixed = {"player": {str(MY_PLAYER): {"is_alive": False}, ENEMY: {}}}
+    assert runner._my_player_defeated(mixed) is True
+
+
+def test_d11_game_over_outcome_live_record_overrides_defeat_flag(tmp_path):
+    """W3-11: the terminated_defeated branch re-checks the player
+    record — a well-formed ALIVE record OVERRIDES the env's defeat flag
+    that produced the extraction verdict (fall through to the game-over
+    path), and the flag is honored only when the record is missing."""
+    obs, info = turn_world(1)  # my player record: is_alive=True
+    session = FakeSession([(obs, info)])
+    session.my_player_is_defeated = True
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    runner._session = session  # direct-call tests: run() never ran
+    adapter = runner._load_adapter()
+    outcomes = adapter.obs_extract.ExtractOutcome
+    # The flag-sourced verdict (terminated_defeated) with an alive record.
+    outcome, reason, snap = runner._game_over_outcome(
+        outcomes.TERMINATED_DEFEATED,
+        "terminated=True with my_player_is_defeated=True")
+    assert outcome == "VICTORY"
+    assert "defeated=False" in reason
+    assert snap is None
+    # The same verdict with a missing record: the positive flag decides.
+    runner._session = _D11TurnStartSession(
+        [turn_world(1)], player_mutator=_d11_player_missing,
+        env_defeated=True)
+    outcome, reason, _snap = runner._game_over_outcome(
+        outcomes.TERMINATED_DEFEATED,
+        "terminated=True with my_player_is_defeated=True")
+    assert outcome == "DEFEATED"
+    assert reason == "my player is defeated"

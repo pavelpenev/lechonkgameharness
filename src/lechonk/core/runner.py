@@ -575,16 +575,43 @@ class GameRunner:
         # --- snapshot + candidate table (the policy-facing surface) -----
         # The env's game-over flags ride the session cache: an empty
         # game-over observation is classified by them (DEFEATED /
-        # VICTORY / TRUNCATED), never by the dict alone.
-        terminated, truncated, defeated = self._session_game_over_flags()
-        extraction = adapter.obs_extract.extract_snapshot(
-            self._session.obs, self._session.info,
-            terminated=terminated, truncated=truncated,
-            my_player_is_defeated=defeated,
-            my_player_id=self._session.player_id,
-            ruleset=self._session.ruleset,
-            action_probs=self._session.action_probs,
-        )
+        # VICTORY / TRUNCATED), never by the dict alone. D11: the defeat
+        # verdict is RECORD-AUTHORITATIVE — the player record in the
+        # observation decides; the env's defeat flag is only the
+        # positive-only fallback inside _my_player_defeated, and an
+        # unknown status is passed as False so extraction classifies
+        # terminated_game_over and _game_over_outcome re-derives
+        # (TRUNCATED — never a false VICTORY).
+        terminated, truncated, _env_defeated = self._session_game_over_flags()
+        defeated = self._my_player_defeated(self._session.obs)
+        try:
+            extraction = adapter.obs_extract.extract_snapshot(
+                self._session.obs, self._session.info,
+                terminated=terminated, truncated=truncated,
+                my_player_is_defeated=bool(defeated),
+                my_player_id=self._session.player_id,
+                ruleset=self._session.ruleset,
+                action_probs=self._session.action_probs,
+            )
+        except Exception:
+            if not (terminated or truncated):
+                # A non-terminal parse failure is a genuine
+                # infrastructure failure — the generic handler.
+                raise
+            # D11 hardening (terminal-before-snapshot): a malformed
+            # terminal observation must not raise into the generic
+            # infra handler before the record-authoritative fallback
+            # applies — classify the terminal flags/records directly.
+            outcomes = adapter.obs_extract.ExtractOutcome
+            if truncated and not terminated:
+                outcome = outcomes.TRUNCATED_INFRA
+            elif defeated:
+                outcome = outcomes.TERMINATED_DEFEATED
+            else:
+                outcome = outcomes.TERMINATED_GAME_OVER
+            return self._game_over_outcome(
+                outcome, "malformed terminal observation: classified from "
+                         "the env's game-over flags and the player record")
         if extraction.outcome != adapter.obs_extract.ExtractOutcome.OK:
             return self._game_over_outcome(extraction.outcome, extraction.reason)
         snapshot = extraction.snapshot
@@ -784,45 +811,76 @@ class GameRunner:
     def _game_over_outcome(self, outcome: Any, reason: str
                            ) -> tuple[Optional[str], str, Optional[Snapshot]]:
         """Map the extraction outcome (classified by the env's game-over
-        flags) to the run outcome. The VICTORY branch is evidence-gated:
-        ``terminated_game_over`` means the env's defeat flag said
-        not-defeated, but a False flag is not positive proof of survival
-        (the vendor method returns False both when the player is
-        provably alive AND when the player record is missing —
+        flags) to the run outcome. D11: the defeat verdict is
+        RECORD-AUTHORITATIVE at every boundary — both terminated
+        branches re-check the player record, so a well-formed alive
+        record OVERRIDES the env's defeat flag (never a false DEFEATED)
+        and the flag alone proves defeat only when the record is missing
+        or malformed (the positive-only env fallback). The VICTORY branch
+        stays evidence-gated: ``terminated_game_over`` means the env's
+        defeat flag said not-defeated, but a False flag is not positive
+        proof of survival (the vendor method returns False both when the
+        player is provably alive AND when the player record is missing —
         civ_controller.py:303-330), so the defeat status must be provable
         or the run reports TRUNCATED — never a false VICTORY."""
         value = getattr(outcome, "value", outcome)
         self._transition(RunState.GAME_OVER)
-        if value == "terminated_defeated":
-            # terminated=True with the env's defeat flag True: positive
-            # evidence of defeat.
-            return ("DEFEATED", "my player is defeated", None)
-        if value == "truncated_infra":
-            return ("TRUNCATED", reason or "infrastructure truncation", None)
-        if value == "terminated_game_over":
+        if value in ("terminated_defeated", "terminated_game_over"):
+            # terminated=True: the player record decides (D11) — the
+            # flag-sourced extraction verdict can never defeat a
+            # well-formed alive record.
             defeated = self._my_player_defeated(self._session.obs)
             if defeated is None:
                 return ("TRUNCATED",
                         "game over with unknown defeat status (no "
                         "well-formed player record, no positive env "
                         "defeat signal) — never a false VICTORY", None)
-            return ("DEFEATED" if defeated else "VICTORY",
-                    f"game over (defeated={defeated})", None)
+            if defeated:
+                return ("DEFEATED", "my player is defeated", None)
+            return ("VICTORY", f"game over (defeated={defeated})", None)
+        if value == "truncated_infra":
+            return ("TRUNCATED", reason or "infrastructure truncation", None)
         return ("TRUNCATED", reason or "unknown extraction outcome", None)
 
     def _my_player_defeated(self, obs: Any) -> Optional[bool]:
         """The defeat status at a game-over boundary: True/False when
         provable, None when unknown (never a false VICTORY).
 
-        A well-formed player record (is_alive a bool) is authoritative.
-        When the record is missing or malformed, the env's defeat flag
-        decides — but only positively: the vendor method returns False
-        both when the player is provably alive and when the record is
-        missing (civ_controller.py:303-330), so anything but a True flag
-        leaves the status unknown."""
-        players = (obs or {}).get("player") or {}
+        A well-formed player record (is_alive a bool) is authoritative
+        (D11) — it OVERRIDES the env's defeat flag. When the record is
+        missing or malformed, the env's defeat flag decides — but only
+        positively: the vendor method returns False both when the
+        player is provably alive and when the record is missing
+        (civ_controller.py:303-330), so anything but a True flag leaves
+        the status unknown.
+
+        Hardened (D11): never raises on a malformed observation or
+        player mapping — a malformed record counts as a missing record
+        (the positive-only env fallback) — and the my-player entry is
+        found whether the observation keys the player domain by integer
+        or by serialized string."""
+        players = obs.get("player") if isinstance(obs, Mapping) else None
+        if not isinstance(players, dict):
+            players = {}
         pid = self._session.player_id
         me = players.get(pid)
+        if me is None and pid is not None:
+            me = players.get(str(pid))
+        if me is None and pid is not None:
+            # Serialized-string player IDs (a JSON round-trip keys the
+            # player domain by string): match by normalized integer.
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                pid_int = None
+            if pid_int is not None:
+                for key, entry in players.items():
+                    try:
+                        if int(key) == pid_int:
+                            me = entry
+                            break
+                    except (TypeError, ValueError):
+                        continue
         if isinstance(me, dict) and isinstance(me.get("is_alive"), bool):
             return me["is_alive"] is False
         flag = getattr(self._session, "my_player_is_defeated", None)
