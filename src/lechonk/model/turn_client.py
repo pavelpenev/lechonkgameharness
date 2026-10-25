@@ -44,6 +44,7 @@ from lechonk.core.model_client import (
     RepairPrompt,
     TurnPrompt,
 )
+from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.schemas import estimate_tokens
 from lechonk.model import prompts as prompt_templates
 from lechonk.model.mistral_client import MistralClient
@@ -54,8 +55,7 @@ _TURN_ID_RE = re.compile(r"/t(\d+)\Z")
 def _prompt_hash(messages: list[dict[str, str]]) -> str:
     """Deterministic prompt hash: sha256 over the canonical JSON of the
     message list (the ModelCallRecord carries it; never the prompt text)."""
-    canonical = json.dumps(messages, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
+    canonical = strict_dumps(messages, sort_keys=True)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

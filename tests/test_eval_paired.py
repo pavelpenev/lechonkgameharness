@@ -493,3 +493,37 @@ def test_eval_module_level_adapter_imports_are_none():
                         (node.module or "") == "civrealm":
                     offenders.append(f"{path}:{node.lineno} from {node.module}")
     assert offenders == [], f"module-level adapter imports: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# FW-18: the strict canonical-JSON rule in paired (the FW-09 rule)
+# ---------------------------------------------------------------------------
+
+def test_paired_canonical_json_nan_raises_deterministically():
+    # C9b: NaN/Infinity are rejected (allow_nan=False) — a deterministic
+    # ValueError, never a bare NaN/Infinity token (invalid JSON).
+    with pytest.raises(ValueError):
+        paired.canonical_json({"x": float("nan")})
+    with pytest.raises(ValueError):
+        paired.canonical_json({"x": float("inf")})
+    with pytest.raises(ValueError):
+        paired.canonical_json({"x": float("-inf")})
+
+
+def test_paired_canonical_json_lone_surrogate_escaped_not_unicode_encode_error():
+    # C9b: a lone surrogate is escaped as \udXXX (valid JSON, round-trips
+    # through json.loads); its utf-8 encoding can never fail with
+    # UnicodeEncodeError.
+    text = paired.canonical_json({"s": "a\ud800b"})  # must not raise
+    assert "\\ud800" in text
+    assert json.loads(text) == {"s": "a\ud800b"}
+    text.encode("utf-8")
+
+
+def test_paired_canonical_json_clean_payload_byte_identical_to_pre_fw18():
+    # Regression: for clean (non-NaN, surrogate-free) payloads the output
+    # is byte-identical to the pre-FW-18 json.dumps construction
+    # (sort_keys, compact separators, ensure_ascii=False).
+    payload = {"b": 1, "a": [1, 2, {"c": "café — ü"}], "d": None, "e": True}
+    assert paired.canonical_json(payload) == json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

@@ -495,3 +495,45 @@ def test_prompt_hash_clean_ids_unaffected():
     # Clean turn ids still parse; a newline-terminated id no longer does.
     assert _turn_number("run/t7") == 7
     assert _turn_number("run/t7\n") is None
+
+
+# ---------------------------------------------------------------------------
+# FW-18: the strict canonical-JSON rule in the prompt-hash path
+# ---------------------------------------------------------------------------
+
+def test_prompt_hash_nan_raises_deterministically():
+    # C9b: NaN/Infinity are rejected (allow_nan=False) — a deterministic
+    # ValueError, never a bare NaN/Infinity token inside the hashed text.
+    with pytest.raises(ValueError):
+        _prompt_hash([{"role": "user", "content": float("nan")}])
+    with pytest.raises(ValueError):
+        _prompt_hash([{"role": "user", "content": float("inf")}])
+    with pytest.raises(ValueError):
+        _prompt_hash([{"role": "user", "content": float("-inf")}])
+
+
+def test_prompt_hash_lone_surrogate_escaped_not_unicode_encode_error():
+    # C9b: a lone surrogate never reaches the utf-8 encoder — the strict
+    # helper escapes it as \udXXX in the canonical form (valid JSON, stable
+    # hash); pre-FW-18 this raised UnicodeEncodeError.
+    messages = [{"role": "user", "content": "a\ud800b"}]
+    prompt_hash = _prompt_hash(messages)  # must not raise
+    canonical = json.dumps(messages, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).replace("\ud800", "\\ud800")
+    expected = "sha256:" + hashlib.sha256(
+        canonical.encode("utf-8")).hexdigest()
+    assert prompt_hash == expected
+
+
+def test_prompt_hash_clean_payload_unchanged_vs_pre_fw18_json_dumps():
+    # Regression: for clean payloads the hash is byte-identical to the
+    # pre-FW-18 json.dumps construction (same sort_keys/separators), so
+    # recorded prompt hashes still verify.
+    messages = [
+        {"role": "system", "content": "system prompt café — ü"},
+        {"role": "user", "content": "snapshot unit:7:goto_n"},
+    ]
+    expected = "sha256:" + hashlib.sha256(json.dumps(
+        messages, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
+    assert _prompt_hash(messages) == expected

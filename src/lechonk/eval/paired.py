@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.model_client import ModelResponse, RepairPrompt, TurnPrompt
 from lechonk.core.schemas import (
     ActionBatch,
@@ -84,8 +85,7 @@ MAX_API_ATTEMPTS_PER_TURN = 2
 
 
 def canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
+    return strict_dumps(obj, sort_keys=True)
 
 
 def sha256_text(text: str) -> str:
@@ -536,8 +536,7 @@ class RecordingClient:
             prompt, ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         if summary is not None:
             self._summaries.append(summary)
-            self._fh.write(json.dumps(summary, sort_keys=True,
-                                      ensure_ascii=False, default=str) + "\n")
+            self._fh.write(strict_dumps(summary, sort_keys=True) + "\n")
             self._fh.flush()
         return resp
 
