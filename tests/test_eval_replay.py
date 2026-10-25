@@ -17,7 +17,9 @@ breakout attempt in its detail), renders the bundle, and asserts:
 - the raw transcript copy is byte-identical (sha256);
 - the WP2 10-turn transcript (when the artifact is present) renders
   into a bundle with the expected record counts (skipped otherwise —
-  the artifact is a local run output, not a repo fixture).
+  the artifact is a local run output, not a repo fixture);
+- every recorded transcript under artifacts/ loads read-only through
+  load_transcript (W3-9; skipped when the artifacts are absent).
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from lechonk.core.ledger import TranscriptLedger
+from lechonk.core.ledger import TranscriptLedger, load_transcript
 from lechonk.core.schemas import (
     ActionResultRecord,
     CandidatesRefRecord,
@@ -48,6 +50,12 @@ from lechonk.eval import replay
 
 REPO = Path(__file__).resolve().parents[1]
 WP2_TRANSCRIPT = REPO / "artifacts" / "runs" / "wp2-model-run" / "transcript.jsonl"
+# The recorded-transcript inventory under artifacts/ (42 transcripts at
+# the 2026-10-25 wave-3 hash pin): the W3-9 read-only load check loads
+# every one. The artifacts are local run outputs, not repo fixtures —
+# a clone without them skips (unavailable coverage, not a pass).
+RECORDED_TRANSCRIPTS = sorted(
+    (REPO / "artifacts").rglob("transcript.jsonl"))
 
 PANEL_IDS = ["panel-manifest", "panel-empire", "panel-turns",
              "panel-snapshot", "panel-actions", "panel-commitments",
@@ -367,6 +375,23 @@ def test_render_bundle_wp2_transcript(tmp_path):
     statuses = {c["status"] for c in board}
     assert statuses <= {"fulfilled_model", "fulfilled_other", "missed",
                         "open"}
+
+
+# ---------------------------------------------------------------------------
+# the recorded-transcript inventory (W3-9 read-only load check; skipped
+# when the artifacts are absent — they are local run outputs, not repo
+# fixtures)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not RECORDED_TRANSCRIPTS,
+                    reason="the recorded transcript inventory is not present")
+def test_recorded_transcripts_all_load_read_only():
+    # the 2026-10-25 wave-3 hash pin: exactly 42 recorded transcripts
+    assert len(RECORDED_TRANSCRIPTS) == 42
+    for path in RECORDED_TRANSCRIPTS:
+        loaded = load_transcript(path)  # read-only: never modifies the file
+        assert loaded.records, path
+        assert loaded.last_seq == len(loaded.records) - 1
 
 
 # ---------------------------------------------------------------------------

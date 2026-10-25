@@ -129,6 +129,31 @@ transport cancellation. An ALREADY-ESTABLISHED game-over wins over a
 newly-noticed deadline expiry (DEF-1). ONE comparison convention (>=
 — the deadline is reached when clock() >= the deadline) is pinned across
 the guards and the phase checks.
+
+W3-9 engine-automatic observation (D9/D12, Option A): engine-automatic
+resolutions (§3 line 38 — counted, never hidden) are detected by
+observation-event diffing over a PERSISTENT last-seen baseline (own-city
+production + the current research target) fed at FOUR observation events:
+(1) turn start, post-extraction, from the session's cached obs; (2) after
+EVERY executed mutation, from the same cache (ExecutionResult carries no
+obs); (3) after the verified resend — the resend completes inside
+_execute_one, so the caller's post-step event covers it; (4) after
+successful phase completion (the finish outcome), so final-boundary
+transitions before the horizon exit are captured. Attribution is
+per-interval: a change is the model's iff it matches a produce/research
+action executed since the last observation event (a bounded retained
+set); every other change — a corroborated new city's first non-None
+production (ownership transfer / checkpoint resync / re-sighting after
+absence is baseline-only), a B→A revert, a buy-completion transition
+observed at the next event — emits engine_automatic with a ref carrying
+the entity identity and an observation index (unique per record).
+Records carry the turn current AT the observation event — never beyond
+the counted horizon (the finish boundary attributes to the COMPLETING
+turn). A capture gap emits the DEF-3 diagnostic (fail-open, disclosed);
+readback credit is unchanged (observation history never upgrades a
+contradicted action). Within each iteration the W3-2 guard records are
+emitted BEFORE the observation-diff records, so a deadline stop never
+half-records an observation event.
 """
 
 from __future__ import annotations
@@ -290,6 +315,25 @@ def _dispatch_result_detail(intent_seq: int, message: str) -> str:
 # as a diagnostic, never an aggregate).
 ACTING_DEADLINE_STOP_EVENT = "acting_deadline_stop"
 PARTIAL_BATCH_PROTOCOL = "partial-batch/v1"
+
+# --- W3-9 engine-automatic observation events (D9/D12, Option A) -------------
+# Observation-event diffing over a persistent last-seen baseline replaces
+# the old turn-start-snapshot diff (_detect_engine_automatic, deleted) and
+# the per-turn trackers — ONE detection path, no dual counting. The four
+# events: turn start post-extraction; after every executed mutation (the
+# session cache is the source — ExecutionResult carries no obs); after the
+# verified resend (it completes inside _execute_one, so the caller's
+# post-step event covers it); after successful phase completion (the
+# finish outcome — attributed to the COMPLETING turn, never beyond the
+# counted horizon).
+ENGINE_OBSERVATION_GAP_EVENT = "engine_observation_gap"
+# DEF-3: the retained per-interval executed-action set is bounded so it
+# cannot grow unbounded; an overflow drops the entry and emits the
+# observation-gap diagnostic (fail-open with mandatory disclosure).
+ENGINE_OBSERVATION_INTERVAL_MAX = 4096
+# freeciv's VUT_NONE production kind (version/v14.py; mirrors
+# obs_extract.VUT_NONE — the adapter imports stay lazy, §7.1).
+VUT_NONE = 0
 
 
 def _json_object(value: Any) -> Optional[dict]:
@@ -592,11 +636,29 @@ class GameRunner:
         self._abort_reason: Optional[str] = None
         self._session: Any = None
         self._watchdog: Optional[StallWatchdog] = None
-        # Standing orders (continued_model_order) + engine-automatic
-        # detection trackers.
+        # Standing orders (continued_model_order) + the W3-9
+        # engine-automatic observation tracker.
         self._standing: dict[str, _StandingOrder] = {}
-        self._research_last_turn: Optional[int] = None
-        self._produce_last_turn: dict[int, str] = {}
+        # The persistent last-seen baseline: own-city production display
+        # names + the current research target id, fed at the four
+        # observation events (see the W3-9 constants above).
+        self._engine_baseline_seen = False
+        self._engine_baseline_cities: dict[int, Optional[str]] = {}
+        self._engine_baseline_research: Optional[int] = None
+        # Every city id ever baselined: a re-sighting after absence is
+        # baseline-only, never a fresh choice (hardening b).
+        self._engine_known_cities: set[int] = set()
+        # Corroborated foundings (the founding verifier's new_cities):
+        # a confirmed new own city gets an initial production-resolution
+        # event even when the founding itself was model-directed.
+        self._engine_founded: set[int] = set()
+        # The per-interval attribution set: the produce/research actions
+        # executed since the last observation event (bounded, DEF-3).
+        self._engine_interval_actions: set[tuple] = set()
+        # City ids founded (verified) since the last observation event.
+        self._engine_interval_foundings: set[int] = set()
+        # The observation-event counter (the engine-auto refs' uniqueness).
+        self._engine_observation_index = 0
         self._game_over: Optional[tuple[bool, bool]] = None  # (terminated, truncated)
         # The TRUE count of turns that completed (reached a turn boundary /
         # NEXT_OWN_PHASE) — survives an exception unwind out of _run_turns,
@@ -1054,14 +1116,13 @@ class GameRunner:
             by_domain=by_domain,
             opportunity_domains=opportunity_domains(offered.candidates)))
 
-        # Engine-automatic resolutions (counted, never hidden, §3 line 38):
-        # a research/production target that changed during WAITING with no
-        # executed action of ours is the engine's own resolution.
-        self._detect_engine_automatic(
-            turn=turn, prev_snapshot=prev_snapshot, snapshot=snapshot,
-            snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
-        self._research_last_turn = None
-        self._produce_last_turn = {}
+        # W3-9 (D9/D12, Option A): the turn-start observation event — the
+        # first of the four events feeding the persistent last-seen
+        # baseline. Engine-automatic resolutions are counted, never
+        # hidden (§3 line 38); the first event seeds the baseline
+        # silently (turn 1's empty baseline: no records).
+        self._observe_engine_automatic(
+            turn=turn, snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
 
         delta = enforce_delta_budget(compute_delta(prev_snapshot, snapshot))
         delta_text = delta.render()
@@ -1197,6 +1258,13 @@ class GameRunner:
             return ("DEFEATED" if defeated else "VICTORY",
                     "game over at the phase boundary "
                     f"(defeated={defeated})", None)
+        # W3-9: the finish-boundary observation event (the fourth) — the
+        # post-finish observation is the first sight of the next phase's
+        # state; final-boundary transitions before the horizon exit are
+        # captured, attributed to THIS (completing) turn — never beyond
+        # the counted horizon.
+        self._observe_engine_automatic(
+            turn=turn, snapshot_seq=snapshot_seq, candidates_seq=candidates_seq)
         self._transition(RunState.NEXT_OWN_PHASE)
         return None, "", snapshot
 
@@ -1596,12 +1664,22 @@ class GameRunner:
             executed_any = True
             remaining.pop(0)
             acted_actors.add(actor)
-            self._track_executed(cand, readback)
+            self._track_executed(cand, result, turn=turn)
             if provenance == "model":
                 self._update_standing(actor, cand, seq, readback)
             if readback == adapter.execute.CONTRADICTED:
                 # An illegal action aborts the entity's remaining group.
                 aborted_actors.add(actor)
+            if result.status == "executed":
+                # W3-9: the post-step observation event — after the
+                # mutation's own action_result (the emission-order
+                # contract: a straddling completed mutation emits its
+                # result first, then the observation diff). The verified
+                # resend completes inside _execute_one, so this event
+                # covers it too.
+                self._observe_engine_automatic(
+                    turn=turn, snapshot_seq=snapshot_seq,
+                    candidates_seq=candidates_seq)
             if result.terminated or result.truncated:
                 self._game_over = (bool(result.terminated),
                                    bool(result.truncated))
@@ -2153,20 +2231,68 @@ class GameRunner:
     # standing orders (continued_model_order)
     # ------------------------------------------------------------------
 
-    def _track_executed(self, cand: Candidate, readback: str) -> None:
-        """Track executed research/produce actions for the
-        engine-automatic detection (a target change caused by our own
-        action is not engine-automatic)."""
+    def _track_executed(self, cand: Candidate, result: Any, *,
+                        turn: int) -> None:
+        """Retain the executed produce/research actions (and the
+        corroborated foundings) since the last observation event — the
+        per-interval attribution set the next observation event diffs
+        against (W3-9). A target change caused by our own action is not
+        engine-automatic. A CONTRADICTED action is never attributed (the
+        readback credit rules are unchanged: observation history never
+        upgrades a contradicted action)."""
+        readback = result.readback.status
         if readback not in ("verified", "inconclusive"):
             return
+        payload = cand.payload or {}
         if cand.domain == "tech" and cand.verb.startswith("research_tech_"):
-            self._research_last_turn = cand.payload.get("tech_id")
+            tech_id = payload.get("tech_id")
+            if isinstance(tech_id, int) and not isinstance(tech_id, bool):
+                self._retain_interval_action(("research", tech_id),
+                                             turn=turn, ref=cand.id)
         elif cand.domain == "city" and cand.verb.startswith("produce_"):
+            name = payload.get("production")
             try:
-                self._produce_last_turn[int(cand.actor_id)] = \
-                    cand.payload.get("production")
+                cid = int(cand.actor_id)
             except (TypeError, ValueError):
-                pass
+                cid = None
+            if name is not None and cid is not None:
+                self._retain_interval_action(("produce", cid, name),
+                                             turn=turn, ref=cand.id)
+        elif cand.domain == "unit" and cand.verb == "build_city":
+            # Corroborated founding evidence: the founding verifier's
+            # new_cities (execute.py) — only a VERIFIED founding counts
+            # (an inconclusive founding is an uncertain mutation, not a
+            # corroborated one).
+            if readback == "verified":
+                evidence = result.readback.evidence or {}
+                for cid in (evidence.get("new_cities") or []):
+                    try:
+                        self._engine_interval_foundings.add(int(cid))
+                    except (TypeError, ValueError):
+                        continue
+
+    def _retain_interval_action(self, entry: tuple, *, turn: int,
+                                ref: str) -> None:
+        """Retain one executed produce/research action in the bounded
+        per-interval attribution set. DEF-3: the set is bounded so it
+        cannot grow unbounded; an overflow drops the entry and emits the
+        observation-gap diagnostic (fail-open with mandatory disclosure
+        — the run remains valid, the affected turn's engine-auto
+        accounting is potentially incomplete)."""
+        if entry in self._engine_interval_actions:
+            return
+        if len(self._engine_interval_actions) >= ENGINE_OBSERVATION_INTERVAL_MAX:
+            self._emit(MetricEventRecord(
+                name=ENGINE_OBSERVATION_GAP_EVENT,
+                value=(f"turn {turn}: the engine-observation attribution "
+                       f"set overflowed (bounded at "
+                       f"{ENGINE_OBSERVATION_INTERVAL_MAX} retained "
+                       f"actions); {ref} is not retained — the "
+                       f"engine-automatic accounting for turn {turn} is "
+                       f"potentially incomplete (DEF-3: fail-open, "
+                       f"disclosed)")))
+            return
+        self._engine_interval_actions.add(entry)
 
     def _update_standing(self, actor: str, cand: Candidate, seq: int,
                          readback: str) -> None:
@@ -2241,6 +2367,12 @@ class GameRunner:
             completed_seqs.append(seq)
             readback = result.readback.status
             standing.reissued = True
+            if result.status == "executed":
+                # W3-9: the post-step observation event — the standing
+                # re-issue is a mutation like any other.
+                self._observe_engine_automatic(
+                    turn=turn, snapshot_seq=snapshot_seq,
+                    candidates_seq=candidates_seq)
             if readback == adapter.execute.CONTRADICTED:
                 del self._standing[actor]
             if result.terminated or result.truncated:
@@ -2280,65 +2412,256 @@ class GameRunner:
         return name == expected
 
     # ------------------------------------------------------------------
-    # engine-automatic detection (§3 line 38)
+    # engine-automatic observation (§3 line 38; W3-9, D9/D12 Option A)
     # ------------------------------------------------------------------
 
-    def _detect_engine_automatic(self, *, turn: int,
-                                 prev_snapshot: Optional[Snapshot],
-                                 snapshot: Snapshot, snapshot_seq: int,
-                                 candidates_seq: int) -> None:
-        """Count engine-automatic resolutions of new research/production
-        choices — never hidden (§3 line 38). A target change between turn
-        starts that our own executed actions did not cause is the engine's
-        resolution (the fork's research-continuation default). This
-        includes the None -> target first choice, gated the same way: a
-        first research/production action of ours attributes the choice to
-        the model, never to the engine."""
-        if prev_snapshot is None:
+    def _observe_engine_automatic(self, *, turn: int, snapshot_seq: int,
+                                  candidates_seq: int) -> None:
+        """One W3-9 observation event: diff the session's cached
+        observation against the persistent last-seen baseline and emit
+        an engine_automatic record for every change no produce/research
+        action of ours (executed since the last observation event)
+        accounts for — counted, never hidden (§3 line 38).
+
+        The four events: turn start post-extraction; after every
+        executed mutation; after the verified resend (it completes
+        inside _execute_one, so the caller's post-step event covers
+        it); after successful phase completion (the finish outcome,
+        attributed to the COMPLETING turn — never beyond the counted
+        horizon). The first event seeds the baseline silently (the
+        empty baseline: turn 1's pre-existing choices are not engine
+        resolutions).
+
+        Hardenings: entity/index identity in the refs (unique per
+        record); corroborated founding evidence (an ownership transfer,
+        checkpoint resynchronization or re-sighting after absence is
+        baseline-only, never a fresh choice); duplicate/unchanged
+        observations produce no record; a capture gap emits the DEF-3
+        diagnostic (fail-open, disclosed); the readback credit rules are
+        unchanged; buy-completion is captured only on an OBSERVED
+        transition (never assumed at the buy's own post-step event)."""
+        obs = self._session.obs
+        cities, research_id, me, city_names = self._engine_observation_state(
+            obs)
+        if cities is None:
+            # A capture gap (DEF-3): no observation to diff — disclose,
+            # fail open, leave the baseline (and the interval) untouched.
+            self._emit(MetricEventRecord(
+                name=ENGINE_OBSERVATION_GAP_EVENT,
+                value=(f"turn {turn}: no observation at this event — the "
+                       f"engine-automatic accounting for turn {turn} is "
+                       f"potentially incomplete (DEF-3: fail-open, "
+                       f"disclosed)")))
             return
-        prev_research = prev_snapshot.player.research
-        cur_research = snapshot.player.research
-        prev_target_id = prev_research.current_target_id
-        cur_target_id = cur_research.current_target_id
-        if (cur_target_id is not None
-                and prev_target_id != cur_target_id
-                and self._research_last_turn != cur_target_id):
-            name = cur_research.current_target or \
-                f"tech#{cur_research.current_target_id}"
-            self._emit_action_result(
-                turn=turn, ref=f"engine_automatic:research:{name}",
+        self._engine_observation_index += 1
+        index = self._engine_observation_index
+        if not self._engine_baseline_seen:
+            # The empty baseline seeds silently.
+            self._engine_baseline_seen = True
+            self._engine_baseline_cities = dict(cities)
+            self._engine_baseline_research = research_id
+            self._engine_known_cities.update(cities)
+            self._engine_interval_actions.clear()
+            self._engine_interval_foundings.clear()
+            return
+        my_id = self._session.player_id
+        # --- the research target ---------------------------------------
+        prev_research = self._engine_baseline_research
+        if (research_id is not None and prev_research != research_id
+                and ("research", research_id)
+                not in self._engine_interval_actions):
+            name = self._engine_research_name(obs, research_id, me)
+            prev_name = (self._engine_research_name(obs, prev_research, me)
+                         if prev_research is not None else None)
+            self._emit_engine_automatic(
+                turn=turn,
+                ref=f"engine_automatic:research:player:{my_id}:obs{index}",
                 domain="tech", verb="research_tech_auto", target=name,
-                affected=name, outcome="executed",
-                provenance_class="engine_automatic", readback="none",
-                snapshot_seq=snapshot_seq,
-                candidates_seq=candidates_seq, call_seq=None,
-                detail=(f"research target changed "
-                        f"{prev_research.current_target} -> {name} during "
-                        f"WAITING with no executed tech action — "
-                        f"engine-automatic continuation (counted, never "
-                        f"hidden, §3 line 38)"))
-        prev_cities = {c.id: c for c in prev_snapshot.cities if c.is_own}
-        for city in snapshot.cities:
-            if not city.is_own or city.id not in prev_cities:
+                affected=name, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq,
+                detail=(f"research target changed {prev_name} -> {name} "
+                        f"between observation events with no executed tech "
+                        f"action of ours — engine-automatic resolution "
+                        f"(counted, never hidden, §3 line 38)"))
+        self._engine_baseline_research = research_id
+        # --- own-city production ----------------------------------------
+        for cid in sorted(cities):
+            production = cities[cid]
+            if cid not in self._engine_baseline_cities:
+                # A first sighting of an own city.
+                self._engine_known_cities.add(cid)
+                if cid in self._engine_founded \
+                        or cid in self._engine_interval_foundings:
+                    # Corroborated founding: founding and choosing the
+                    # default production are distinct decisions — the
+                    # engine's initial choice is a resolution even when
+                    # the founding itself was model-directed.
+                    self._engine_founded.add(cid)
+                    self._engine_baseline_cities[cid] = production
+                    if production is not None:
+                        self._emit_engine_automatic(
+                            turn=turn,
+                            ref=(f"engine_automatic:production:city:{cid}"
+                                 f":obs{index}"),
+                            domain="city", verb="produce_auto",
+                            target=production, affected=production,
+                            snapshot_seq=snapshot_seq,
+                            candidates_seq=candidates_seq,
+                            detail=(f"city {city_names.get(cid, cid)} founded "
+                                    f"with the engine's initial production "
+                                    f"{production} — counted, never "
+                                    f"hidden (§3 line 38)"))
+                else:
+                    # Ownership transfer / checkpoint resynchronization /
+                    # re-sighting after absence: baseline-only, never
+                    # mislabeled as a fresh choice.
+                    self._engine_baseline_cities[cid] = production
                 continue
-            prev_city = prev_cities[city.id]
-            if (city.production is not None
-                    and prev_city.production != city.production
-                    and self._produce_last_turn.get(city.id)
-                    != city.production):
-                self._emit_action_result(
+            prev = self._engine_baseline_cities[cid]
+            if (production is not None and production != prev
+                    and ("produce", cid, production)
+                    not in self._engine_interval_actions):
+                self._emit_engine_automatic(
                     turn=turn,
-                    ref=f"engine_automatic:production:{city.production}",
-                    domain="city", verb="produce_auto",
-                    target=city.production, affected=city.production,
-                    outcome="executed", provenance_class="engine_automatic",
-                    readback="none", snapshot_seq=snapshot_seq,
-                    candidates_seq=candidates_seq, call_seq=None,
-                    detail=(f"city {city.name} production changed "
-                            f"{prev_city.production} -> {city.production} "
-                            f"during WAITING with no executed produce "
-                            f"action — engine-automatic resolution "
+                    ref=(f"engine_automatic:production:city:{cid}"
+                         f":obs{index}"),
+                    domain="city", verb="produce_auto", target=production,
+                    affected=production, snapshot_seq=snapshot_seq,
+                    candidates_seq=candidates_seq,
+                    detail=(f"city {city_names.get(cid, cid)} production "
+                            f"changed {prev} -> {production} between "
+                            f"observation events with no executed produce "
+                            f"action of ours — engine-automatic resolution "
                             f"(counted, never hidden, §3 line 38)"))
+            self._engine_baseline_cities[cid] = production
+        # An own city absent from this observation is dropped (loss or
+        # conquest); a re-sighting is baseline-only (the known-city set
+        # keeps the id).
+        for cid in list(self._engine_baseline_cities):
+            if cid not in cities:
+                del self._engine_baseline_cities[cid]
+        # The interval ends at this observation event.
+        self._engine_interval_actions.clear()
+        self._engine_interval_foundings.clear()
+
+    def _engine_observation_state(
+            self, obs: Any) -> tuple[Optional[dict[int, Optional[str]]],
+                                     Optional[int],
+                                     Optional[Mapping[str, Any]],
+                                     dict[int, str]]:
+        """The baseline view of one observation: ({city_id: production
+        display name}, the research target id, the own player entry,
+        {city_id: name}). The cities are None when the observation
+        carries no player domain (a capture gap — DEF-3)."""
+        if not isinstance(obs, Mapping):
+            return None, None, None, {}
+        players = obs.get("player")
+        if not isinstance(players, dict) or not players:
+            return None, None, None, {}
+        my_id = self._session.player_id
+        me = players.get(my_id)
+        if me is None and my_id is not None:
+            me = players.get(str(my_id))
+        if me is None and my_id is not None:
+            # Serialized-string player IDs (a JSON round-trip keys the
+            # player domain by string): match by normalized integer.
+            try:
+                pid_int = int(my_id)
+            except (TypeError, ValueError):
+                pid_int = None
+            if pid_int is not None:
+                for key, entry in players.items():
+                    try:
+                        if int(key) == pid_int:
+                            me = entry
+                            break
+                    except (TypeError, ValueError):
+                        continue
+        researching = me.get("researching") if isinstance(me, Mapping) else None
+        research_id = None
+        if isinstance(researching, int) and not isinstance(researching, bool) \
+                and researching != 0:
+            research_id = researching
+        names = self._engine_production_names()
+        cities: dict[int, Optional[str]] = {}
+        city_names: dict[int, str] = {}
+        city_domain = obs.get("city")
+        if isinstance(city_domain, dict):
+            for key, entry in city_domain.items():
+                if not isinstance(entry, Mapping):
+                    continue
+                try:
+                    cid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if entry.get("owner") != my_id:
+                    continue  # own cities only (as today)
+                kind = entry.get("production_kind")
+                value = entry.get("production_value")
+                production = None
+                if kind not in (None, VUT_NONE) and value is not None:
+                    try:
+                        production = names.get((int(kind), int(value)))
+                        if production is None:
+                            production = f"kind{int(kind)}#{int(value)}"
+                    except (TypeError, ValueError):
+                        production = None
+                cities[cid] = production
+                city_names[cid] = str(entry.get("name") or f"city#{cid}")
+        return (cities, research_id,
+                me if isinstance(me, Mapping) else None, city_names)
+
+    def _engine_production_names(self) -> Mapping[tuple[int, int], str]:
+        """The (production_kind, production_value) -> display name map,
+        mirroring the snapshot path's resolution (obs_extract): the
+        ruleset's city_production_names, else the inverse of the
+        session's production_name_map."""
+        ruleset = getattr(self._session, "ruleset", None)
+        names = getattr(ruleset, "city_production_names", None)
+        if isinstance(names, Mapping) and names:
+            return names
+        out: dict[tuple[int, int], str] = {}
+        for name, kv in (self._session.production_name_map() or {}).items():
+            if isinstance(kv, tuple) and len(kv) == 2:
+                try:
+                    out[(int(kv[0]), int(kv[1]))] = name
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def _engine_research_name(self, obs: Mapping[str, Any],
+                              tech_id: Optional[int],
+                              me: Optional[Mapping[str, Any]]) -> Optional[str]:
+        """The research target's display name, mirroring the snapshot
+        path's resolution (obs_extract._extract_player): the tech domain
+        wins, then the player's research_name, then tech#<id>."""
+        if tech_id is None:
+            return None
+        techs = obs.get("tech")
+        entry = techs.get(tech_id) if isinstance(techs, dict) else None
+        if isinstance(entry, Mapping):
+            name = entry.get("name")
+            if name:
+                return str(name)
+        name = me.get("research_name") if isinstance(me, Mapping) else None
+        return str(name) if name else f"tech#{tech_id}"
+
+    def _emit_engine_automatic(self, *, turn: int, ref: str, domain: str,
+                               verb: str, target: str, affected: str,
+                               snapshot_seq: int, candidates_seq: int,
+                               detail: str) -> int:
+        """The engine-automatic emission shape (unchanged): an
+        ActionResultRecord, provenance_class "engine_automatic",
+        readback "none", outcome "executed", turn = the observation
+        event's turn. The ref carries the entity identity and the
+        observation index — unique per record (name-only refs collide
+        across cities and confuse the P11 audit's by-ref grouping)."""
+        return self._emit_action_result(
+            turn=turn, ref=ref, domain=domain, verb=verb, target=target,
+            affected=affected, outcome="executed",
+            provenance_class="engine_automatic", readback="none",
+            snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+            call_seq=None, detail=detail)
 
     # ------------------------------------------------------------------
     # memory / threats

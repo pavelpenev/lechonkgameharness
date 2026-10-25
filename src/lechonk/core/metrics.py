@@ -25,6 +25,20 @@ ledger-only — no free-text parsing anywhere):
   readback-gated — contradicted and inconclusive executions enter
   neither numerator nor denominator. Engine-automatic resolutions are
   counted (they are creditable executed decisions), never hidden.
+  JOINT METRIC-DISCONTINUITY NOTE (2026-10-25, wave 3, one note): D1
+  re-bases the participation numerator and D2 the domain shares onto
+  verified-only executions; W3-9 (D9/D12) grows the engine
+  denominators — the engine-automatic observation (boundary event
+  diffing over a persistent last-seen baseline at FOUR observation
+  events, the fourth added at the finish boundary) detects resolutions
+  the old turn-start-snapshot diff missed (a newly founded city's
+  engine-chosen production, A→B→A reverts, buy-completion
+  transitions), so on re-computation the research/production
+  model-control shares DROP and engine records also enter the
+  fulfilled_any numerator. DEF-3: an observation capture gap is
+  disclosed by a diagnostic metric event (engine_observation_gap) and
+  the affected turns' engine-auto accounting is marked potentially
+  incomplete; runs remain valid. Recorded evidence is never recomputed.
   The participation gate (§3 line 38) passes iff participation >= 0.80
   AND every per-domain share with a NUMERIC status (ok) is
   majority-model (> 0.5). D3 (ruled 2026-10-24): the small-domain
@@ -383,7 +397,7 @@ def _credits_execution(rec: ActionResultRecord) -> bool:
     fulfillment and acted-on credit only when its ledger read-back
     VERIFIED the mutation, or when the decision is an engine-automatic
     resolution — those have readback "none" by construction
-    (runner._detect_engine_automatic emits no read-back) and remain
+    (the W3-9 observation tracker emits no read-back) and remain
     creditable per the frozen "any policy" wording. A CONTRADICTED action
     (emitted outcome "executed" with readback "contradicted" and
     rejection_class "illegal_in_rule" — the rules engine proved

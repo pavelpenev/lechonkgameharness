@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import importlib.util
 import inspect
 import json
 import time
@@ -71,7 +72,9 @@ from tests.fog_fixtures import (
     MY_PLAYER,
     NUM_IMPROVEMENTS,
     SETTLERS,
+    VUT_IMPROVEMENT,
     VUT_UTYPE,
+    WARRIORS,
     foreign_city,
     own_city,
 )
@@ -88,6 +91,13 @@ from tests.runner_fixtures import (
 )
 
 REPO = Path(__file__).resolve().parents[1]
+
+# The P11 ledger audit (scripts/wp3_p11_audit.py), loaded the same way
+# tests/test_lifecycle_p11.py loads it — for the W3-9 audit-side pins.
+_audit_spec = importlib.util.spec_from_file_location(
+    "wp3_p11_audit", REPO / "scripts" / "wp3_p11_audit.py")
+wp3_p11_audit = importlib.util.module_from_spec(_audit_spec)
+_audit_spec.loader.exec_module(wp3_p11_audit)
 
 
 def _records(path):
@@ -543,15 +553,23 @@ def test_runner_fortifying_unit_counts_as_standing_in_effect(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# engine-automatic resolutions are counted, never hidden (§3 line 38)
+# engine-automatic resolutions are counted, never hidden (§3 line 38) —
+# W3-9: observation-event diffing over a persistent last-seen baseline
+# (D9/D12, Option A; the old turn-start-snapshot diff is replaced)
 # ---------------------------------------------------------------------------
 
 
 def test_runner_counts_engine_automatic_research_continuation(tmp_path):
+    """W3-9 REPLACEMENT (the old test pinned the turn-start snapshot
+    diff: the change was detected at the NEXT turn start and attributed
+    to that turn). New path: the w1->w2 transition is captured at
+    turn 1's FINISH-boundary observation event (the fourth event) and
+    attributed to the COMPLETING turn."""
     # Turn 1: researching Alphabet (tech 1 per default_techs), the model
-    # only moves a unit. Turn 2: the engine continued research to Pottery
-    # (tech 2) during WAITING — no executed tech action → engine_automatic,
-    # counted. (The snapshot's ResearchView resolves ids via the tech domain:
+    # only moves a unit. The engine continues research to Pottery
+    # (tech 2) during WAITING — no executed tech action -> engine_
+    # automatic, counted at the finish-boundary event, attributed to
+    # the completing turn. (The tech domain resolves the ids:
     # researching=1 -> "Alphabet", researching=2 -> "Pottery".)
     worlds = [
         turn_world(1, researching=1),
@@ -571,10 +589,15 @@ def test_runner_counts_engine_automatic_research_continuation(tmp_path):
     automatic = [a for a in actions
                  if a.provenance_class == "engine_automatic"]
     assert len(automatic) == 1
-    assert automatic[0].turn == 2
+    assert automatic[0].turn == 1  # the completing turn (the finish
+    # boundary), not the next turn start
     assert automatic[0].domain == "tech"
     assert automatic[0].target == "Pottery"
     assert automatic[0].outcome == "executed"
+    assert automatic[0].readback == "none"
+    # The ref carries the entity identity + the observation index.
+    assert automatic[0].ref.startswith("engine_automatic:research:player:")
+    assert ":obs" in automatic[0].ref
     # Counted in the research domain share, not as model participation.
     research_share = result.metrics.domain_model_shares["research"]
     assert research_share.denominator == 1  # only the engine resolution
@@ -582,12 +605,14 @@ def test_runner_counts_engine_automatic_research_continuation(tmp_path):
 
 
 def test_runner_counts_engine_automatic_first_research_choice(tmp_path):
-    # FW-R3: turn 1 has NO research target (the player domain carries no
-    # "researching" — current_target_id None); the model only moves a
-    # unit. Turn 2: the engine auto-set an initial target (tech 2 =
-    # Pottery) during WAITING with no executed tech action of ours — a
-    # None -> target first choice is a new research choice:
-    # engine_automatic, counted.
+    """W3-9 REPLACEMENT (the old test pinned the turn-start snapshot
+    diff with the next-turn attribution). FW-R3 carried over: turn 1
+    has NO research target (the player domain carries no "researching"
+    — current_target_id None); the model only moves a unit. The engine
+    auto-set an initial target (tech 2 = Pottery) during WAITING with
+    no executed tech action of ours — a None -> target first choice is
+    a new research choice: engine_automatic, counted at the
+    finish-boundary event, attributed to the completing turn."""
     worlds = [
         turn_world(1),
         turn_world(2, researching=2),
@@ -606,7 +631,8 @@ def test_runner_counts_engine_automatic_first_research_choice(tmp_path):
     automatic = [a for a in actions
                  if a.provenance_class == "engine_automatic"]
     assert len(automatic) == 1
-    assert automatic[0].turn == 2
+    assert automatic[0].turn == 1  # the completing turn (the finish
+    # boundary), not the next turn start
     assert automatic[0].domain == "tech"
     assert automatic[0].target == "Pottery"
     assert automatic[0].outcome == "executed"
@@ -648,11 +674,14 @@ def test_runner_first_research_choice_with_own_action_is_model_attributed(
 
 
 def test_runner_counts_engine_automatic_first_city_production(tmp_path):
-    # FW-R3: turn 1: Rome has no production (production_kind VUT_NONE);
-    # the model only moves a unit. Turn 2: the engine auto-set the city's
-    # first production (Settlers) during WAITING with no executed produce
-    # action of ours — a None -> production first choice is a new
-    # production choice: engine_automatic, counted.
+    """W3-9 REPLACEMENT (the old test pinned the turn-start snapshot
+    diff with the next-turn attribution). FW-R3 carried over: turn 1:
+    # Rome has no production (production_kind VUT_NONE); the model only
+    moves a unit. The engine auto-set the city's first production
+    (Settlers) during WAITING with no executed produce action of ours —
+    a None -> production first choice is a new production choice:
+    engine_automatic, counted at the finish-boundary event, attributed
+    to the completing turn."""
     worlds = [
         turn_world(1),
         turn_world(2, cities=[
@@ -675,10 +704,13 @@ def test_runner_counts_engine_automatic_first_city_production(tmp_path):
     automatic = [a for a in actions
                  if a.provenance_class == "engine_automatic"]
     assert len(automatic) == 1
-    assert automatic[0].turn == 2
+    assert automatic[0].turn == 1  # the completing turn (the finish
+    # boundary), not the next turn start
     assert automatic[0].domain == "city"
     assert automatic[0].target == "Settlers"
     assert automatic[0].outcome == "executed"
+    # The ref carries the entity identity + the observation index.
+    assert automatic[0].ref == "engine_automatic:production:city:1:obs3"
 
 
 def test_runner_first_city_production_with_own_action_is_model_attributed(
@@ -715,6 +747,574 @@ def test_runner_first_city_production_with_own_action_is_model_attributed(
     assert produce[0].readback == "verified"
     assert not [a for a in actions
                 if a.provenance_class == "engine_automatic"]
+
+
+# ---------------------------------------------------------------------------
+# W3-9 acceptance matrix (D9/D12, Option A): the observation-event
+# diffing hardenings — corroborated founding, A→B→A reverts, buy-
+# completion conditionality, the empty baseline, the horizon rule, the
+# emission-order contract, the DEF-3 gap diagnostic, entity-identity
+# refs + the P11 audit grouping, and the unchanged readback credit
+# ---------------------------------------------------------------------------
+
+
+class _FoundingSession(FakeSession):
+    """A FakeSession whose build_city step founds the city with the
+    engine's default production choice landing with it — the founding
+    verifier's corroborated evidence (execute.py: a new own city at
+    the unit's tile, the unit consumed)."""
+
+    def __init__(self, worlds, *, new_city_id=3, production="Warriors"):
+        super().__init__(worlds)
+        self._new_city_id = new_city_id
+        self._production = production
+
+    def _apply_effect(self, obs, action):
+        ctrl_type, actor_id, action_key = action
+        if ctrl_type == "unit" and action_key == "build_city":
+            uid = int(actor_id)
+            unit = obs["unit"].get(uid)
+            if unit is None:
+                return
+            x, y = int(unit["x"]), int(unit["y"])
+            del obs["unit"][uid]
+            kind, value = self._production_names.get(
+                self._production, (VUT_IMPROVEMENT, 0))
+            obs["city"][self._new_city_id] = own_city(
+                city_id=self._new_city_id, name="Newtown", x=x, y=y,
+                production_kind=kind, production_value=value)
+            return
+        super()._apply_effect(obs, action)
+
+
+def test_runner_engine_record_for_founded_city_initial_production(tmp_path):
+    """W3-9 acceptance (1): a new city founded mid-batch — the post-step
+    observation shows the new city with the engine's production choice.
+    With the corroborated-founding rule the model-directed founding
+    still emits the engine's production choice (founding and choosing
+    the default production are distinct decisions): ONE engine record
+    at that event, after the founding action's own result."""
+    worlds = [turn_world(1), turn_world(2)]
+    session = _FoundingSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:10:build_city"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 1
+    record = automatic[0]
+    assert record.turn == 1
+    assert record.domain == "city" and record.verb == "produce_auto"
+    assert record.target == "Warriors"
+    assert record.outcome == "executed" and record.readback == "none"
+    # The ref carries the entity identity + the observation index.
+    assert record.ref == "engine_automatic:production:city:3:obs2"
+    # The founding action's own result precedes the observation diff
+    # (the emission-order contract), and the founding verified.
+    founding = [a for a in actions if a.ref == "unit:10:build_city"]
+    assert len(founding) == 1
+    assert founding[0].readback == "verified"
+    assert record.seq > founding[0].seq
+
+
+def test_runner_engine_record_for_a_b_a_revert(tmp_path):
+    """W3-9 acceptance (2): A→B→A — the model produces B on turn 1
+    (the post-step observation attributes the change to us: the
+    baseline updates to B, no record), the engine reverts to A before
+    the next turn start — the finish-boundary observation captures the
+    revert: ONE engine record for the revert, none for the B change
+    itself."""
+    granary = dict(production_kind=VUT_IMPROVEMENT, production_value=0)
+    worlds = [
+        turn_world(1, cities=[own_city(**granary), foreign_city()]),
+        turn_world(2, cities=[own_city(**granary), foreign_city()]),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["city:1:produce_settlers"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    # ONE engine record: the revert to Granary (A), captured at the
+    # finish-boundary observation event, attributed to the completing
+    # turn. None for the B (Settlers) change itself — our executed
+    # produce action accounts for it.
+    assert len(automatic) == 1
+    assert automatic[0].turn == 1
+    assert automatic[0].target == "Granary"
+    assert automatic[0].verb == "produce_auto"
+    assert not [a for a in automatic if a.target == "Settlers"]
+    # Our produce action executed and was read-back verified.
+    produce = [a for a in actions if a.ref == "city:1:produce_settlers"]
+    assert len(produce) == 1 and produce[0].readback == "verified"
+
+
+def test_runner_engine_record_for_buy_completion_at_next_observation(tmp_path):
+    """W3-9 acceptance (6) + hardening (7): buy-completion capture is
+    CONDITIONAL on an observed transition. The buy's own post-step
+    observation shows the production UNCHANGED (the W3-8 live probe
+    observed a bought Warrior completing at the turn change) — no
+    record there; the completion transition is captured at the NEXT
+    observation event (the finish boundary) as an engine choice with
+    no produce action of ours matching."""
+    worlds = [
+        turn_world(1, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=SETTLERS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+        turn_world(2, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=WARRIORS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["city:1:city_buy_production"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 1
+    assert automatic[0].turn == 1
+    assert automatic[0].target == "Warriors"
+    assert automatic[0].verb == "produce_auto"
+    # The buy executed and was verified (the W3-8 pinned direction: a
+    # successful buy raises shield_stock).
+    buy = [a for a in actions if a.ref == "city:1:city_buy_production"]
+    assert len(buy) == 1 and buy[0].readback == "verified"
+    # The record was captured at the finish-boundary event (the next
+    # observation event after the buy), NOT at the buy's own post-step
+    # event: its seq follows the WAITING state transition (the finish
+    # primitive already ran).
+    waiting = [r for r in records
+               if isinstance(r, MetricEventRecord)
+               and r.name == "state_transition"
+               and r.value == "FINISH_SENT->WAITING"]
+    assert len(waiting) == 1
+    assert automatic[0].seq > waiting[0].seq
+    assert automatic[0].seq > buy[0].seq
+
+
+def test_runner_first_turn_empty_baseline_emits_no_records(tmp_path):
+    """W3-9 acceptance (7): the empty baseline seeds silently — turn
+    1's PRE-EXISTING research/production choices are baselined, never
+    emitted as engine resolutions."""
+    cities = [
+        own_city(production_kind=VUT_UTYPE,
+                 production_value=SETTLERS + NUM_IMPROVEMENTS),
+        foreign_city(),
+    ]
+    worlds = [
+        turn_world(1, researching=2, cities=cities),
+        turn_world(2, researching=2, cities=cities),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
+
+
+def test_runner_engine_records_load_and_render_in_replay(tmp_path):
+    """W3-9 acceptance (8): a transcript containing engine records
+    loads via load_transcript and renders in the replay viewer."""
+    from lechonk.eval import replay
+
+    worlds = [
+        turn_world(1, researching=1),
+        turn_world(2, researching=2),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    # loads via load_transcript
+    records = load_transcript(runner.ledger.path).records
+    engine = [a for a in records if isinstance(a, ActionResultRecord)
+              and a.provenance_class == "engine_automatic"]
+    assert len(engine) == 1
+    # renders in replay
+    out = tmp_path / "replay"
+    summary = replay.render_bundle(runner.ledger.path, out)
+    assert summary["meta"]["outcome"] == "COMPLETED"
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert engine[0].ref in html  # the engine record is embedded
+    assert "pv-engine" in html  # the engine provenance class is styled
+
+
+def test_runner_engine_records_never_attributed_beyond_horizon(tmp_path):
+    """W3-9 acceptance (9) + the horizon rule: the finish-boundary
+    event attributes to the COMPLETING turn — no engine record is
+    attributed beyond max_turns (the runner exits before processing
+    the next turn; the metric horizon is never extended)."""
+    worlds = [
+        turn_world(1, researching=1),
+        turn_world(2, researching=2),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    assert result.turns_completed == 1
+    actions = _actions(_records(runner.ledger.path))
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    # The w1->w2 transition is captured at the finish boundary BEFORE
+    # the horizon exit — attributed to the completing turn.
+    assert len(automatic) == 1
+    assert automatic[0].turn == 1
+    assert all(a.turn <= 1 for a in automatic)
+    # The metric horizon derives from turn-bearing records: (1, 1).
+    assert result.metrics.run_turns == (1, 1)
+
+
+class _EngineActingDeadlineSession(FakeSession):
+    """A mutation step that consumes a scripted fake-clock interval per
+    send (the D13 straddle) AND applies an engine production change on
+    a scripted step — the engine acted during our own phase, invisible
+    to any action of ours (the W3-9 post-step observation diff)."""
+
+    def __init__(self, worlds, clock, *, step_delays_s, engine_step,
+                 production=(VUT_UTYPE, WARRIORS + NUM_IMPROVEMENTS)):
+        super().__init__(worlds)
+        self._clock = clock
+        self._step_delays_s = list(step_delays_s)
+        self._engine_step = engine_step
+        self._production = production
+        self._mutation_steps = 0
+
+    def step(self, action, *, deadline=None):
+        if action is not None:
+            self._mutation_steps += 1
+            if self._step_delays_s:
+                self._clock.advance(self._step_delays_s.pop(0))
+            if self._mutation_steps == self._engine_step:
+                obs, info = self._worlds[self._index]
+                new_obs = copy.deepcopy(obs)
+                city = new_obs["city"][1]
+                city["production_kind"], city["production_value"] = \
+                    self._production
+                self._worlds[self._index] = (new_obs, info)
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_deadline_stop_never_half_records_an_observation_event(tmp_path):
+    """W3-9 acceptance (10) + the emission-order contract (glm §8): a
+    deadline stop mid-batch does not half-record an observation event.
+    The straddling completed mutation emits its own result first, then
+    the observation diff (the engine's production change is captured);
+    the W3-2 guard records (the aborted_group + the stop summary) come
+    after — the observation event completed, never half-recorded."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    clock = FakeClock()
+    session = _EngineActingDeadlineSession(
+        worlds, clock, step_delays_s=[100.0, 100.0, 100.0], engine_step=2)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e", "unit:11:sentry",
+                     "unit:10:goto_nw"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2, clock=clock)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "ACTING exceeded its deadline of 180.0s" in result.reason
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    executed = [a for a in actions
+                if a.outcome == "executed"
+                and a.provenance_class == "model"]
+    aborted = [a for a in actions if a.outcome == "aborted_group"]
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    # Two sends completed (the second straddled the deadline, D13); the
+    # engine's production change on the straddling step is captured by
+    # that mutation's post-step observation event.
+    assert [a.ref for a in executed] == ["unit:10:goto_e", "unit:11:sentry"]
+    assert len(automatic) == 1
+    assert automatic[0].turn == 1
+    assert automatic[0].target == "Warriors"
+    # The pinned order: the straddling mutation's own result, then the
+    # observation diff, then the guard's records (never half-recorded).
+    assert automatic[0].seq > executed[-1].seq
+    assert aborted[0].seq > automatic[0].seq
+    stops = _stop_events(records)
+    assert len(stops) == 1
+    assert stops[0].seq > aborted[0].seq
+
+
+def test_runner_engine_observation_gap_is_disclosed_and_run_valid(
+        tmp_path, monkeypatch):
+    """W3-9 acceptance (11) + DEF-3: the bounded per-interval
+    attribution set overflows -> the observation-gap diagnostic metric
+    event is emitted (fail-open with mandatory disclosure) and the run
+    remains valid."""
+    monkeypatch.setattr(
+        "lechonk.core.runner.ENGINE_OBSERVATION_INTERVAL_MAX", 0)
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["city:1:produce_settlers",
+                     "tech:cur_player:research_tech_pottery_1"],
+                    turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    # Fail-open: the run remains valid.
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    gaps = [r for r in records
+            if isinstance(r, MetricEventRecord)
+            and r.name == "engine_observation_gap"]
+    # Both retained actions dropped (the bound is 0): one diagnostic per
+    # dropped action, each naming the affected turn.
+    assert len(gaps) == 2
+    assert all("turn 1" in g.value for g in gaps)
+    # The dropped attribution is disclosed, never silent: with the
+    # interval set empty the produce/research changes are NOT
+    # attributed to our actions — the engine records are emitted and
+    # the accounting is flagged potentially incomplete.
+    automatic = [a for a in _actions(records)
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 2
+
+
+def test_runner_ownership_transfer_is_baseline_only(tmp_path):
+    """W3-9 hardening (2): a first sighting that is NOT a corroborated
+    founding (an ownership transfer / checkpoint resynchronization) is
+    baseline-only — never mislabeled as a fresh engine choice."""
+    warriors = dict(production_kind=VUT_UTYPE,
+                    production_value=WARRIORS + NUM_IMPROVEMENTS)
+    worlds = [
+        turn_world(1),
+        turn_world(2, cities=[
+            own_city(),
+            own_city(city_id=3, name="Conquered", **warriors),
+            foreign_city(),
+        ]),
+        turn_world(3, cities=[
+            own_city(),
+            own_city(city_id=3, name="Conquered", **warriors),
+            foreign_city(),
+        ]),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    # The transferred city's production is baselined, never recorded.
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
+
+
+def test_runner_resighting_after_absence_is_baseline_only(tmp_path):
+    """W3-9 hardening (2): a city that disappears from an observation
+    (loss/conquest) and is re-sighted later is baseline-only — never
+    mislabeled as a fresh engine choice, even though its production
+    differs from the pre-absence value."""
+    warriors = dict(production_kind=VUT_UTYPE,
+                    production_value=WARRIORS + NUM_IMPROVEMENTS)
+    granary = dict(production_kind=VUT_IMPROVEMENT, production_value=0)
+    worlds = [
+        turn_world(1, cities=[
+            own_city(),
+            own_city(city_id=3, name="Faraway", **warriors),
+            foreign_city(),
+        ]),
+        turn_world(2, cities=[own_city(), foreign_city()]),
+        turn_world(3, cities=[
+            own_city(),
+            own_city(city_id=3, name="Faraway", **granary),
+            foreign_city(),
+        ]),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    # The re-sighting (Warriors -> Granary across the absence) is
+    # baseline-only: no record.
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
+
+
+class _NoEffectProduceSession(FakeSession):
+    """A FakeSession whose produce step does NOT apply the effect —
+    the mutation provably did not execute (the read-back is
+    CONTRADICTED: the production is unchanged)."""
+
+    def _apply_effect(self, obs, action):
+        ctrl_type, _actor_id, action_key = action
+        if ctrl_type == "city" and action_key.startswith("produce_"):
+            return  # the production does not change
+        super()._apply_effect(obs, action)
+
+
+def test_runner_contradicted_produce_is_never_upgraded_by_observation(tmp_path):
+    """W3-9 hardening (6): the readback credit rules are unchanged —
+    observation history never upgrades a contradicted action. A
+    produce action that reads back CONTRADICTED (the production is
+    unchanged: the rules engine proved non-execution) is not
+    attributed to the model, emits no engine record (the observation
+    shows no change), and never credits."""
+    worlds = [
+        turn_world(1, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=SETTLERS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+        turn_world(2, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=SETTLERS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+    ]
+    session = _NoEffectProduceSession(worlds)
+    client = FakeModelClient([
+        ok_response(["city:1:produce_granary"], turn_id="t1",
+                    with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    actions = _actions(records)
+    produce = [a for a in actions if a.ref == "city:1:produce_granary"]
+    assert len(produce) == 1
+    # Contradicted: provably non-executed (the production is unchanged).
+    assert produce[0].outcome == "executed"
+    assert produce[0].readback == "contradicted"
+    assert produce[0].rejection_class == "illegal_in_rule"
+    # No engine record: the observation shows no change, and the
+    # observation history never upgrades the contradicted action.
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
+    report = compute_metrics(records)
+    assert report.domain_model_shares["production"].numerator == 0
+
+
+def test_runner_engine_refs_distinguish_same_production_cities(tmp_path):
+    """W3-9 acceptance (12) + hardening (1): two own cities whose
+    production changes to the SAME name produce two DISTINGUISHABLE
+    engine records — the refs carry the entity identity and the
+    observation index — and the P11 audit's by-ref grouping keeps them
+    apart (name-only refs would collide and fail the audit's
+    no_duplicate_mutation check)."""
+    settlers = dict(production_kind=VUT_UTYPE,
+                    production_value=SETTLERS + NUM_IMPROVEMENTS)
+    warriors = dict(production_kind=VUT_UTYPE,
+                    production_value=WARRIORS + NUM_IMPROVEMENTS)
+
+    def cities_with(prod):
+        return [own_city(city_id=1, name="Rome", **prod),
+                own_city(city_id=3, name="Alexandria", **prod),
+                foreign_city()]
+
+    worlds = [
+        turn_world(1, cities=cities_with(settlers)),
+        turn_world(2, cities=cities_with(warriors)),
+        turn_world(3, cities=cities_with(warriors)),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    automatic = [a for a in _actions(records)
+                 if a.provenance_class == "engine_automatic"]
+    # Both cities changed to the SAME production name...
+    assert len(automatic) == 2
+    assert {a.target for a in automatic} == {"Warriors"}
+    # ... yet the records are distinguishable: each ref carries its
+    # city's identity and the observation index.
+    assert {a.ref for a in automatic} == {
+        "engine_automatic:production:city:1:obs2",
+        "engine_automatic:production:city:3:obs2",
+    }
+    # The P11 audit groups executed results by ref: the entity-identity
+    # refs keep the two same-production records apart — the audit's
+    # no_duplicate_mutation check passes.
+    audit = wp3_p11_audit.audit_transcript(runner.ledger.path)
+    assert audit["checks"]["no_duplicate_mutation"]["pass"] is True
+
+
+def test_p11_audit_groups_engine_records_by_entity_ref(tmp_path):
+    """W3-9 hardening (1) counterfactual pin: two executed engine
+    records sharing a NAME-ONLY ref (the old format) collide in the P11
+    audit's by-ref grouping and FAIL its no_duplicate_mutation check —
+    the entity-identity refs are what keep same-production records
+    apart."""
+    path = tmp_path / "collide.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    for _city_id in (1, 3):
+        ledger.append(ActionResultRecord(
+            turn=1, ref="engine_automatic:production:Warriors",
+            domain="city", verb="produce_auto", target="Warriors",
+            affected="Warriors", outcome="executed",
+            provenance_class="engine_automatic", readback="none"),
+            durable=True)
+    ledger.append(OutcomeRecord(outcome="COMPLETED", reason="horizon"),
+                  durable=True)
+    ledger.close()
+    audit = wp3_p11_audit.audit_transcript(path)
+    assert audit["checks"]["no_duplicate_mutation"]["pass"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1959,10 +2559,17 @@ def test_runner_engine_automatic_resolution_credits_fulfilled_other(tmp_path):
         ("research", "Pottery")]
     # The engine-automatic research resolution fulfilled it: a
     # fulfilled_other credit on the board, never fulfilled_model.
+    # (W3-9: the record is captured at turn 1's finish-boundary event,
+    # and its ref carries the entity identity + the observation index.)
+    automatic = [a for a in _actions(records)
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 1
+    assert automatic[0].turn == 1
+    assert automatic[0].target == "Pottery"
     board = commitment_board(records)
     entry = next(e for e in board if e["target"] == "Pottery")
     assert entry["status"] == "fulfilled_other"
-    assert entry["fulfilled_by"] == ["engine_automatic:research:Pottery"]
+    assert entry["fulfilled_by"] == [automatic[0].ref]
     assert entry["fulfilled_model_by"] == []
 
 
