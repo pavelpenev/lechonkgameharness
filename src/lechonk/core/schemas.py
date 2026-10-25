@@ -22,6 +22,15 @@ evidence ``readback``, ``scripted_default`` reason, the ``commitment`` record
 carrying the batch's threat hypotheses, per-domain offered counts on
 ``candidates_ref``).
 
+Additive amendment (2026-10-24, FW-10 — dated addendum:
+artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/addendum.md):
+``Commitment`` gains ``target_kind`` (Literal ``tech``/``production``/
+``unit``/``city``/``player``/``tile``/``any``, default ``"any"``) and
+``verb`` (Optional[str], default None) — the typed commitment targets and
+the user-approved verb field. Additive only: pre-addendum payloads load
+unchanged (legacy free-text targets land on kind ``"any"``); no frozen
+record kind, field, or vocabulary is removed or renamed.
+
 This module NEVER imports civrealm (test-enforced: tests/test_core_purity.py).
 
 Token budgets (§3): Snapshot ≤ 8,000 tokens rendered, Delta ≤ 800,
@@ -333,13 +342,31 @@ class ActionItem(BaseModel):
 
 
 class Commitment(BaseModel):
-    """Structured commitment (§3 commitment follow-through)."""
+    """Structured commitment (§3 commitment follow-through).
+
+    FW-10 additive amendment (2026-10-24): ``target_kind`` types the target
+    and ``verb`` optionally states the intended action. Both carry defaults,
+    so pre-addendum payloads (free-text ``target`` only) load unchanged and
+    land on the legacy kind ``"any"`` — see the dated addendum
+    (artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/).
+    Matching is kind-aware exact equality (core.metrics._target_match).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     domain: Literal["research", "production", "expansion", "military", "diplomacy", "other"]
     target: str
     deadline_turn: int
+    # Typed target (§3 line 40): the action-side descriptor family the
+    # target names — tech/production name, "unit:<id>", "city:<id>",
+    # "player:<id>", "tile:x,y"; "any" = legacy free text (exact match
+    # only); "*" as the target is the wildcard. Canonical forms are the
+    # ones runner._describe emits on the action side.
+    target_kind: Literal["tech", "production", "unit", "city", "player", "tile", "any"] = "any"
+    # Optional intended-action verb (vocabulary: research, build, attack,
+    # move, negotiate, defend — see the dated addendum for the
+    # commitment-verb -> action-verb compatibility mapping).
+    verb: Optional[str] = None
 
 
 class MemoryUpdate(BaseModel):
@@ -415,6 +442,15 @@ METRIC_DOMAINS: tuple[str, ...] = (
 # Commitment domains (§3 line 40) — the commitment grammar.
 COMMITMENT_DOMAINS: tuple[str, ...] = (
     "research", "production", "expansion", "military", "diplomacy", "other",
+)
+# Commitment target kinds (FW-10 typed targets, 2026-10-24): the action-side
+# descriptor families produced by runner._describe (tech name, production
+# name, "unit:<id>", "city:<id>", "player:<id>", "tile:x,y") plus "any" —
+# legacy free-text targets, matched by exact equality only. The "*" target
+# is the wildcard (any kind). See the dated addendum:
+# artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/
+COMMITMENT_TARGET_KINDS: tuple[str, ...] = (
+    "tech", "production", "unit", "city", "player", "tile", "any",
 )
 
 
@@ -549,9 +585,10 @@ class ThreatMention(BaseModel):
 class CommitmentRecord(TranscriptRecordBase):
     """The model's structured memory statement for one batch (§7.5: the
     memory_update rides the ActionBatch — never a separate API call).
-    Carries the batch's commitments (falsifiable: domain, target,
-    deadline_turn) and threat hypotheses. The metric de-duplicates
-    commitments per (target, domain) and threats per (entity, turn)."""
+    Carries the batch's commitments (falsifiable: domain, target kind +
+    target, optional verb, deadline turn) and threat hypotheses. The metric
+    de-duplicates commitments per (target, domain) and threats per
+    (entity, turn)."""
 
     kind: Literal["commitment"] = "commitment"
     turn: int

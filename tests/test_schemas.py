@@ -11,11 +11,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from lechonk.core.schemas import (
     ACTION_BATCH_MAX_ACTIONS,
+    COMMITMENT_TARGET_KINDS,
     ActionBatch,
     ActionItem,
     Candidate,
     CandidateTable,
     Commitment,
+    CommitmentRecord,
     Delta,
     DeltaEvent,
     CityView,
@@ -262,3 +264,74 @@ def test_commitment_schema():
     assert c.domain == "expansion"
     with pytest.raises(ValidationError):
         Commitment(domain="banana", target="x", deadline_turn=1)
+
+
+# ---------------------------------------------------------------------------
+# FW-10: typed commitment targets + additive verb (dated addendum
+# artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/)
+# ---------------------------------------------------------------------------
+
+
+def test_commitment_fw10_additivity_only_named_fields_added():
+    """FW-10 additivity: exactly the two named fields were added to the
+    frozen Commitment field set — target_kind (default "any") and verb
+    (default None). Nothing removed or renamed; extra fields still
+    forbidden."""
+    assert set(Commitment.model_fields) == {
+        "domain", "target", "deadline_turn", "target_kind", "verb"}
+    assert Commitment.model_fields["target_kind"].default == "any"
+    assert Commitment.model_fields["verb"].default is None
+    assert COMMITMENT_TARGET_KINDS == (
+        "tech", "production", "unit", "city", "player", "tile", "any")
+    # unknown kinds and unknown fields are still schema errors
+    with pytest.raises(ValidationError):
+        Commitment(domain="research", target="Pottery", deadline_turn=5,
+                   target_kind="banana")
+    with pytest.raises(ValidationError):
+        Commitment(domain="research", target="Pottery", deadline_turn=5,
+                   bogus=1)
+
+
+def test_commitment_fw10_legacy_payload_loads_with_legacy_defaults():
+    """FW-10 legacy fallback: a pre-addendum payload (the old field shape,
+    no target_kind/verb) loads unchanged and lands on the documented
+    legacy defaults — kind "any", verb None."""
+    payload = {"domain": "research", "target": "Pottery", "deadline_turn": 9}
+    c = Commitment.model_validate(payload)
+    assert (c.domain, c.target, c.deadline_turn) == ("research", "Pottery", 9)
+    assert c.target_kind == "any"
+    assert c.verb is None
+    # the legacy shape also round-trips through the frozen transcript union
+    rec = CommitmentRecord(turn=1, commitments=[payload], threats=[],
+                           call_seq=None)
+    loaded = rec.commitments[0]
+    assert (loaded.target_kind, loaded.verb) == ("any", None)
+    adapter = TypeAdapter(TranscriptRecord)
+    parsed = adapter.validate_python(
+        {"seq": 1, "ts": "2026-10-24T12:00:00Z", "checksum": "x",
+         "kind": "commitment", "turn": 1, "commitments": [payload],
+         "threats": [], "call_seq": None})
+    assert parsed.commitments[0].target_kind == "any"
+
+
+def test_commitment_fw10_typed_target_and_verb_roundtrip():
+    """FW-10: typed targets + verb validate, round-trip through the dump,
+    and ride both the ActionBatch and memory_update commitment lists."""
+    c = Commitment(domain="military", target_kind="unit", target="unit:7",
+                   verb="attack", deadline_turn=12)
+    assert (c.target_kind, c.target, c.verb) == ("unit", "unit:7", "attack")
+    dumped = c.model_dump()
+    assert dumped["target_kind"] == "unit" and dumped["verb"] == "attack"
+    batch = ActionBatch(
+        turn_id="run1/t1", actions=[],
+        commitments=[{"domain": "research", "target_kind": "tech",
+                      "target": "Pottery", "verb": "research",
+                      "deadline_turn": 5}],
+        memory_update={"commitments": [dumped]})
+    assert batch.commitments[0].target_kind == "tech"
+    assert batch.commitments[0].verb == "research"
+    assert batch.memory_update.commitments[0].verb == "attack"
+    # the "*" wildcard target is retained on every kind
+    for kind in COMMITMENT_TARGET_KINDS:
+        assert Commitment(domain="other", target_kind=kind, target="*",
+                          deadline_turn=3).target == "*"

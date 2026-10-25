@@ -13,6 +13,8 @@ the exact fields each metric reads.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -228,3 +230,44 @@ def test_run_manifest_field_set_is_the_decision_8_list():
                            seeds={"mapseed": 1, "gameseed": 1, "agentseed": 1})
     record = RunManifestRecord(manifest=manifest)
     assert record.manifest.model_id == "mistral-large-4"
+
+
+# ---------------------------------------------------------------------------
+# FW-10 dated additive amendment (2026-10-24): the schema-coverage addendum
+# ---------------------------------------------------------------------------
+
+FW10_ADDENDUM = (Path(__file__).parents[1] / "artifacts" / "runs" /
+                 "wp2-schema-coverage" / "2026-10-24-verb-typed-targets" /
+                 "addendum.md")
+
+
+def test_fw10_dated_schema_coverage_addendum_exists():
+    """FW-10: the dated additive-amendment addendum artifact exists next to
+    the frozen coverage check (artifacts/ is gitignored; the addendum is
+    committed with git add -f in a separate evidence-only commit)."""
+    assert FW10_ADDENDUM.is_file(), f"missing addendum: {FW10_ADDENDUM}"
+    text = FW10_ADDENDUM.read_text(encoding="utf-8")
+    # the addendum records the additive change, the verb grammar, and the
+    # legacy fallback
+    for needle in ("target_kind", "verb", "additive", "legacy",
+                   "exact", "wildcard"):
+        assert needle in text, f"addendum missing {needle!r}"
+
+
+def test_fw10_commitment_amendment_is_additive_over_the_freeze():
+    """FW-10: the frozen record kinds are untouched and the Commitment
+    amendment adds exactly the two named fields (the freeze test above
+    still passes; this pins the amendment's field set)."""
+    from lechonk.core.schemas import Commitment
+    assert set(Commitment.model_fields) == {
+        "domain", "target", "deadline_turn", "target_kind", "verb"}
+    # a frozen-union commitment record with the legacy payload still parses
+    record = _ADAPTER.validate_python(
+        {"seq": 1, "ts": "2026-10-24T12:00:00Z", "checksum": "x",
+         "kind": "commitment", "turn": 4,
+         "commitments": [{"domain": "research", "target": "Pottery",
+                          "deadline_turn": 9}],
+         "threats": [], "call_seq": 3})
+    assert isinstance(record, CommitmentRecord)
+    assert record.commitments[0].target_kind == "any"
+    assert record.commitments[0].verb is None

@@ -41,7 +41,8 @@ PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 # them on the variable sections as defense-in-depth.
 MEMORY_TOKEN_BUDGET = 1500
 
-SYSTEM_PROMPT = "system_v2"
+SYSTEM_PROMPT = "system_v3"  # FW-10: v3 documents the typed commitment
+# grammar (target_kind + verb vocabulary); v1/v2 retained on disk for history
 TURN_PREFIX = "turn_prefix_v2"
 REPAIR_SCHEMA_ERROR = "repair_schema_error_v1"
 REPAIR_STATE_FOG_ERROR = "repair_state_fog_error_v1"

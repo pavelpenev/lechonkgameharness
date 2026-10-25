@@ -54,8 +54,9 @@ from lechonk.model.prompts import (
 # records these (decision 8); editing a template without bumping its version
 # and these constants is a test failure by design.
 # system_v1/turn_prefix_v1 are retained on disk for history (the WP2
-# truncation evidence, 8/17 length-capped calls, ran on v1); the live
-# registry points at the v2 templates with the brevity discipline (F1).
+# truncation evidence, 8/17 length-capped calls, ran on v1); system_v2 is
+# retained for history (the brevity discipline, F1, ran on v2); the live
+# registry points at the v3 system prompt (FW-10: typed commitment grammar).
 RECORDED_HASHES = {
     "system_v1":
         "sha256:28d1e070592b0fcc4fb92a85b87d5caf725dc14548f977e3767bf675a4f6cdd4",
@@ -63,6 +64,8 @@ RECORDED_HASHES = {
         "sha256:6605991d15db3560d448c8179dda10d4d428e16ffd74b9fdb83ef13aaded368f",
     "system_v2":
         "sha256:c6b059013fa5b04a09b1def3233c743517888fb19980fd04d2b5fed4b94b2075",
+    "system_v3":
+        "sha256:e549096dd6b3dec92aa12fd71588930dd3d4687a59aabb9da0887afcad1dd46b",
     "turn_prefix_v2":
         "sha256:c5ef73e490dc422fcb5e57c40c1420c183cc50db325c6a109bbebf250fa07a51",
     "repair_schema_error_v1":
@@ -185,6 +188,39 @@ def test_system_prompt_brevity_discipline():
     assert "memory_update" in text and "compact" in text
     assert "SNAPSHOT" in text and "DELTA" in text  # no restating them
     assert "filler" in text
+
+
+def test_system_prompt_v3_typed_commitment_grammar():
+    """FW-10: the live system prompt is v3 and documents the typed
+    commitment grammar — the target_kind vocabulary with the canonical
+    target forms, the exact-match rule, and the verb vocabulary with the
+    commitment-verb -> action-verb compatibility mapping."""
+    assert prompts.SYSTEM_PROMPT == "system_v3"
+    assert SYSTEM_PROMPT == "system_v3"
+    text = system_prompt()
+    # the typed grammar fields
+    assert "target_kind" in text and "deadline_turn" in text
+    assert "Commitment grammar (v3, typed targets)" in text
+    # the target_kind vocabulary
+    for kind in ("tech", "production", "unit", "city", "player", "tile",
+                 "any"):
+        assert kind in text
+    # the canonical typed target forms (the runner's action-side forms)
+    for form in ('"unit:<id>"', '"city:<id>"', '"player:<id>"',
+                 '"tile:<x>,<y>"'):
+        assert form in text
+    assert '"*" as the target is the wildcard' in text
+    # exact matching, no substring
+    assert "EXACT match" in text and "partial names never match" in text
+    # the verb vocabulary + the compatibility mapping
+    for verb in ("research", "build", "attack", "move", "negotiate",
+                 "defend"):
+        assert verb in text
+    for action_verb in ("research_*", "build_city", "produce_*",
+                        "build_road", "irrigation", "mine", "attack_*",
+                        "goto_*", "stop_negotiation", "cancel_treaty",
+                        "accept_treaty", "fortify", "sentry"):
+        assert action_verb in text
 
 
 def test_turn_prefix_brevity_discipline():

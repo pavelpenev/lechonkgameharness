@@ -22,17 +22,19 @@ ledger-only — no free-text parsing anywhere):
   domains are n/a. Engine-automatic resolutions are counted (they are
   executed decisions), never hidden.
 - commitment follow-through: commitments are the structured objects the
-  model emits (domain, target, deadline turn), de-duplicated per
-  (target, domain) — first emission wins. Denominator = commitments whose
-  deadline falls inside the run [first_turn, last_turn]; censored-at-horizon
-  commitments are excluded, not failed. A commitment is fulfilled by a
-  ledger-verified matching EXECUTED action (same domain + registered
-  target + compatible verb) with turn ≤ deadline. Two shares: intent
-  realized by any policy (fulfilled_any), and model-attributed
+  model emits (domain, target kind, target, optional verb, deadline turn),
+  de-duplicated per (target, domain) — first emission wins. Denominator =
+  commitments whose deadline falls inside the run [first_turn, last_turn];
+  censored-at-horizon commitments are excluded, not failed. A commitment
+  is fulfilled by a ledger-verified matching EXECUTED action (same domain +
+  registered target + compatible verb) with turn ≤ deadline. Two shares:
+  intent realized by any policy (fulfilled_any), and model-attributed
   (fulfilled_model: the fulfilling action's provenance is model, or
   continued_model_order whose ORIGIN action is model-class and itself
   matches the commitment) — a scripted default realizing the promise is
-  never credited as model follow-through.
+  never credited as model follow-through. Target matching is kind-aware
+  exact equality (FW-10, 2026-10-24 — no substring in either direction;
+  legacy free-text targets match by exact equality only).
 - reason-but-don't-act: threat = an opponent/barbarian entity referenced
   in the model's structured output fields (entity IDs — no free-text
   parsing), de-duplicated per (entity, turn). acted = a ledger action
@@ -167,18 +169,36 @@ def _norm(text: Optional[str]) -> str:
     return (text or "").strip().lower()
 
 
-def _target_match(action_target: Optional[str], commitment_target: str) -> bool:
-    """Registered-target matching (§3 line 40): exact (case-insensitive),
-    "*" wildcard, or substring in either direction — deterministic and
-    documented; the commitment grammar's targets are the model's own
-    structured strings."""
-    want = _norm(commitment_target)
+def _target_match(action: ActionResultRecord, commitment: Commitment) -> bool:
+    """Kind-aware exact target matching (§3 line 40; FW-10 dated addendum
+    2026-10-24-verb-typed-targets): the ``"*"`` target is the wildcard and
+    matches any action target; otherwise the normalized strings must be
+    EQUAL — no substring in either direction. Typed kinds additionally
+    require the action-side descriptor family to agree: ``tile``/``unit``/
+    ``city``/``player`` targets are the ``"tile:x,y"`` / ``"unit:<id>"`` /
+    ``"city:<id>"`` / ``"player:<id>"`` descriptors (the forms
+    runner._describe emits), and ``tech``/``production`` targets are names
+    matched against actions of the corresponding domain (tech research /
+    city ``produce_*``). Legacy free-text targets (kind ``"any"``,
+    pre-addendum records) match by exact normalized equality only."""
+    want = _norm(commitment.target)
     if want == "*":
         return True
-    if action_target is None:
+    if action.target is None:
         return False
-    have = _norm(action_target)
-    return have == want or want in have or have in want
+    have = _norm(action.target)
+    if have != want:
+        return False
+    kind = commitment.target_kind
+    if kind == "any":
+        return True
+    if kind in ("tile", "unit", "city", "player"):
+        return have.startswith(f"{kind}:")
+    if kind == "tech":
+        return action.domain == "tech"
+    if kind == "production":
+        return action.domain == "city" and action.verb.startswith("produce_")
+    return False
 
 
 def _chebyshev(ax: int, ay: int, bx: int, by: int) -> int:
@@ -305,11 +325,11 @@ def _is_attempt(rec: ActionResultRecord) -> bool:
 def _commitment_matches(action: ActionResultRecord, c: Commitment) -> bool:
     """The frozen commitment-matching predicate (§3 line 40): the action's
     metric domain is compatible with the commitment's domain and its
-    registered target matches."""
+    registered target matches (kind-aware exact equality, FW-10)."""
     md = _action_metric_domain(action)
     if md not in _COMMITMENT_DOMAIN_MAP.get(c.domain, frozenset()):
         return False
-    return _target_match(action.target, c.target)
+    return _target_match(action, c)
 
 
 def _commitment_fulfills_model(action: ActionResultRecord, c: Commitment,

@@ -397,3 +397,174 @@ def test_commitment_board_continued_model_order_credit(tmp_path):
     assert board[0]["fulfilled_model_by"] == ["unit:10:attack_n"]
     assert board[0]["fulfilled_model_by_count"] == 2
     assert board[0]["fulfilled_by_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# FW-10: typed commitment targets + the additive verb field
+# (dated addendum artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/)
+# ---------------------------------------------------------------------------
+
+
+def _fw10_action(*, turn, domain, verb, target, ref=None):
+    from lechonk.core.schemas import ActionResultRecord
+    return ActionResultRecord(
+        turn=turn, ref=ref or f"{domain}:actor:{verb}", domain=domain,
+        verb=verb, target=target, outcome="executed",
+        provenance_class="model", readback="verified", detail="")
+
+
+def _fw10_board(commitment, action):
+    """One commitment (turn 1, deadline 2) + one executed action (turn 2)
+    over turns [1, 2]; returns the commitment board entry."""
+    from lechonk.core.metrics import commitment_board
+    from lechonk.core.schemas import CommitmentRecord, TurnStartRecord
+    records = [
+        TurnStartRecord(turn=1),
+        TurnStartRecord(turn=2),
+        CommitmentRecord(turn=1, commitments=[commitment], threats=[],
+                         call_seq=None),
+        action,
+    ]
+    board = commitment_board(records)
+    assert len(board) == 1
+    return board[0]
+
+
+def test_fw10_legacy_commitment_payload_loads_and_matches(tmp_path):
+    """FW-10 acceptance: a legacy Commitment payload (the old field shape,
+    no target_kind/verb) loads through the real ledger + frozen union and
+    matches by the documented legacy rule (kind "any", exact normalized
+    equality)."""
+    from lechonk.core.ledger import TranscriptLedger, load_transcript
+    from lechonk.core.metrics import commitment_board
+    from lechonk.core.schemas import (
+        ActionResultRecord,
+        CommitmentRecord,
+        TurnStartRecord,
+    )
+    path = tmp_path / "transcript.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(TurnStartRecord(turn=2))
+    # the pre-addendum field shape, exactly
+    ledger.append(CommitmentRecord(
+        turn=1,
+        commitments=[{"domain": "research", "target": "Pottery",
+                      "deadline_turn": 2}],
+        threats=[], call_seq=None))
+    ledger.append(ActionResultRecord(
+        turn=2, ref="tech:player:research_tech_pottery_1", domain="tech",
+        verb="research_tech_pottery_1", target="Pottery", outcome="executed",
+        provenance_class="model", readback="verified", detail=""))
+    ledger.close()
+    records = load_transcript(path).records
+    commitment = [r for r in records
+                  if isinstance(r, CommitmentRecord)][0].commitments[0]
+    # legacy defaults: kind "any", verb None
+    assert commitment.target_kind == "any"
+    assert commitment.verb is None
+    # matches by the legacy rule: exact normalized equality
+    report = compute_metrics(records)
+    assert report.commitment_followthrough_any.numerator == 1
+    assert report.commitment_followthrough_any.denominator == 1
+    assert report.commitment_followthrough_model.numerator == 1
+    board = commitment_board(records)
+    assert board[0]["status"] == "fulfilled_model"
+
+
+def test_fw10_legacy_free_text_target_matches_exact_only():
+    """FW-10 legacy rule: a free-text target (kind "any") matches by exact
+    normalized equality — the old bidirectional substring match is gone in
+    both directions, while case/whitespace normalization is retained."""
+    from lechonk.core.schemas import Commitment
+    action = _fw10_action(turn=2, domain="tech",
+                          verb="research_tech_pottery_1", target="Pottery")
+    # exact (normalized) -> fulfilled
+    entry = _fw10_board(
+        Commitment(domain="research", target=" pottery ", deadline_turn=2),
+        action)
+    assert entry["status"] == "fulfilled_model"
+    # substring (commitment shorter than the action target) -> missed
+    entry = _fw10_board(
+        Commitment(domain="research", target="Pott", deadline_turn=2),
+        action)
+    assert entry["status"] == "missed"
+    # substring (commitment longer than the action target) -> missed
+    entry = _fw10_board(
+        Commitment(domain="research", target="Pottery glaze",
+                   deadline_turn=2),
+        action)
+    assert entry["status"] == "missed"
+
+
+def test_fw10_wildcard_target_matches_any_action():
+    """The "*" wildcard is retained and matches any action target, on the
+    legacy kind and on typed kinds alike."""
+    from lechonk.core.schemas import Commitment
+    action = _fw10_action(turn=2, domain="tech",
+                          verb="research_tech_pottery_1", target="Pottery")
+    for kind in ("any", "tile", "unit"):
+        entry = _fw10_board(
+            Commitment(domain="other", target_kind=kind, target="*",
+                       deadline_turn=2),
+            action)
+        assert entry["status"] == "fulfilled_model", kind
+
+
+def test_fw10_typed_target_kinds_are_kind_aware():
+    """Typed targets match by exact equality AND the action-side descriptor
+    family must agree: name kinds bind to the corresponding action domain,
+    descriptor kinds to the typed descriptor form."""
+    from lechonk.core.schemas import Commitment
+    produce = _fw10_action(turn=2, domain="city", verb="produce_warriors",
+                           target="Warriors",
+                           ref="city:3:produce_warriors")
+    research = _fw10_action(turn=2, domain="tech",
+                            verb="research_tech_warriors_0",
+                            target="Warriors",
+                            ref="tech:player:research_tech_warriors_0")
+    # kind "tech" binds to research actions, not produce actions
+    entry = _fw10_board(
+        Commitment(domain="other", target_kind="tech", target="Warriors",
+                   deadline_turn=2), produce)
+    assert entry["status"] == "missed"
+    entry = _fw10_board(
+        Commitment(domain="other", target_kind="tech", target="Warriors",
+                   deadline_turn=2), research)
+    assert entry["status"] == "fulfilled_model"
+    # kind "production" binds to produce_* actions
+    entry = _fw10_board(
+        Commitment(domain="production", target_kind="production",
+                   target="Warriors", deadline_turn=2), produce)
+    assert entry["status"] == "fulfilled_model"
+    # descriptor kinds match the typed descriptor forms
+    fortify = _fw10_action(turn=2, domain="unit", verb="fortify",
+                           target="unit:7", ref="unit:7:fortify")
+    entry = _fw10_board(
+        Commitment(domain="military", target_kind="unit", target="unit:7",
+                   verb="defend", deadline_turn=2), fortify)
+    assert entry["status"] == "fulfilled_model"
+    build = _fw10_action(turn=2, domain="unit", verb="build_city",
+                         target="tile:2,1", ref="unit:7:build_city")
+    entry = _fw10_board(
+        Commitment(domain="expansion", target_kind="tile",
+                   target="tile:2,1", verb="build", deadline_turn=2), build)
+    assert entry["status"] == "fulfilled_model"
+    negotiate = _fw10_action(turn=2, domain="dipl", verb="stop_negotiation",
+                             target="player:2", ref="dipl:2:stop_negotiation")
+    entry = _fw10_board(
+        Commitment(domain="diplomacy", target_kind="player",
+                   target="player:2", verb="negotiate", deadline_turn=2),
+        negotiate)
+    assert entry["status"] == "fulfilled_model"
+    buy = _fw10_action(turn=2, domain="city", verb="city_buy_production",
+                       target="city:3", ref="city:3:city_buy_production")
+    entry = _fw10_board(
+        Commitment(domain="other", target_kind="city", target="city:3",
+                   verb="build", deadline_turn=2), buy)
+    assert entry["status"] == "fulfilled_model"
+    # exact string equality alone is NOT enough: the family must agree
+    entry = _fw10_board(
+        Commitment(domain="military", target_kind="tile", target="unit:7",
+                   deadline_turn=2), fortify)
+    assert entry["status"] == "missed"
