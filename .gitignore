@@ -1,0 +1,19 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+
+# Run artifacts (per-run evidence, never tracked)
+artifacts/
+logs/
+recordings/
+game_scores/
+geckodriver.log

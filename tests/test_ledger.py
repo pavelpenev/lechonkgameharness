@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: MIT
+"""Ledger tests (WP2): append-only JSONL transcript durability (§3 line 34).
+
+- one checksummed record per line; the ledger assigns seq/ts/checksum and
+  re-validates the finalized record against the frozen union;
+- fsync at the durability boundaries (durable=True appends + the explicit
+  intent-before-write fsync);
+- a simulated mid-write kill leaves a trailing partial record, which is
+  DISCARDED on load (never silently truncated mid-file: corruption before
+  the trailing record raises);
+- TranscriptLedger.attach recovers a transcript and resumes the seq.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+from lechonk.core.ledger import (
+    LedgerCorruptionError,
+    TranscriptLedger,
+    canonical_json,
+    compute_checksum,
+    load_transcript,
+)
+from lechonk.core.schemas import (
+    ActionResultRecord,
+    MetricEventRecord,
+    OutcomeRecord,
+    TurnStartRecord,
+)
+
+
+def _action(turn: int = 1, **kwargs) -> ActionResultRecord:
+    fields = dict(turn=turn, ref="unit:7:goto_n", domain="unit", verb="goto_n",
+                  outcome="executed", provenance_class="model",
+                  readback="verified")
+    fields.update(kwargs)
+    return ActionResultRecord(**fields)
+
+
+# ---------------------------------------------------------------------------
+# append + checksum
+# ---------------------------------------------------------------------------
+
+
+def test_append_assigns_seq_ts_checksum_and_validates(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    seq0 = ledger.append(TurnStartRecord(turn=1))
+    seq1 = ledger.append(_action())
+    ledger.close()
+    assert (seq0, seq1) == (0, 1)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    rec0, rec1 = (json.loads(line) for line in lines)
+    assert rec0["seq"] == 0 and rec0["ts"] and rec0["checksum"]
+    assert rec1["seq"] == 1
+    # The checksum covers the canonical JSON of the record minus itself.
+    assert rec1["checksum"] == compute_checksum(
+        {k: v for k, v in rec1.items() if k != "checksum"})
+    # Round-trip through the frozen union.
+    load = load_transcript(path)
+    assert not load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+    assert isinstance(load.records[1], ActionResultRecord)
+
+
+def test_checksum_is_order_independent_and_canonical():
+    rec = {"kind": "turn_start", "turn": 3, "seq": 0, "ts": "x", "checksum": ""}
+    a = compute_checksum(rec)
+    b = compute_checksum({"turn": 3, "kind": "turn_start", "ts": "x",
+                          "seq": 0, "checksum": ""})
+    assert a == b  # canonical JSON: sorted keys
+    assert a != compute_checksum({**rec, "turn": 4})
+
+
+def test_append_rejects_records_outside_the_frozen_union(tmp_path):
+    ledger = TranscriptLedger(tmp_path / "t.jsonl")
+    with pytest.raises(Exception):
+        ledger.append(MetricEventRecord(name="n", value="v", bogus=1))
+    ledger.close()
+
+
+def test_append_after_close_raises(tmp_path):
+    ledger = TranscriptLedger(tmp_path / "t.jsonl")
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.close()
+    with pytest.raises(RuntimeError):
+        ledger.append(TurnStartRecord(turn=2))
+
+
+# ---------------------------------------------------------------------------
+# durability boundaries (§3 line 34)
+# ---------------------------------------------------------------------------
+
+
+def test_durable_appends_and_fsync_call_os_fsync(tmp_path, monkeypatch):
+    calls = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    ledger = TranscriptLedger(tmp_path / "t.jsonl")
+    ledger.append(TurnStartRecord(turn=1))            # buffered
+    assert calls == []
+    ledger.fsync()                                     # intent-before-write
+    assert len(calls) == 1
+    ledger.append(_action(), durable=True)             # action boundary
+    assert len(calls) == 2
+    ledger.append(OutcomeRecord(outcome="COMPLETED"), durable=True)
+    assert len(calls) == 3
+    ledger.close()                                     # close fsyncs too
+    assert len(calls) == 4
+
+
+def test_last_event_tracks_the_injected_clock(tmp_path):
+    ticks = [1000.0]
+    ledger = TranscriptLedger(tmp_path / "t.jsonl", clock=lambda: ticks[0])
+    assert ledger.last_event == 1000.0
+    ledger.append(TurnStartRecord(turn=1))
+    assert ledger.last_event == 1000.0
+    ticks[0] = 1600.0  # the stall watchdog reads last_event
+    ledger.append(TurnStartRecord(turn=2))
+    assert ledger.last_event == 1600.0
+    ledger.close()
+
+
+# ---------------------------------------------------------------------------
+# trailing partial record: the simulated mid-write kill (§3 line 34)
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_partial_record_is_discarded(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_action(), durable=True)
+    ledger.close()
+    good_bytes = path.read_bytes()
+
+    # Simulate a kill mid-write: torn bytes after the last newline.
+    with open(path, "ab") as fh:
+        fh.write(b'{"kind":"action_result","turn":2,"ref":"unit:7:g')  # torn
+    load = load_transcript(path)
+    assert load.discarded_trailing_partial
+    assert load.discarded_bytes > 0
+    assert [r.seq for r in load.records] == [0, 1]  # prior records intact
+
+    # A torn FINAL newline-terminated line (killed before the fsync) is
+    # also a trailing partial.
+    path2 = tmp_path / "t2.jsonl"
+    path2.write_bytes(good_bytes + b'{"kind":"turn_start","turn":3,"seq":2\n')
+    load = load_transcript(path2)
+    assert load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+
+    # A COMPLETE unterminated line (valid JSON + checksum) is accepted.
+    complete = json.loads(good_bytes.splitlines()[0])
+    path3 = tmp_path / "t3.jsonl"
+    path3.write_bytes(good_bytes + canonical_json(complete).encode("utf-8"))
+    load = load_transcript(path3)
+    assert not load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1, 0]
+
+
+def test_corruption_before_the_trailing_record_raises(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(TurnStartRecord(turn=2))
+    ledger.append(TurnStartRecord(turn=3))
+    ledger.close()
+    lines = path.read_bytes().splitlines(keepends=True)
+    lines[0] = b'{"kind":"turn_start","turn":1,"seq":0,"ts":"x","checksum":"bad"}\n'
+    path.write_bytes(b"".join(lines))
+    with pytest.raises(LedgerCorruptionError):
+        load_transcript(path)
+
+
+def test_attach_recovers_and_resumes_seq(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_action(), durable=True)
+    ledger.close()
+    with open(path, "ab") as fh:
+        fh.write(b'{"kind":"action_res')  # torn trailing write
+
+    recovered = TranscriptLedger.attach(path)
+    assert recovered.next_seq == 2  # resumes after the last valid record
+    # The torn trailing record was truncated out of the FILE (not just the
+    # load view): the next append lands right after the last valid line.
+    seq = recovered.append(TurnStartRecord(turn=2), durable=True)
+    assert seq == 2
+    recovered.close()
+    load = load_transcript(path)
+    assert not load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1, 2]
+
+
+def test_load_missing_or_empty_file(tmp_path):
+    load = load_transcript(tmp_path / "missing.jsonl")
+    assert load.records == [] and not load.discarded_trailing_partial
+    empty = tmp_path / "empty.jsonl"
+    empty.write_bytes(b"")
+    load = load_transcript(empty)
+    assert load.records == []

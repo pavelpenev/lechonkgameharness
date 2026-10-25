@@ -1,0 +1,14 @@
+Your previous output was rejected as a SCHEMA ERROR and did not count as a
+turn decision. $error_detail
+
+Re-emit a conforming ActionBatch:
+- exactly one JSON object, no prose, no markdown fences;
+- every action is {"ref": "<candidate_id>"} with the ID copied EXACTLY from
+  the candidate table — actions must be candidate IDs, never raw coordinates
+  or free-text moves;
+- at most 20 actions; commitments keep the {domain, target, deadline_turn}
+  grammar; include memory_update as before.
+
+The full candidate table is re-attached below. Pick from it.
+
+$refreshed_candidates

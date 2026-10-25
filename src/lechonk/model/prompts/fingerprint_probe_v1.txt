@@ -1,0 +1,2 @@
+Respond with exactly this string and nothing else:
+LECHONK-FINGERPRINT-7f3a91c2

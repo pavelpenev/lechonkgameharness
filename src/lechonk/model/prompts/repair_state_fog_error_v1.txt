@@ -1,0 +1,13 @@
+Your previous output was rejected as a STATE-FOG ERROR: the game state changed
+and the following references are no longer valid candidates:
+$failed_refs
+
+$error_detail
+
+The state changed under you — a vanished unit is not destroyed, and a
+candidate that was legal when enumerated may be gone now. Here are the
+REFRESHED candidates for the failed references; re-emit an ActionBatch using
+only IDs from this refreshed list (other actions from your previous batch may
+be kept only if their IDs still appear):
+
+$refreshed_candidates

@@ -1,0 +1,3 @@
+[submodule "vendor/civrealm"]
+	path = vendor/civrealm
+	url = https://github.com/pavelpenev/civrealm.git

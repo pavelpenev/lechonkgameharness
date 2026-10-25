@@ -1,0 +1,12 @@
+Your previous output was rejected as ILLEGAL-IN-RULE: this candidate became
+illegal between enumeration and execution:
+$failed_refs
+
+$error_detail
+
+The candidate existed but the rules no longer allow it (the actor ran out of
+moves, the city changed production, the tech finished, the treaty state
+changed). Here is the refreshed list; re-emit an ActionBatch with a legal
+replacement or drop the action:
+
+$refreshed_candidates
