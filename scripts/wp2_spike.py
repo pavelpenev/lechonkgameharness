@@ -23,6 +23,7 @@ FAILED (model id or json_schema unsupported — no silent substitution, model
 dependent work stops); 3 = blocked (key absent), offline mock evidence
 recorded.
 """
+import inspect
 import json
 import os
 import sys
@@ -37,12 +38,15 @@ RUNDIR = os.path.join(REPO, 'artifacts', 'runs', 'wp2-spike')
 os.makedirs(RUNDIR, exist_ok=True)
 
 LOG_PATH = os.path.join(RUNDIR, 'wp2_spike_stdout.log')
-_log_file = open(LOG_PATH, 'a', encoding='utf-8')
+_log_file = None
 
 
 def log(msg):
     """Print to stdout AND persist to the run log (HANDOFF: persist run
     stdout/logs as artifacts under artifacts/runs/)."""
+    global _log_file
+    if _log_file is None:
+        _log_file = open(LOG_PATH, 'a', encoding='utf-8')
     line = f'[{datetime.now(timezone.utc).isoformat(timespec="seconds")}] {msg}'
     print(line, flush=True)
     _log_file.write(line + '\n')
@@ -129,12 +133,14 @@ def offline_mock_verification():
         calls: list = field(default_factory=list)
 
         def complete(self, *, messages, model, temperature, max_tokens,
-                     response_format, random_seed):
+                     response_format, random_seed, reasoning_effort=None,
+                     n=None, timeout_ms=None,
+                     disable_transport_retries=False):
             self.calls.append({
                 'messages': messages, 'model': model,
                 'temperature': temperature, 'max_tokens': max_tokens,
                 'response_format': response_format,
-                'random_seed': random_seed,
+                'reasoning_effort': reasoning_effort, 'n': n,
             })
             outcome = self.outcomes.pop(0)
             if isinstance(outcome, Exception):
@@ -171,7 +177,10 @@ def offline_mock_verification():
         and t.calls[0]['response_format'] == {'type': 'json_object'})
 
     # 2. json_schema path: strict structured-output request with the real
-    #    ActionBatch schema (candidate-ID-constrained refs)
+    #    ActionBatch schema (candidate-ID-constrained refs). Pydantic's
+    #    JSON-schema export renders the ref pattern in ECMA flavor
+    #    (\Z -> \z), so the conjunct compares the ECMA-translated regex.
+    ecma_ref_pattern = CANDIDATE_ID_REGEX.replace('\\Z', '\\z')
     t = MockTransport(outcomes=[raw(valid_batch)])
     c = mc.MistralClient(api_key=canary, transport=t,
                          enforcement='json_schema')
@@ -185,7 +194,7 @@ def offline_mock_verification():
         and rf['json_schema']['strict'] is True
         and schema == mc.action_batch_json_schema()
         and schema['$defs']['ActionItem']['properties']['ref']['pattern']
-        == CANDIDATE_ID_REGEX)
+        == ecma_ref_pattern)
 
     # 3. attempt cap: garbage on both attempts -> AttemptBudgetExhausted,
     #    exactly 2 transport calls
@@ -244,8 +253,8 @@ def offline_mock_verification():
     blob = json.dumps([l.to_dict() for l in c.call_logs])
     checks['no_secret_in_logs'] = canary not in blob
 
-    # 7. fingerprint probe: deterministic under mock, temperature 0, fixed
-    #    prompt hash, output hash recorded
+    # 7. fingerprint probe: K=3 multi-sample, arm sampling (temperature
+    #    1.0, reasoning_effort "high", no top_p), set-encoded fingerprint
     t = MockTransport(outcomes=[raw('LECHONK-FINGERPRINT-7f3a91c2')])
     c = mc.MistralClient(api_key=canary, transport=t)
     p = c.probe_fingerprint()
@@ -254,9 +263,12 @@ def offline_mock_verification():
         b'LECHONK-FINGERPRINT-7f3a91c2').hexdigest()
     checks['fingerprint_probe_mock'] = (
         p.fingerprint == expected
-        and t.calls[0]['temperature'] == 0.0
-        and t.calls[0]['response_format'] is None
-        and p.prompt_hash == prompts.prompt_hash(prompts.FINGERPRINT_PROBE)
+        and t.calls[0]['temperature'] == 1.0
+        and t.calls[0]['reasoning_effort'] == 'high'
+        and t.calls[0]['n'] == mc.FINGERPRINT_PROBE_SAMPLES
+        and 'top_p' not in t.calls[0]
+        and p.prompt_hash == prompts.prompt_hash(
+            mc.FINGERPRINT_PROBE_PROMPT)
         and c.arm_fingerprint == expected)
 
     return {
@@ -387,5 +399,110 @@ def main():
     return 3
 
 
+def respike_main() -> int:
+    """FW-22 dated re-spike: re-run the P10a model-id probe, the P10b
+    json_schema support probe, and the K=3 fingerprint probe LIVE under the
+    new arm sampling (temperature 1.0, reasoning_effort "high", no top_p),
+    into a NEW dated dir artifacts/runs/wp2-spike/<execution-date>-respike/.
+    Existing artifacts are never touched; probe failures are reported,
+    never faked."""
+    global RUNDIR, LOG_PATH
+    execution_date = datetime.now().astimezone().date().isoformat()
+    outdir = os.path.join(REPO, 'artifacts', 'runs', 'wp2-spike',
+                          f'{execution_date}-respike')
+    os.makedirs(outdir, exist_ok=True)
+    RUNDIR = outdir
+    LOG_PATH = os.path.join(outdir, 'wp2_spike_stdout.log')
+
+    try:
+        client = mc.MistralClient()  # env key, exact pinned model id
+    except mc.MistralKeyError as exc:
+        write_json('respike_report.json', {
+            'probe': 'FW-22 re-spike',
+            'model_id': mc.MODEL_ID,
+            'execution_date': execution_date,
+            'verdict': 'blocked',
+            'blocker': {'kind': 'missing_evidence', 'detail': str(exc)},
+        })
+        log(f'respike blocked: {exc}')
+        return 4
+
+    p10a = client.probe_model_id()
+    p10b = client.probe_json_schema_support(probe_prompt=P10_PROBE_PROMPT)
+    fingerprint = client.probe_fingerprint()
+    probe_call_logs = [
+        {'call_id': l.call_id, 'kind': l.kind, 'temperature': l.temperature,
+         'reasoning_effort': l.reasoning_effort, 'tokens_in': l.tokens_in,
+         'tokens_out': l.tokens_out, 'tokens_total': l.tokens_total,
+         'latency_ms': l.latency_ms, 'finish_reason': l.finish_reason,
+         'model_requested': l.model_requested,
+         'model_responded': l.model_responded}
+        for l in client.call_logs]
+    try:
+        from mistralai.client.chat import Chat
+        sdk_chat_params = sorted(
+            inspect.signature(Chat.complete).parameters)
+    except Exception:
+        sdk_chat_params = None
+    supported = p10a.responded and p10b.json_schema_supported
+    report = {
+        'probe': 'FW-22 re-spike',
+        'model_id': mc.MODEL_ID,
+        'execution_date': execution_date,
+        'session_calendar_note': (
+            'the session calendar said 2026-10-24; the host date at '
+            f'execution ({execution_date}) is used'),
+        'sampling': {
+            'temperature': client.temperature,
+            'reasoning_effort': client.reasoning_effort,
+            'max_tokens_default': mc.DEFAULT_MAX_TOKENS,
+            'top_p_sent': False,
+            'transport_parameter_names': sorted(
+                inspect.signature(
+                    mc.MistralSDKTransport.complete).parameters),
+            'sdk_chat_parameter_names': sdk_chat_params,
+        },
+        'probes': {
+            'p10a_model_id': p10a.to_dict(),
+            'p10b_json_schema': p10b.to_dict(),
+            'fingerprint_k3': fingerprint.to_dict(),
+        },
+        'probe_call_logs': probe_call_logs,
+        'max_tokens_recheck': {
+            'scope_note': (
+                'probe-scale only: these are individual probe calls '
+                '(max_tokens 16 / 1024 / 1024), not full turns; a full '
+                'turn-scale finish_reason re-check requires a future live '
+                'run under the same arm sampling'),
+            'p10a_model_id': {
+                'finish_reason': p10a.finish_reason,
+                'tokens_in': None, 'tokens_out': None,
+            },
+            'p10b_json_schema': {
+                'finish_reason': p10b.response_shape.get('finish_reason'),
+                'tokens_in': None, 'tokens_out': None,
+            },
+            'fingerprint_k3': {
+                'finish_reason': fingerprint.finish_reason,
+                'tokens_in': fingerprint.tokens_in,
+                'tokens_out': fingerprint.tokens_out,
+                'tokens_total': fingerprint.tokens_total,
+                'sample_attempts': fingerprint.sample_attempts,
+                'sample_mode': fingerprint.sample_mode,
+                'output_hashes_unique': len(fingerprint.output_hashes),
+            },
+        },
+    }
+    write_json('respike_report.json', report)
+    log(f'respike verdict: '
+        f'{"decided_live" if supported else "live_probe_failed"}; '
+        f'p10a.responded={p10a.responded} '
+        f'p10b.json_schema_supported={p10b.json_schema_supported}')
+    _log_file.close()
+    return 0 if supported else 1
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'respike':
+        sys.exit(respike_main())
     sys.exit(main())
