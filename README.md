@@ -373,11 +373,14 @@ Upstream quirks with fog implications, disclosed:
   under a predeclared paired contract (equal observation format, candidate
   restrictions, action budgets, lifecycle handling — hashed and recorded in both arm
   manifests), run sequentially on an otherwise-idle machine.
-- **Model fingerprint:** every arm records a per-model fingerprint (fixed probe prompt,
-  deterministic sampling, recorded output hash) and arm-start timestamps —
+- **Model fingerprint:** every arm records a per-model fingerprint (fixed
+  capacity-revealing probe prompt, `fingerprint_probe_v2`; K=3 samples collected
+  under the arm's sampling — temperature 1.0, reasoning_effort high, no top_p;
+  the recorded fingerprint is the sorted, deduplicated set of the sample output
+  hashes) and arm-start timestamps —
   `mistral-large-4` is a public preview whose weights can drift under the same ID;
   the fingerprint is a canary (serving nondeterminism can false-positive; an unchanged
-  output does not prove unchanged weights). **Drift policy:** on a between-arm
+  sample set does not prove unchanged weights). **Drift policy:** on a between-arm
   mismatch, re-probe once; a persistent mismatch marks the pair drift-suspect —
   excluded from reproducibility claims, both arms still reported individually.
 - **Replay:** every run's append-only checksummed JSONL transcript renders into a

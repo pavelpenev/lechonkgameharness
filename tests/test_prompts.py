@@ -61,6 +61,9 @@ from lechonk.model.prompts import (
 # truncation evidence, 8/17 length-capped calls, ran on v1); system_v2 is
 # retained for history (the brevity discipline, F1, ran on v2); the live
 # registry points at the v3 system prompt (FW-10: typed commitment grammar).
+# fingerprint_probe_v1 is retained for history (the verbatim-echo probe);
+# the live registry points at the v2 capacity-revealing probe (FW-21) —
+# the fingerprint client (mistral_client) loads it directly.
 RECORDED_HASHES = {
     "system_v1":
         "sha256:28d1e070592b0fcc4fb92a85b87d5caf725dc14548f977e3767bf675a4f6cdd4",
@@ -80,6 +83,8 @@ RECORDED_HASHES = {
         "sha256:f99a1ff3730256c8f55efeb59cda0868ffb1271456143d666d9cbb292cf236ec",
     "fingerprint_probe_v1":
         "sha256:f1e5cf8937f94cabb84e0178debab9587cfa0d5f6ad7e12ad6012d010a3d05d1",
+    "fingerprint_probe_v2":
+        "sha256:29c72ee59512c80521b3d55975e3dd82e3ea624a4e186655649b968ef78035cb",
 }
 
 
@@ -395,7 +400,10 @@ def test_render_template_json_braces_are_literal():
 def test_fingerprint_probe_prompt_is_fixed():
     text = fingerprint_probe_prompt()
     assert text == load_prompt(FINGERPRINT_PROBE)
-    assert "LECHONK-FINGERPRINT-7f3a91c2" in text
+    # v2 (capacity-revealing) field labels — not the v1 verbatim echo, which
+    # is retained on disk for history (FW-21)
+    for label in ("MODEL:", "LAB:", "PRODUCT:", "CAPITAL:", "SEQ:"):
+        assert label in text
     # stable hash (recorded in the manifest)
     assert prompt_hash(FINGERPRINT_PROBE) == RECORDED_HASHES[FINGERPRINT_PROBE]
 

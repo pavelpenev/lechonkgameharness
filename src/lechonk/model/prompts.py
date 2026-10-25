@@ -81,7 +81,10 @@ TURN_PREFIX = "turn_prefix_v2"
 REPAIR_SCHEMA_ERROR = "repair_schema_error_v1"
 REPAIR_STATE_FOG_ERROR = "repair_state_fog_error_v1"
 REPAIR_ILLEGAL_IN_RULE = "repair_illegal_in_rule_v1"
-FINGERPRINT_PROBE = "fingerprint_probe_v1"
+# FW-21: v2 (capacity-revealing) is the live probe prompt — the fingerprint
+# client (mistral_client.FINGERPRINT_PROBE_PROMPT) loads it directly; the v1
+# verbatim-echo prompt is retained on disk for history
+FINGERPRINT_PROBE = "fingerprint_probe_v2"
 
 ALL_PROMPTS: tuple[str, ...] = (
     SYSTEM_PROMPT,
