@@ -89,7 +89,7 @@ MAX_REPAIRS_PER_TURN = 1
 # Per-logical-attempt wall-clock bound (the §3 ACTING deadline is 180 s; one
 # attempt must fit well inside it, leaving room for the repair attempt).
 DEFAULT_TIMEOUT_MS = 120_000
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_REASONING_EFFORT = "high"
 

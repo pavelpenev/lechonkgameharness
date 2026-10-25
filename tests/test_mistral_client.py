@@ -1083,6 +1083,15 @@ def test_default_arm_sampling_settings():
     assert mc.DEFAULT_REASONING_EFFORT == "high"
 
 
+def test_default_max_tokens_16384():
+    """FW-05b: the constructor default max_tokens is 16384 (FW-05 decision
+    record raised it from 8192; the turn path initial and repair attempts
+    both inherit the constant when no override is passed)."""
+    client = make_client(MockTransport())
+    assert client.max_tokens == 16384
+    assert mc.DEFAULT_MAX_TOKENS == 16384
+
+
 def test_every_call_path_carries_arm_sampling():
     """ALL call paths — the turn path (initial AND repair attempts) and
     every probe path (fingerprint, model-id, json-schema) — carry the arm
