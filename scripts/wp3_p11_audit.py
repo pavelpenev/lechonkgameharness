@@ -24,6 +24,14 @@ as a control when present):
 - no dangling uncertain mutations: every executed action_result with
   readback=inconclusive is followed by a mutation_reconciliation event
   for the same ref (settled, never left dangling);
+- pending dispatch intents (W3-1, D5/D15): a PURE scanner classifies
+  every dispatch_intent record — resolved (a correlated action_result
+  via the dispatch-result/v1 detail envelope), cancelled (a
+  mutation_dispatch_cancelled event — known not sent), or uncertain
+  (forensic only: a crash inside the dispatch window; the runner never
+  refuses or quarantines on it, D15). Transcripts without intents are
+  legacy. The scanner is audit-side ONLY: the runner never imports or
+  calls it;
 - provenance classes within the frozen set;
 - no takeover / bounded close / bounded outcome: cross-checked against
   the run's run_meta.json (player identity stable, username never
@@ -81,6 +89,150 @@ AUDIT_RUNS = [
 ]
 
 WALL_BOUND_S = 240.0
+
+# ---------------------------------------------------------------------------
+# W3-1 (D5/D15): the pure pending-intent scanner — audit-side ONLY
+# ---------------------------------------------------------------------------
+# The runner never imports or calls this module (D15: unresolved intents
+# are forensic evidence, never a runner refusal). The scanner is a pure
+# function over loaded transcript records: it pairs each dispatch_intent
+# with its correlation BY LEDGER SEQ (the dispatch-result/v1 detail
+# envelope carries the intent's seq — never positional (turn, ref)
+# matching, so a same-ref resend pairs with its OWN result).
+
+DISPATCH_INTENT_EVENT = "dispatch_intent"
+DISPATCH_CANCELLED_EVENT = "mutation_dispatch_cancelled"
+DISPATCH_INTENT_PROTOCOL = "dispatch-intent/v1"
+DISPATCH_CANCELLED_PROTOCOL = "dispatch-cancelled/v1"
+DISPATCH_RESULT_PROTOCOL = "dispatch-result/v1"
+
+INTENT_RESOLVED = "resolved"    # intent + its correlated action_result
+INTENT_CANCELLED = "cancelled"  # intent + its cancellation (known not sent)
+INTENT_UNCERTAIN = "uncertain"  # intent alone (forensic, D15)
+INTENT_STATUSES = (INTENT_RESOLVED, INTENT_CANCELLED, INTENT_UNCERTAIN)
+
+
+def _parse_json_object(text):
+    """Strictly parse a canonical-JSON payload string; None when the value
+    is not a JSON object (a legacy or corrupt payload)."""
+    if not isinstance(text, str):
+        return None
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_int_seq(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def parse_dispatch_intent(value):
+    """The dispatch-intent payload (dict), or None when the value does
+    not carry the dispatch-intent/v1 protocol."""
+    data = _parse_json_object(value)
+    if data is None or data.get("protocol") != DISPATCH_INTENT_PROTOCOL:
+        return None
+    return data
+
+
+def parse_dispatch_cancelled(value):
+    """The cancellation payload (dict), or None when the value does not
+    carry the dispatch-cancelled/v1 protocol."""
+    data = _parse_json_object(value)
+    if data is None or data.get("protocol") != DISPATCH_CANCELLED_PROTOCOL:
+        return None
+    return data
+
+
+def parse_dispatch_result_intent_seq(detail):
+    """The intent seq carried by an action_result's dispatch-result/v1
+    detail envelope, or None (legacy detail strings remain valid — they
+    simply carry no correlation)."""
+    data = _parse_json_object(detail)
+    if data is None or data.get("protocol") != DISPATCH_RESULT_PROTOCOL:
+        return None
+    seq = data.get("intent_seq")
+    return seq if _is_int_seq(seq) else None
+
+
+def scan_pending_intents(records):
+    """The PURE pending-intent scanner (W3-1, D5/D15) over loaded
+    transcript records.
+
+    Classification per dispatch_intent metric_event:
+    - intent + a correlated action_result (a dispatch-result/v1 detail
+      envelope with intent_seq == the intent's seq, at a HIGHER seq)
+      -> "resolved";
+    - intent + a cancellation event (a dispatch-cancelled/v1 payload with
+      intent_seq == the intent's seq, at a higher seq) -> "cancelled"
+      (known not sent);
+    - intent alone -> "uncertain" (forensic: the send may or may not have
+      gone out — a kill inside the dispatch window; D15: reported by this
+      audit, never refused by the runner).
+    A transcript with no dispatch_intent records at all is "legacy".
+
+    Returns the report dict:
+    {"legacy": bool,
+     "intents": [{"seq", "turn", "ref", "provenance_class", "status",
+                  "correlated_seq"}...],
+     "resolved_seqs": [...], "cancelled_seqs": [...],
+     "uncertain_seqs": [...]}
+    """
+    from lechonk.core.schemas import ActionResultRecord, MetricEventRecord
+
+    intent_seqs = set()
+    intent_events = []
+    cancellations = {}  # intent_seq -> cancellation event's seq
+    results = {}  # intent_seq -> correlated action_result's seq
+    for rec in records:
+        if isinstance(rec, MetricEventRecord):
+            if rec.name == DISPATCH_INTENT_EVENT:
+                intent_events.append(rec)
+                intent_seqs.add(rec.seq)
+            elif rec.name == DISPATCH_CANCELLED_EVENT:
+                payload = parse_dispatch_cancelled(rec.value)
+                if payload is None:
+                    continue
+                iseq = payload.get("intent_seq")
+                if _is_int_seq(iseq) and iseq in intent_seqs \
+                        and rec.seq > iseq:
+                    cancellations.setdefault(iseq, rec.seq)
+        elif isinstance(rec, ActionResultRecord):
+            iseq = parse_dispatch_result_intent_seq(rec.detail)
+            if iseq is not None and iseq in intent_seqs \
+                    and rec.seq > iseq:
+                results.setdefault(iseq, rec.seq)
+
+    entries = []
+    for rec in intent_events:
+        payload = parse_dispatch_intent(rec.value)
+        if rec.seq in cancellations:
+            status, correlated = INTENT_CANCELLED, cancellations[rec.seq]
+        elif rec.seq in results:
+            status, correlated = INTENT_RESOLVED, results[rec.seq]
+        else:
+            status, correlated = INTENT_UNCERTAIN, None
+        entries.append({
+            "seq": rec.seq,
+            "turn": payload.get("turn") if payload else None,
+            "ref": payload.get("ref") if payload else None,
+            "provenance_class": (payload.get("provenance_class")
+                                 if payload else None),
+            "status": status,
+            "correlated_seq": correlated,
+        })
+    return {
+        "legacy": not intent_events,
+        "intents": entries,
+        "resolved_seqs": [e["seq"] for e in entries
+                          if e["status"] == INTENT_RESOLVED],
+        "cancelled_seqs": [e["seq"] for e in entries
+                           if e["status"] == INTENT_CANCELLED],
+        "uncertain_seqs": [e["seq"] for e in entries
+                           if e["status"] == INTENT_UNCERTAIN],
+    }
 
 # Sentinel for AUDIT_RUNS: resolve the latest kill-test transcript at
 # audit time (the wp3-kill evidence root is frozen — the suite no longer
@@ -234,6 +386,18 @@ def audit_transcript(path) -> dict:
            else "every uncertain (inconclusive) execution was settled by a "
                 "mutation_reconciliation event"))
 
+    # --- pending dispatch intents (W3-1, D5/D15: forensic report) ------------
+    scan = scan_pending_intents(records)
+    check("pending_intents_disclosed",
+          all(e["status"] in INTENT_STATUSES for e in scan["intents"]),
+          (f"{len(scan['intents'])} dispatch intent(s): "
+           f"{len(scan['resolved_seqs'])} resolved, "
+           f"{len(scan['cancelled_seqs'])} cancelled (known not sent), "
+           f"{len(scan['uncertain_seqs'])} uncertain (forensic, D15 — the "
+           f"runner never refuses on them)"
+           if not scan["legacy"]
+           else "legacy transcript: no dispatch_intent records (pre-W3-1)"))
+
     return {
         "path": str(path),
         "records": len(records),
@@ -242,6 +406,7 @@ def audit_transcript(path) -> dict:
                     if isinstance(outcome_record, OutcomeRecord) else None),
         "executed_actions": len(executed),
         "repeat_executions": repeats,
+        "pending_intents": scan,
         "checks": checks,
         "verdict": ("PASS" if all(c["pass"] for c in checks.values())
                     else "FAIL"),

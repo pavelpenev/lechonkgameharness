@@ -641,3 +641,196 @@ def test_viewer_participation_curve_is_readback_gated_and_opportunity_intersecte
     # opportunities [1,2,2,3]: Y decreases as the value rises, so
     # cy[0] > cy[1] == cy[2] > cy[3].
     assert opp[0][1] > opp[1][1] == opp[2][1] > opp[3][1]
+
+
+# ---------------------------------------------------------------------------
+# W3-1: the viewer separates operational events from the aggregate
+# metrics table
+# ---------------------------------------------------------------------------
+
+
+def _build_w3_transcript(tmp_path: Path):
+    """A transcript carrying registered aggregate metric names
+    (participation, a parameterized domain_model_share:*,
+    illegal_attempts_total), operational protocol events
+    (state_transition, dispatch_intent, mutation_dispatch_cancelled,
+    prompt_budget_exceeded) and an unknown/legacy event name."""
+    path = tmp_path / "w3-transcript.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(RunManifestRecord(manifest=RunManifest(run_id="w3-run")))
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(MetricEventRecord(name="participation", value=1.0))
+    ledger.append(MetricEventRecord(name="domain_model_share:research",
+                                    value=0.5))
+    ledger.append(MetricEventRecord(name="illegal_attempts_total", value=0))
+    ledger.append(MetricEventRecord(name="state_transition",
+                                    value="STARTUP->ACTING"))
+    ledger.append(MetricEventRecord(
+        name="dispatch_intent",
+        value=('{"call_seq":2,"candidates_seq":3,'
+               '"provenance_class":"model","protocol":"dispatch-intent/v1",'
+               '"ref":"unit:10:goto_e","snapshot_seq":2,"turn":1}')))
+    ledger.append(MetricEventRecord(
+        name="mutation_dispatch_cancelled",
+        value=('{"call_seq":2,"candidates_seq":3,"intent_seq":4,'
+               '"provenance_class":"model",'
+               '"protocol":"dispatch-cancelled/v1",'
+               '"reason":"ACTING deadline reached","ref":"unit:10:goto_e",'
+               '"snapshot_seq":2,"turn":1}')))
+    ledger.append(MetricEventRecord(name="prompt_budget_exceeded",
+                                    value="turn 1: prompt over budget"))
+    ledger.append(MetricEventRecord(name="some_legacy_event",
+                                    value="an unknown/legacy name"))
+    ledger.append(OutcomeRecord(outcome="COMPLETED",
+                                reason="horizon reached"))
+    ledger.close()
+    return path
+
+
+# A minimal DOM shim + runner for the viewer's main script: it executes
+# the extracted JS under node with the embedded JSON blocks and dumps the
+# metrics panel's DOM tree (tags + text + children).
+_VIEWER_TABLES_DRIVER = r"""
+"use strict";
+const fs = require("fs");
+const blocks = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const script = fs.readFileSync(process.argv[3], "utf8");
+function makeEl(tag) {
+  const e = {
+    tagName: tag,
+    attributes: {},
+    children: [],
+    className: "",
+    value: undefined,
+    _text: "",
+    appendChild(c) {
+      this.children.push(c);
+      if (this.tagName === "select" && c && c.tagName === "option" &&
+          this.value === undefined) {
+        this.value = c.attributes.value;
+      }
+      return c;
+    },
+    setAttribute(k, v) { this.attributes[k] = v; },
+    addEventListener() {},
+  };
+  Object.defineProperty(e, "textContent", {
+    get() { return this._text; },
+    set(v) { this._text = String(v); },
+  });
+  return e;
+}
+const ids = ["lechonk-meta", "lechonk-turns", "lechonk-commitments",
+  "lechonk-transcript", "manifest-body", "empire-body", "turns-body",
+  "snapshot-body", "actions-body", "commitments-body", "metrics-body",
+  "footer", "run-title", "run-sub"];
+const byId = {};
+for (const id of ids) {
+  const e = makeEl("div");
+  e.id = id;
+  e._text = blocks[id] === undefined ? "" : blocks[id];
+  byId[id] = e;
+}
+global.document = {
+  getElementById(id) { return byId[id] || null; },
+  createElement(tag) { return makeEl(tag); },
+  createTextNode(t) { return { text: String(t) }; },
+};
+eval(script);
+function dump(n) {
+  if (!n) { return null; }
+  if (n.tagName === undefined) { return { text: n.text }; }
+  return { tag: n.tagName, text: n._text,
+           children: (n.children || []).map(dump) };
+}
+process.stdout.write(JSON.stringify(dump(byId["metrics-body"])));
+"""
+
+
+def test_viewer_separates_operational_events_from_aggregate_metrics(tmp_path):
+    """W3-1 viewer obligation: the aggregate metrics table carries ONLY
+    the registered aggregate names; operational protocol events
+    (dispatch_intent, mutation_dispatch_cancelled, state_transition, the
+    budget events) and unknown/legacy names render in a diagnostics
+    table, never as aggregates."""
+    transcript = _build_w3_transcript(tmp_path)
+    out = tmp_path / "w3-replay"
+    replay.render_bundle(transcript, out)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    script = _viewer_main_script(html)
+    # structural pins: the registered-aggregate filter and the
+    # diagnostics section ship in the viewer JS
+    assert "isAggregateMetric" in script
+    assert '"domain_model_share:"' in script
+    assert '"illegal_action_share:"' in script
+    assert "operational events (diagnostics, " in html
+    assert "aggregate metrics (frozen, ledger-" in html
+    # behavioral: execute the viewer JS under node and read the metrics
+    # panel's tables (skipped when node is absent — the structural pins
+    # above still run)
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available to execute the viewer JS")
+    blocks = {bid: _script_block(html, bid)
+              for bid in ("lechonk-meta", "lechonk-turns",
+                          "lechonk-commitments", "lechonk-transcript")}
+    blocks_path = tmp_path / "viewer-blocks.json"
+    blocks_path.write_text(json.dumps(blocks), encoding="utf-8")
+    script_path = tmp_path / "viewer-main.js"
+    script_path.write_text(script, encoding="utf-8")
+    driver_path = tmp_path / "viewer-tables.js"
+    driver_path.write_text(_VIEWER_TABLES_DRIVER, encoding="utf-8")
+    proc = subprocess.run(
+        [node, str(driver_path), str(blocks_path), str(script_path)],
+        capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, f"viewer JS failed under node: {proc.stderr}"
+    tree = json.loads(proc.stdout)
+
+    def tables_under(heading_prefix):
+        """The tables rendered under the h3 headings whose text starts
+        with ``heading_prefix``: [{heading, rows: [[cell, ...], ...]}]"""
+        found = []
+        current = None
+
+        def walk(n):
+            nonlocal current
+            if not isinstance(n, dict):
+                return
+            if n.get("tag") == "h3":
+                current = n.get("text")
+            elif n.get("tag") == "table" and current is not None:
+                rows = []
+                for tr in n.get("children") or []:
+                    if not isinstance(tr, dict) or tr.get("tag") != "tr":
+                        continue
+                    rows.append([c.get("text")
+                                 for c in (tr.get("children") or [])
+                                 if isinstance(c, dict)])
+                found.append({"heading": current, "rows": rows})
+                current = None
+            for c in (n.get("children") or []):
+                walk(c)
+
+        walk(tree)
+        return [t for t in found
+                if t["heading"] and t["heading"].startswith(heading_prefix)]
+
+    aggregates = tables_under("aggregate metrics")
+    assert len(aggregates) == 1
+    assert aggregates[0]["rows"][0] == ["metric", "value"]
+    assert [r[0] for r in aggregates[0]["rows"][1:]] == [
+        "participation", "domain_model_share:research",
+        "illegal_attempts_total"]
+    diagnostics = tables_under("operational events")
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["rows"][0] == ["event", "value"]
+    assert [r[0] for r in diagnostics[0]["rows"][1:]] == [
+        "state_transition", "dispatch_intent",
+        "mutation_dispatch_cancelled", "prompt_budget_exceeded",
+        "some_legacy_event"]
+    # The operational events never appear in the aggregate table.
+    aggregate_names = {r[0] for r in aggregates[0]["rows"]}
+    assert "dispatch_intent" not in aggregate_names
+    assert "mutation_dispatch_cancelled" not in aggregate_names
+    assert "state_transition" not in aggregate_names
+    assert "some_legacy_event" not in aggregate_names

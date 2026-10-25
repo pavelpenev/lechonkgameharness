@@ -90,6 +90,21 @@ itself is never repeated: a second disconnect (or a contradicted
 resend) quarantines the same way. Reconciliation decisions are ledgered
 as mutation_reconciliation metric_events so the P11 audit can verify the
 non-execution proof behind every repeat execution.
+
+Dispatch-intent durability (W3-1, D5): every mutation send — at BOTH send
+sites, _execute_one's dispatch and the verified resubmission — is preceded
+by a durable ``dispatch_intent`` metric_event (fsynced BEFORE the send), so
+a kill between dispatch and the action_result leaves a durable trace of
+which action was sent. The pinned send-site order: pre-capture pre-state ->
+deadline/game-over check -> append intent (durable) -> FINAL deadline
+recheck -> if blocked: emit the durable ``mutation_dispatch_cancelled``
+event (the same payload keys as the intent + intent_seq), NO send -> else
+execute_candidate -> append the correlated action_result (durable; its
+detail carries a ``dispatch-result/v1`` envelope with the intent's seq —
+legacy detail strings remain valid). An intent with neither a correlated
+result nor a cancellation (a crash inside the dispatch window) is FORENSIC
+ONLY (D15): the P11 audit's pending-intent scanner reports it; the runner
+never refuses or quarantines on it.
 """
 
 from __future__ import annotations
@@ -118,6 +133,7 @@ from lechonk.core.model_client import (
     TurnPrompt,
 )
 from lechonk.core.delta import compute_delta, enforce_delta_budget
+from lechonk.core.jsonutil import canonical_json
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
@@ -172,6 +188,71 @@ _ACTIVITY_FOR_VERB = {
 # line 41): non-conforming memory_update.threats entries are dropped at
 # emission.
 ENTITY_ID_RE = re.compile(r"^(unit|city|player):[0-9]+\Z")
+
+# --- W3-1 dispatch-intent protocol (D5) ---------------------------------------
+# The durable pre-send intent record and its correlation envelopes. The
+# intent is a MetricEventRecord (no schema change, no freeze amendment);
+# its value is a canonical-JSON string carrying the dispatch identity
+# ONLY — nothing in it asserts that the send happened (the honesty
+# requirement: a kill before the send and a kill after it leave the same
+# durable trace). The action_result that follows an intent correlates it
+# via a protocol-prefixed detail envelope; legacy detail strings (no
+# envelope) remain valid.
+DISPATCH_INTENT_EVENT = "dispatch_intent"
+DISPATCH_CANCELLED_EVENT = "mutation_dispatch_cancelled"
+DISPATCH_INTENT_PROTOCOL = "dispatch-intent/v1"
+DISPATCH_CANCELLED_PROTOCOL = "dispatch-cancelled/v1"
+DISPATCH_RESULT_PROTOCOL = "dispatch-result/v1"
+
+
+def _dispatch_intent_payload(*, turn: int, ref: str,
+                             call_seq: Optional[int], snapshot_seq: int,
+                             candidates_seq: int, provenance: str) -> str:
+    """The dispatch_intent event's canonical-JSON payload: the dispatch
+    identity (protocol tag, turn, action ref, the provenance linkage seqs
+    and the provenance class) — never an execution claim."""
+    return canonical_json({
+        "protocol": DISPATCH_INTENT_PROTOCOL,
+        "turn": turn,
+        "ref": ref,
+        "call_seq": call_seq,
+        "snapshot_seq": snapshot_seq,
+        "candidates_seq": candidates_seq,
+        "provenance_class": provenance,
+    })
+
+
+def _dispatch_cancelled_payload(*, intent_seq: int, reason: str,
+                                turn: int, ref: str,
+                                call_seq: Optional[int], snapshot_seq: int,
+                                candidates_seq: int,
+                                provenance: str) -> str:
+    """The mutation_dispatch_cancelled event's canonical-JSON payload:
+    the same payload keys as the intent, plus the intent's ledger seq
+    (the correlation) and the blocking reason."""
+    return canonical_json({
+        "protocol": DISPATCH_CANCELLED_PROTOCOL,
+        "intent_seq": intent_seq,
+        "reason": reason,
+        "turn": turn,
+        "ref": ref,
+        "call_seq": call_seq,
+        "snapshot_seq": snapshot_seq,
+        "candidates_seq": candidates_seq,
+        "provenance_class": provenance,
+    })
+
+
+def _dispatch_result_detail(intent_seq: int, message: str) -> str:
+    """The correlated action_result's detail: the protocol-prefixed
+    dispatch-result/v1 envelope carrying the intent's ledger seq (the
+    result->intent correlation). The existing detail rides verbatim in
+    ``message``."""
+    return canonical_json({
+        "protocol": DISPATCH_RESULT_PROTOCOL,
+        "intent_seq": intent_seq,
+        "message": message,
+    })
 
 
 class RunState(str, Enum):
@@ -485,6 +566,83 @@ class GameRunner:
 
     def _emit_action_result(self, *, durable: bool = False, **fields: Any) -> int:
         return self._emit(ActionResultRecord(**fields), durable=durable)
+
+    # ------------------------------------------------------------------
+    # the W3-1 dispatch-intent boundary (D5)
+    # ------------------------------------------------------------------
+
+    def _dispatch_block_reason(self) -> Optional[str]:
+        """The pre-send deadline/game-over check (the pinned send-site
+        order's first check and its FINAL recheck). An ALREADY-ESTABLISHED
+        game-over wins over a newly-noticed deadline expiry (DEF-1); the
+        ACTING deadline is the single source published by _transition
+        (W3-3). None when the dispatch may proceed (no deadline published:
+        proceed)."""
+        if self._game_over is not None:
+            return "game over"
+        deadline = self._acting_deadline_at
+        if deadline is not None and self._clock() >= deadline:
+            return "ACTING deadline reached"
+        return None
+
+    def _emit_dispatch_intent(self, *, turn: int, ref: str,
+                              call_seq: Optional[int], snapshot_seq: int,
+                              candidates_seq: int, provenance: str) -> int:
+        """Append the durable dispatch_intent record (D5: the pre-send
+        fsync — the ledger's durable append flushes AND fsyncs, so the
+        intent is on disk before the send)."""
+        return self._emit(MetricEventRecord(
+            name=DISPATCH_INTENT_EVENT,
+            value=_dispatch_intent_payload(
+                turn=turn, ref=ref, call_seq=call_seq,
+                snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+                provenance=provenance)), durable=True)
+
+    def _emit_dispatch_cancelled(self, *, intent_seq: int, reason: str,
+                                 turn: int, ref: str,
+                                 call_seq: Optional[int], snapshot_seq: int,
+                                 candidates_seq: int, provenance: str) -> int:
+        """Append the durable mutation_dispatch_cancelled record (the
+        cancellation contract: the same payload keys as the intent +
+        intent_seq). Emitted when the FINAL pre-send check blocks the
+        dispatch — NO send occurs in that branch."""
+        return self._emit(MetricEventRecord(
+            name=DISPATCH_CANCELLED_EVENT,
+            value=_dispatch_cancelled_payload(
+                intent_seq=intent_seq, reason=reason, turn=turn, ref=ref,
+                call_seq=call_seq, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq, provenance=provenance)),
+            durable=True)
+
+    def _blocked_dispatch(self, adapter: _AdapterModules, cand: Candidate,
+                          *, block: str, pre_info: Mapping[str, Any],
+                          intent_seq: Optional[int]) -> tuple[Any, int]:
+        """A dispatch blocked by the pre-send check (W3-1): NO send and NO
+        action_result are fabricated for it. The deadline arm raises the
+        supervision deadline (the existing bounded truncation path); the
+        game-over arm (DEF-1: an established game-over wins over a
+        newly-noticed deadline expiry) returns a not-dispatched result
+        carrying the termination, so the caller's W2-4 handling stops the
+        batch and the outcome flows through the game-over path."""
+        if block == "game over":
+            terminated, truncated = self._game_over or (False, False)
+            detail = ("not dispatched: the game is over — no send, no "
+                      "action_result (the W3-1 dispatch-intent boundary)")
+            turn_before = int((pre_info or {}).get("turn", 0) or 0)
+            return adapter.execute.ExecutionResult(
+                candidate_id=cand.id, action=("", "", ""),
+                status="not_dispatched",
+                readback=adapter.execute.Readback(status="none",
+                                                  detail=detail),
+                terminated=bool(terminated), truncated=bool(truncated),
+                turn_before=turn_before, turn_after=turn_before,
+                elapsed_s=0.0, detail=detail), (
+                    intent_seq if intent_seq is not None
+                    else self.ledger.last_seq)
+        # The deadline arm: raise the supervision deadline (the existing
+        # bounded truncation with artifacts).
+        raise StateDeadlineExceeded(
+            RunState.ACTING, self.config.acting_deadline_s)
 
     # ------------------------------------------------------------------
     # abort / watchdog
@@ -1308,7 +1466,11 @@ class GameRunner:
         state: it is settled only by full-state reconciliation on
         reconnect, never by blind replay. Returns (ExecutionResult,
         action_result seq); raises _QuarantineFailStop when the mutation
-        is executed-or-unknown (never resent)."""
+        is executed-or-unknown (never resent).
+
+        W3-1 (D5): the pinned send-site order — pre-capture pre-state ->
+        deadline/game-over check -> durable intent -> FINAL deadline
+        recheck -> send or cancel -> the correlated action_result."""
         target, affected, actor_tile = self._describe(cand)
         # Snapshot the caller-supplied pre-dispatch baseline BEFORE any
         # send (§3 line 35): reconciliation compares against the true
@@ -1344,6 +1506,31 @@ class GameRunner:
                 terminated=False, truncated=False,
                 turn_before=turn_before, turn_after=turn_before,
                 elapsed_s=0.0, detail=detail), seq
+        # W3-1 (D5): the dispatch-intent boundary — the pinned send-site
+        # order. The deadline/game-over check runs BEFORE the intent is
+        # written (a blocked dispatch leaves no intent behind).
+        block = self._dispatch_block_reason()
+        if block is not None:
+            return self._blocked_dispatch(
+                adapter, cand, block=block, pre_info=pre_info,
+                intent_seq=None)
+        intent_seq = self._emit_dispatch_intent(
+            turn=turn, ref=cand.id, call_seq=call_seq,
+            snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+            provenance=provenance)
+        # The FINAL pre-send recheck: the intent's fsync took time — a
+        # deadline that passed during it cancels the dispatch durably
+        # instead of sending past it.
+        block = self._dispatch_block_reason()
+        if block is not None:
+            self._emit_dispatch_cancelled(
+                intent_seq=intent_seq, reason=block, turn=turn,
+                ref=cand.id, call_seq=call_seq,
+                snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+                provenance=provenance)
+            return self._blocked_dispatch(
+                adapter, cand, block=block, pre_info=pre_info,
+                intent_seq=intent_seq)
         try:
             result = adapter.execute.execute_candidate(
                 self._session, cand,
@@ -1356,7 +1543,7 @@ class GameRunner:
                 candidates_seq=candidates_seq, reason=reason,
                 origin_seq=origin_seq, target=target, affected=affected,
                 actor_tile=actor_tile,
-                pre_obs=pre_obs, pre_info=pre_info)
+                pre_obs=pre_obs, pre_info=pre_info, intent_seq=intent_seq)
         seq = self._emit_action_result(
             turn=turn, ref=cand.id, domain=cand.domain, verb=cand.verb,
             target=target, affected=affected, actor_tile=actor_tile,
@@ -1367,7 +1554,8 @@ class GameRunner:
             provenance_class=provenance, origin_seq=origin_seq,
             reason=reason, snapshot_seq=snapshot_seq,
             candidates_seq=candidates_seq, call_seq=call_seq,
-            readback=result.readback.status, detail=result.detail,
+            readback=result.readback.status,
+            detail=_dispatch_result_detail(intent_seq, result.detail),
             durable=True)  # the action-boundary fsync (§3 line 34)
         return result, seq
 
@@ -1381,7 +1569,8 @@ class GameRunner:
                               affected: Optional[str],
                               actor_tile: Optional[tuple[int, int]],
                               pre_obs: Mapping[str, Any],
-                              pre_info: Mapping[str, Any]
+                              pre_info: Mapping[str, Any],
+                              intent_seq: int
                               ) -> tuple[Any, int]:
         """§3 line 35: settle a mutation whose read-back is inconclusive
         after a disconnect, ONLY by full-state reconciliation — the
@@ -1389,7 +1578,11 @@ class GameRunner:
         state against a fresh read through the session). Verified
         non-execution permits ONE resubmission (continued_model_order,
         origin-linked); executed-or-unknown is quarantined → the bounded
-        fail-stop. Never blind replay; no duplicate mutation."""
+        fail-stop. Never blind replay; no duplicate mutation.
+
+        W3-1 (D5): the uncertain action_result below IS the correlated
+        result of this dispatch's intent (the send's fate is durably
+        recorded — the intent is resolved, not left forensic)."""
         # The uncertain attempt is ledgered first (the mutation WAS sent;
         # its verification is inconclusive).
         uncertain_seq = self._emit_action_result(
@@ -1399,10 +1592,12 @@ class GameRunner:
             origin_seq=origin_seq, reason=reason,
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
             call_seq=call_seq, readback="inconclusive",
-            detail=(f"mutation send failed after dispatch ({exc!r}): "
-                    f"the execution state is unknown — settling by "
-                    f"full-state reconciliation on reconnect (never "
-                    f"blind replay, §3 line 35)"),
+            detail=_dispatch_result_detail(
+                intent_seq,
+                f"mutation send failed after dispatch ({exc!r}): "
+                f"the execution state is unknown — settling by "
+                f"full-state reconciliation on reconnect (never "
+                f"blind replay, §3 line 35)"),
             durable=True)
         # Full-state reconciliation: re-read (the reconnect) and compare
         # the target postconditions against the caller-captured
@@ -1468,7 +1663,13 @@ class GameRunner:
         model arm — a scripted arm's resubmission is never mislabeled as
         model-originated). A second disconnect, a contradicted resend, or
         an inconclusive resend read-back quarantines; the resubmission is
-        never repeated."""
+        never repeated.
+
+        W3-1 (D5): the SAME pinned send-site order as _execute_one —
+        pre-capture pre-state -> deadline/game-over check -> durable
+        intent -> FINAL deadline recheck -> send or cancel -> the
+        correlated action_result (each of the resubmission's possible
+        action_results correlates this dispatch's intent)."""
         # W2-3: never resend an unmappable candidate. The pre-dispatch
         # classification in _execute_one keeps an unmappable candidate out
         # of the reconciliation path entirely; this guard is the backstop
@@ -1486,6 +1687,30 @@ class GameRunner:
         # origin attempt's provenance class, with the same origin linkage.
         resend_provenance = ("continued_model_order"
                              if provenance == "model" else provenance)
+        # W3-1 (D5): the dispatch-intent boundary — the pinned send-site
+        # order, identical to _execute_one's. Pre-capture the pre-state
+        # (the pre-dispatch info baseline), check, then write the durable
+        # intent, then the FINAL recheck.
+        pre_info = self._session.info
+        block = self._dispatch_block_reason()
+        if block is not None:
+            return self._blocked_dispatch(
+                adapter, cand, block=block, pre_info=pre_info,
+                intent_seq=None)
+        intent_seq = self._emit_dispatch_intent(
+            turn=turn, ref=cand.id, call_seq=None,
+            snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
+            provenance=resend_provenance)
+        # The FINAL pre-send recheck (the intent's fsync took time).
+        block = self._dispatch_block_reason()
+        if block is not None:
+            self._emit_dispatch_cancelled(
+                intent_seq=intent_seq, reason=block, turn=turn,
+                ref=cand.id, call_seq=None, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq, provenance=resend_provenance)
+            return self._blocked_dispatch(
+                adapter, cand, block=block, pre_info=pre_info,
+                intent_seq=intent_seq)
         try:
             result = adapter.execute.execute_candidate(
                 self._session, cand,
@@ -1499,9 +1724,11 @@ class GameRunner:
                 reason="pipeline resubmission after verified non-execution",
                 snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
                 call_seq=None, readback="inconclusive",
-                detail=(f"the resubmission send also failed after dispatch "
-                        f"({exc!r}) — quarantined, never resent again "
-                        f"(never blind replay, §3 line 35)"),
+                detail=_dispatch_result_detail(
+                    intent_seq,
+                    f"the resubmission send also failed after dispatch "
+                    f"({exc!r}) — quarantined, never resent again "
+                    f"(never blind replay, §3 line 35)"),
                 durable=True)
             self._emit(MetricEventRecord(
                 name="mutation_quarantine",
@@ -1523,7 +1750,8 @@ class GameRunner:
                 provenance_class=resend_provenance, origin_seq=origin_seq,
                 reason="pipeline resubmission after verified non-execution",
                 snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
-                call_seq=None, readback=readback, detail=result.detail,
+                call_seq=None, readback=readback,
+                detail=_dispatch_result_detail(intent_seq, result.detail),
                 durable=True)
             self._emit(MetricEventRecord(
                 name="mutation_quarantine",
@@ -1548,7 +1776,8 @@ class GameRunner:
                 provenance_class=resend_provenance, origin_seq=origin_seq,
                 reason="pipeline resubmission after verified non-execution",
                 snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
-                call_seq=None, readback=readback, detail=result.detail,
+                call_seq=None, readback=readback,
+                detail=_dispatch_result_detail(intent_seq, result.detail),
                 durable=True)
             self._emit(MetricEventRecord(
                 name="mutation_quarantine",
@@ -1568,7 +1797,8 @@ class GameRunner:
             reason=("pipeline resubmission after verified non-execution "
                     "(reconciled on reconnect, §3 line 35)"),
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
-            call_seq=None, readback=readback, detail=result.detail,
+            call_seq=None, readback=readback,
+            detail=_dispatch_result_detail(intent_seq, result.detail),
             durable=True)
         if result.terminated or result.truncated:
             # W2-4: a resubmission that ends the game marks termination at

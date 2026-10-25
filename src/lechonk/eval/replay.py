@@ -726,21 +726,56 @@ function legend(seriesList) {
   body.appendChild(lineChart([
     { label: "opportunities", color: "#6b7280", points: opp },
     { label: "participation", color: "#2563eb", points: part }]));
-  // the frozen aggregate metric events
-  var events = (byKind.metric_event || []).filter(function (e) {
-    return e.name !== "state_transition"; });
-  if (events.length) {
+  // W3-1: the aggregate table carries ONLY the registered aggregate
+  // metric names (the frozen metrics lechonk.core.metrics.metric_events
+  // emits, including the parameterized domain_model_share:* and
+  // illegal_action_share:* names). Operational protocol events —
+  // state_transition, dispatch_intent, mutation_dispatch_cancelled, the
+  // reconciliation/quarantine/budget events — and any unknown/legacy
+  // names are NOT aggregates: they render in a diagnostics table below.
+  var AGGREGATE_METRIC_NAMES = ["participation", "participation_gate_pass",
+    "commitment_followthrough_any", "commitment_followthrough_model",
+    "commitment_censored", "commitment_deduped", "reason_but_dont_act",
+    "reason_mentions_censored", "reason_mentions_deduped",
+    "illegal_attempts_total"];
+  var AGGREGATE_METRIC_PREFIXES = ["domain_model_share:",
+    "illegal_action_share:"];
+  function isAggregateMetric(name) {
+    if (AGGREGATE_METRIC_NAMES.indexOf(name) !== -1) { return true; }
+    return AGGREGATE_METRIC_PREFIXES.some(function (p) {
+      return name.indexOf(p) === 0; });
+  }
+  var metricEvents = byKind.metric_event || [];
+  var aggregates = metricEvents.filter(function (e) {
+    return isAggregateMetric(e.name); });
+  var diagnostics = metricEvents.filter(function (e) {
+    return !isAggregateMetric(e.name); });
+  if (aggregates.length) {
     body.appendChild(el("h3", { text: "aggregate metrics (frozen, ledger-" +
       "computed)" }));
     var t = el("table");
     t.appendChild(el("tr", {}, [el("th", { text: "metric" }),
       el("th", { text: "value" })]));
-    events.forEach(function (e) {
+    aggregates.forEach(function (e) {
       t.appendChild(el("tr", {}, [
         el("td", { class: "mono", text: e.name }),
         el("td", { class: "mono", text: String(e.value) })]));
     });
     body.appendChild(t);
+  }
+  if (diagnostics.length) {
+    body.appendChild(el("h3", { text: "operational events (diagnostics, " +
+      "not aggregates)" }));
+    var d = el("table");
+    d.appendChild(el("tr", {}, [el("th", { text: "event" }),
+      el("th", { text: "value" })]));
+    diagnostics.forEach(function (e) {
+      d.appendChild(el("tr", {}, [
+        el("td", { class: "mono", text: e.name }),
+        el("td", { class: "mono", title: String(e.value),
+          text: trunc(String(e.value), 220) })]));
+    });
+    body.appendChild(d);
   }
   // provenance mix per turn
   body.appendChild(el("h3", { text: "provenance mix (executed actions)" }));

@@ -14,20 +14,24 @@ import ast
 import copy
 import hashlib
 import inspect
+import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from lechonk.adapter.session import StepOutcome
-from lechonk.core.ledger import load_transcript
+from lechonk.core.ledger import TranscriptLedger, load_transcript
 from lechonk.core.metrics import commitment_board
 from lechonk.core.model_client import ModelResponse
 from lechonk.core.runner import (
     ENTITY_ID_RE,
     GameRunner,
     RunState,
+    RunnerConfig,
     StallWatchdog,
+    _dispatch_intent_payload,
     _QuarantineFailStop,
     _StandingOrder,
     mark_armed_in_contact,
@@ -47,6 +51,7 @@ from lechonk.core.schemas import (
     ModelCallRecord,
     OutcomeRecord,
     PlayerView,
+    RunManifest,
     RunManifestRecord,
     Snapshot,
     SnapshotRefRecord,
@@ -2933,3 +2938,312 @@ def test_d11_game_over_outcome_live_record_overrides_defeat_flag(tmp_path):
         "terminated=True with my_player_is_defeated=True")
     assert outcome == "DEFEATED"
     assert reason == "my player is defeated"
+
+
+# ---------------------------------------------------------------------------
+# W3-1 (D5): the durable dispatch-intent boundary + the cancellation
+# contract + the D15 forensic-only regression pins
+# ---------------------------------------------------------------------------
+
+
+class _IntentDurabilitySession(FakeSession):
+    """W3-1 (D5): on every mutation send, the dispatch intent for THAT
+    send is already durable on disk — a complete, checksum-valid
+    dispatch_intent line precedes the send (the pre-send fsync)."""
+
+    def __init__(self, worlds, transcript_path):
+        super().__init__(worlds)
+        self._transcript_path = str(transcript_path)
+        self.sends = 0
+        self.intent_seqs_on_disk = []
+
+    def step(self, action, *, deadline=None):
+        if action is not None:
+            self.sends += 1
+            load = load_transcript(self._transcript_path)
+            intents = [r for r in load.records
+                       if isinstance(r, MetricEventRecord)
+                       and r.name == "dispatch_intent"]
+            # The intent for THIS send is already durable on disk, and
+            # no action_result for it exists yet.
+            assert not load.discarded_trailing_partial
+            assert len(intents) == self.sends
+            self.intent_seqs_on_disk.append(intents[-1].seq)
+        return super().step(action, deadline=deadline)
+
+
+def _intent_events(records):
+    return [r for r in records
+            if isinstance(r, MetricEventRecord)
+            and r.name == "dispatch_intent"]
+
+
+def _prefix_bytes_ending_at(path, seq):
+    """The byte length of the transcript's prefix ending right after
+    record ``seq``'s line (a simulated kill at that boundary)."""
+    lines = Path(path).read_bytes().split(b"\n")
+    assert lines[-1] == b""  # every record line is newline-terminated
+    return sum(len(line) + 1 for line in lines[:seq + 1])
+
+
+def test_runner_dispatch_intent_is_durable_before_every_send(tmp_path):
+    """W3-1 (D5) crash-window matrix (1): the normal path — every send is
+    preceded by its durable dispatch_intent (verified ON DISK inside the
+    send itself), immediately followed by the correlated action_result
+    (a dispatch-result/v1 detail envelope carrying the intent's seq)."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = _IntentDurabilitySession(worlds, tmp_path / "transcript.jsonl")
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e",
+                     "tech:cur_player:research_tech_alphabet_0"],
+                    turn_id="t1", with_memory=False),
+        ok_response(["unit:11:sentry"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    # The on-disk check inside every send: 3 sends, 3 durable intents.
+    assert session.sends == 3
+    assert len(session.intent_seqs_on_disk) == 3
+
+    records = _records(runner.ledger.path)
+    intents = _intent_events(records)
+    executed = [a for a in _actions(records) if a.outcome == "executed"]
+    assert len(intents) == 3 and len(executed) == 3
+    # The pinned order per send: the intent is immediately followed by
+    # its correlated action_result.
+    intent_positions = [i for i, r in enumerate(records)
+                         if r in intents]
+    executed_positions = [i for i, r in enumerate(records)
+                          if r in executed]
+    assert len(intent_positions) == 3 == len(executed_positions)
+    for ip, ep in zip(intent_positions, executed_positions):
+        assert ep == ip + 1
+    for intent, action in zip(intents, executed):
+        payload = json.loads(intent.value)
+        assert payload["protocol"] == "dispatch-intent/v1"
+        assert payload["turn"] == action.turn
+        assert payload["ref"] == action.ref
+        assert payload["provenance_class"] == action.provenance_class
+        assert payload["snapshot_seq"] == action.snapshot_seq
+        assert payload["candidates_seq"] == action.candidates_seq
+        assert payload["call_seq"] == action.call_seq
+        envelope = json.loads(action.detail)
+        assert envelope["protocol"] == "dispatch-result/v1"
+        assert envelope["intent_seq"] == intent.seq
+        assert action.ref in envelope["message"]
+    # The intent payload carries identity only — no send/outcome claim.
+    assert set(json.loads(intents[0].value)) == {
+        "protocol", "turn", "ref", "call_seq", "snapshot_seq",
+        "candidates_seq", "provenance_class"}
+
+
+def test_runner_resend_pairs_each_intent_with_its_own_result(tmp_path):
+    """W3-1 crash-window matrix (4): the same ref dispatched twice (the
+    §3 line 35 verified resubmission) — each dispatch_intent pairs with
+    its OWN action_result via intent_seq (no cross-pairing): the first
+    intent with the uncertain attempt, the second with the resend."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = LifecycleSession(worlds, disconnect_on=GOTO_ACTION,
+                               effect_applied=False)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    # The two sends: the failed dispatch + the one resubmission.
+    assert len([c for c in session.calls if c[0] == GOTO_ACTION]) == 2
+
+    records = _records(runner.ledger.path)
+    intents = _intent_events(records)
+    by_ref = [a for a in _actions(records) if a.ref == GOTO_REF]
+    assert len(intents) == 2 and len(by_ref) == 2
+    # Each intent pairs with its OWN result (no cross-pairing).
+    env0 = json.loads(by_ref[0].detail)
+    env1 = json.loads(by_ref[1].detail)
+    assert env0["protocol"] == "dispatch-result/v1"
+    assert env1["protocol"] == "dispatch-result/v1"
+    assert env0["intent_seq"] == intents[0].seq
+    assert env1["intent_seq"] == intents[1].seq
+    assert env0["intent_seq"] != env1["intent_seq"]
+    # The first result is the uncertain attempt; the second the verified
+    # resubmission.
+    assert by_ref[0].readback == "inconclusive"
+    assert by_ref[1].readback == "verified"
+    assert by_ref[1].provenance_class == "continued_model_order"
+    # The resend's intent carries the resubmission's provenance class
+    # (the intent is written at the resend site, before its send).
+    payload1 = json.loads(intents[1].value)
+    assert payload1["provenance_class"] == "continued_model_order"
+    assert payload1["call_seq"] is None
+    assert payload1["ref"] == GOTO_REF
+
+
+def test_runner_final_check_blocked_cancels_the_dispatch(tmp_path,
+                                                          monkeypatch):
+    """W3-1 cancellation contract (crash-window matrix (5)): the FINAL
+    pre-send recheck blocks the dispatch → a durable
+    mutation_dispatch_cancelled event (the same payload keys as the
+    intent + intent_seq) is emitted, NO send occurs, NO action_result is
+    fabricated; the run takes the bounded deadline truncation."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    # The pre-send check passes once (the first check), then blocks (the
+    # FINAL recheck after the intent's fsync).
+    checks = {"n": 0}
+
+    def fake_block_reason(self):
+        checks["n"] += 1
+        return None if checks["n"] == 1 else "ACTING deadline reached"
+
+    monkeypatch.setattr(GameRunner, "_dispatch_block_reason",
+                        fake_block_reason)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert "deadline" in result.reason
+    # NO send: the session saw no step at all.
+    assert session.calls == []
+    records = _records(runner.ledger.path)
+    # NO action_result was fabricated for the blocked dispatch.
+    assert _actions(records) == []
+    intents = _intent_events(records)
+    cancels = [r for r in records
+               if isinstance(r, MetricEventRecord)
+               and r.name == "mutation_dispatch_cancelled"]
+    assert len(intents) == 1 and len(cancels) == 1
+    intent_payload = json.loads(intents[0].value)
+    cancel_payload = json.loads(cancels[0].value)
+    # The same payload keys as the intent + intent_seq (+ the reason).
+    assert cancel_payload["protocol"] == "dispatch-cancelled/v1"
+    assert cancel_payload["intent_seq"] == intents[0].seq
+    for key in ("turn", "ref", "call_seq", "snapshot_seq", "candidates_seq",
+                "provenance_class"):
+        assert cancel_payload[key] == intent_payload[key]
+    assert cancel_payload["reason"] == "ACTING deadline reached"
+    # Both records are durable on disk (they load back), intent first.
+    assert intents[0].seq < cancels[0].seq
+
+
+def test_runner_unresolved_intent_introduces_no_refusal(tmp_path):
+    """W3-1 D15 regression pin: an unresolved (forensic) dispatch intent
+    left by a crashed predecessor run introduces NO runner refusal — the
+    runner attaches, continues appending normally and completes."""
+    path = tmp_path / "transcript.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    # A crashed predecessor's durable intent: no correlated result, no
+    # cancellation — the forensic uncertain case.
+    ledger.append(MetricEventRecord(
+        name="dispatch_intent",
+        value=_dispatch_intent_payload(
+            turn=1, ref=GOTO_REF, call_seq=None, snapshot_seq=0,
+            candidates_seq=0, provenance="model")), durable=True)
+    dangling_seq = ledger.last_seq
+    ledger.close()
+
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    attached = TranscriptLedger.attach(path)
+    config = RunnerConfig(max_turns=2, run_id="test-run",
+                          watchdog_interval_s=0.02)
+    runner = GameRunner(
+        config=config, client=client, ledger=attached,
+        manifest=RunManifest(run_id="test-run"),
+        session_factory=lambda: session, clock=time.monotonic)
+    result = runner.run()
+    # The run starts and continues normally: no refusal, no quarantine,
+    # the ordinary horizon completion.
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    assert not [r for r in records
+                if isinstance(r, MetricEventRecord)
+                and r.name == "mutation_quarantine"]
+    # The dangling intent survives untouched; the run's own records
+    # continue the seq after it.
+    dangling = _intent_events(records)
+    assert dangling[0].seq == dangling_seq
+    assert [r.seq for r in records] == list(range(len(records)))
+    # The run's own dispatch was sent and correlated normally.
+    assert len(dangling) == 2
+    by_ref = [a for a in _actions(records) if a.ref == GOTO_REF]
+    assert len(by_ref) == 1
+    envelope = json.loads(by_ref[0].detail)
+    assert envelope["intent_seq"] == dangling[1].seq
+
+
+def test_runner_never_imports_the_pending_intent_scanner():
+    """W3-1 D15 regression pin (purity): no lechonk source imports or
+    references the P11 audit's pending-intent scanner — unresolved
+    intents are forensic (audit-side), never a runner input."""
+    offenders = []
+    for path in sorted((REPO / "src" / "lechonk").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "wp3_p11_audit" in text or "scan_pending_intents" in text:
+            offenders.append(str(path))
+    assert not offenders, (
+        f"lechonk sources referencing the audit scanner: {offenders}")
+
+
+def test_runner_intent_is_the_honest_crash_window_boundary(tmp_path):
+    """W3-1 crash-window matrix (2)+(3) honesty pin: a kill between the
+    intent fsync and the send, and a kill after the send before the
+    read-back, leave the SAME durable trace — the transcript ends with
+    the unresolved intent — and nothing in the intent record
+    distinguishes them (the payload carries identity only, never an
+    execution claim)."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    # The send DID happen (the mutation was applied server-side) — yet
+    # the durable trace below cannot show it.
+    assert len([c for c in session.calls if c[0] == GOTO_ACTION]) == 1
+    path = Path(runner.ledger.path)
+    records = _records(path)
+    intents = _intent_events(records)
+    assert len(intents) == 1
+    intent = intents[0]
+    # The intent payload asserts identity ONLY — no send/outcome claim,
+    # so a kill before the send and a kill after it are indistinguishable.
+    payload = json.loads(intent.value)
+    assert set(payload) == {"protocol", "turn", "ref", "call_seq",
+                            "snapshot_seq", "candidates_seq",
+                            "provenance_class"}
+    assert payload["protocol"] == "dispatch-intent/v1"
+    # Case (2): a kill between the intent fsync and the send — the
+    # transcript ends with the unresolved intent; load keeps it.
+    cut = _prefix_bytes_ending_at(path, intent.seq)
+    killed_before = tmp_path / "killed-before-send.jsonl"
+    killed_before.write_bytes(path.read_bytes()[:cut])
+    load = load_transcript(killed_before)
+    assert not load.discarded_trailing_partial
+    assert load.records[-1].seq == intent.seq
+    assert isinstance(load.records[-1], MetricEventRecord)
+    # Case (3): a kill after the send before the read-back — the result
+    # was never written, so the durable trace is IDENTICAL: the same
+    # unresolved-intent tail (the honesty requirement, not a gap).
+    killed_after = tmp_path / "killed-after-send.jsonl"
+    killed_after.write_bytes(path.read_bytes()[:cut])
+    load2 = load_transcript(killed_after)
+    assert [r.seq for r in load2.records] == [r.seq for r in load.records]
+    assert load2.records[-1].seq == intent.seq

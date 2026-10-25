@@ -365,3 +365,74 @@ def test_load_missing_or_empty_file(tmp_path):
     empty.write_bytes(b"")
     load = load_transcript(empty)
     assert load.records == []
+
+
+# ---------------------------------------------------------------------------
+# W3-1 (D5): the durable dispatch-intent record at the crash-window
+# boundary — load-level behavior
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_intent_event(turn=1, ref="unit:10:goto_e"):
+    return MetricEventRecord(
+        name="dispatch_intent",
+        value=canonical_json({
+            "protocol": "dispatch-intent/v1", "turn": turn, "ref": ref,
+            "call_seq": None, "snapshot_seq": 0, "candidates_seq": 0,
+            "provenance_class": "model"}))
+
+
+def test_durable_intent_at_eof_is_kept_on_load(tmp_path):
+    """W3-1 (D5): a transcript ending with a durable dispatch_intent (a
+    kill between the intent fsync and the send) loads cleanly — the
+    unresolved intent is KEPT (never discarded as a trailing partial)."""
+    path = tmp_path / "intent.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    seq = ledger.append(_dispatch_intent_event(), durable=True)
+    ledger.close()
+    load = load_transcript(path)
+    assert not load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+    last = load.records[-1]
+    assert isinstance(last, MetricEventRecord)
+    assert last.name == "dispatch_intent"
+    assert last.seq == seq
+
+
+def test_torn_intent_tail_is_discarded(tmp_path):
+    """W3-1 (D5): a kill mid-write of the intent line leaves torn bytes
+    at EOF — the trailing partial is discarded; the earlier records
+    (including earlier durable intents) load."""
+    path = tmp_path / "torn-intent.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_dispatch_intent_event(), durable=True)
+    ledger.close()
+    with open(path, "ab") as fh:
+        fh.write(b'{"kind":"metric_event","name":"dispatch_inte')
+    load = load_transcript(path)
+    assert load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+    assert load.records[-1].name == "dispatch_intent"
+
+
+def test_torn_result_after_intent_leaves_it_unresolved(tmp_path):
+    """W3-1 (D5): a kill after the send but mid-write of the
+    action_result — the torn result is discarded on load and the intent
+    remains the last record (unresolved: the send may or may not have
+    gone out — the honest crash-window state)."""
+    path = tmp_path / "torn-result.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_dispatch_intent_event(), durable=True)
+    ledger.close()
+    with open(path, "ab") as fh:
+        fh.write(b'{"kind":"action_result","turn":1,"ref":"unit:10:g')
+    load = load_transcript(path)
+    assert load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+    # The intent survives as the unresolved tail record.
+    last = load.records[-1]
+    assert isinstance(last, MetricEventRecord)
+    assert last.name == "dispatch_intent"
