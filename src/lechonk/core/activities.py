@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 """Canonical freeciv unit-activity id/name tables (version/v14.py:50-65).
 
 Single source of truth for the wire-level activity ids: the name table and

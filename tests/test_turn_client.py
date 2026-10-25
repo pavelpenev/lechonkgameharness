@@ -56,9 +56,9 @@ class MockTransport:
     outcomes: list = field(default_factory=list)
     calls: list = field(default_factory=list)
 
-    def complete(self, *, messages, model, temperature, max_tokens,
-                 response_format, random_seed, timeout_ms=None,
-                 disable_transport_retries=False):
+    def complete(self, *, messages, model, temperature, reasoning_effort,
+                 max_tokens, response_format, random_seed,
+                 timeout_ms=None, disable_transport_retries=False):
         self.calls.append({
             "messages": messages, "model": model,
             "temperature": temperature, "max_tokens": max_tokens,
@@ -329,8 +329,8 @@ def test_repair_attempt_makes_exactly_one_transport_request():
             self.calls = []
             self.network_calls = 0
 
-        def complete(self, *, messages, model, temperature, max_tokens,
-                     response_format, random_seed, timeout_ms=None,
+        def complete(self, *, messages, model, temperature, reasoning_effort,
+                     max_tokens, response_format, random_seed, timeout_ms=None,
                      disable_transport_retries=False, _retry=False):
             if not _retry:
                 self.calls.append({
@@ -347,7 +347,8 @@ def test_repair_attempt_makes_exactly_one_transport_request():
             if self.network_calls == 1:
                 return self.complete(
                     messages=messages, model=model, temperature=temperature,
-                    max_tokens=max_tokens, response_format=response_format,
+                    reasoning_effort=reasoning_effort, max_tokens=max_tokens,
+                    response_format=response_format,
                     random_seed=random_seed, timeout_ms=timeout_ms,
                     disable_transport_retries=disable_transport_retries,
                     _retry=True)
