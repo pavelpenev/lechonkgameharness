@@ -25,6 +25,14 @@ ledger-only — no free-text parsing anywhere):
   readback-gated — contradicted and inconclusive executions enter
   neither numerator nor denominator. Engine-automatic resolutions are
   counted (they are creditable executed decisions), never hidden.
+  The participation gate (§3 line 38) passes iff participation >= 0.80
+  AND every per-domain share with a NUMERIC status (ok) is
+  majority-model (> 0.5). D3 (ruled 2026-10-24): the small-domain
+  exemption is intentional — only numeric-status (ok) domain shares
+  vote; an "n/a" (zero-choice) or "insufficient sample" (denominator < 5)
+  domain cannot block the gate; and when the participation share itself
+  is not a number ("n/a" or "insufficient sample"), the gate is left
+  UNSET (participation_gate_pass None) rather than passed.
 - commitment follow-through: commitments are the structured objects the
   model emits (domain, target kind, target, optional verb, deadline turn),
   de-duplicated per (target, domain) — FW-11 (2026-10-24): when duplicates

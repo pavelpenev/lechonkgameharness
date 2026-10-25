@@ -1036,3 +1036,92 @@ def test_d2_mixed_fixture_hand_computed_shares():
     for domain in ("research", "expansion"):
         assert (shares[domain].numerator, shares[domain].denominator) == (0, 0)
         assert shares[domain].status == STATUS_NA
+
+
+# ---------------------------------------------------------------------------
+# D3 (W3-6): the small-domain gate exemption (kept per the ruling) —
+# boundary pins on the FINAL readback-gated population (W3-4/W3-5
+# semantics). The n/a and insufficient-sample non-blocking pins, the
+# insufficient-participation-unset pin, and the all-domains-n/a pass pin
+# live in the fixture tests (test_fixture_participation,
+# test_fw12_fixture_gate_passes_one_domain_na,
+# test_fw12_fixture_gate_passes_all_domains_na,
+# test_fixture_minimum_denominator, test_fixture_zero_opportunity); the
+# missing pin — exactly-0.5 FAILS — is added here.
+# ---------------------------------------------------------------------------
+
+
+def _d3_records():
+    """A 6-turn run pinning the D3 gate boundary on the FINAL gated
+    population: every counted execution is readback-VERIFIED, so the
+    shares below are exactly the gated ones (nothing is excluded by the
+    D1/D2 readback gates). Every turn offers a research opportunity;
+    turns 1-5 carry an executed verified model goto_e (model
+    participation — unit_action is an opportunity domain but NOT a
+    SHARE_DOMAIN, so it moves participation without moving any share);
+    turns 1-3 carry an executed verified model research and turns 4-6
+    an executed verified scripted_default research. Hand-computed:
+    opportunity turns {1..6} = 6, model-participation turns {1..5} = 5
+    -> participation 5/6 = 0.833... >= 0.8 (ok); research share
+    3/6 = 0.5 EXACTLY (ok, denominator 6 >= 5); production/expansion
+    0/0 n/a. The gate FAILS: the majority conjunct is strict (> 0.5),
+    so exactly-half does not vote with the model."""
+    from lechonk.core.schemas import (
+        ActionResultRecord,
+        CandidatesRefRecord,
+        TurnStartRecord,
+    )
+
+    def opp(turn):
+        return CandidatesRefRecord(
+            turn=turn, table_hash="sha256:" + "01" * 32, candidate_count=10,
+            by_domain={"tech": 10}, opportunity_domains=["research"])
+
+    def action(turn, ref, domain, verb, target, *, provenance_class):
+        return ActionResultRecord(
+            turn=turn, ref=ref, domain=domain, verb=verb, target=target,
+            outcome="executed", provenance_class=provenance_class,
+            readback="verified", detail="")
+
+    records = []
+    for turn in range(1, 7):
+        records.append(TurnStartRecord(turn=turn))
+        records.append(opp(turn))
+        # Model participation on turns 1-5: a unit action (an opportunity
+        # domain, but not a SHARE_DOMAIN).
+        if turn <= 5:
+            records.append(action(
+                turn, f"unit:10:goto_e_{turn}", "unit", "goto_e",
+                "tile:5,5", provenance_class="model"))
+        # The research share: 3 model (turns 1-3) + 3 scripted_default
+        # (turns 4-6) = 3/6 = 0.5 exactly.
+        records.append(action(
+            turn, f"tech:player:research_tech_alphabet_{turn}", "tech",
+            "research_tech_alphabet", "Alphabet",
+            provenance_class="model" if turn <= 3 else "scripted_default"))
+    return records
+
+
+def test_d3_gate_fails_on_exactly_half_domain_share():
+    """D3 (the FW-12 small-domain exemption, kept per the ruling): the
+    blocking boundary is strict — a NUMERIC (status ok) domain share of
+    EXACTLY 0.5 blocks the gate, even though participation 5/6 = 0.833...
+    >= 0.8 and the other two domains are n/a (non-numeric shares cannot
+    block). Together with the 2/6 = 0.333... blocking pin
+    (test_fw12_fixture_gate_fails_on_domain_share), this pins the
+    majority conjunct as > 0.5, not >= 0.5."""
+    from lechonk.core.metrics import STATUS_NA, STATUS_OK, compute_metrics
+    report = compute_metrics(_d3_records())
+    assert (report.participation.numerator,
+            report.participation.denominator) == (5, 6)
+    assert report.participation.status == STATUS_OK
+    assert report.participation.value == pytest.approx(5 / 6)
+    research = report.domain_model_shares["research"]
+    assert (research.numerator, research.denominator) == (3, 6)
+    assert research.status == STATUS_OK
+    assert research.value == pytest.approx(0.5)
+    for domain in ("production", "expansion"):
+        share = report.domain_model_shares[domain]
+        assert (share.numerator, share.denominator) == (0, 0)
+        assert share.status == STATUS_NA
+    assert report.participation_gate_pass is False
