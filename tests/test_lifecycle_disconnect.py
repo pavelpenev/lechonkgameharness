@@ -18,10 +18,17 @@ The four cases of the reconciliation contract:
 Plus the per-mutation deadline case: a send+read-back timeout marks the
 session failed (the real AdapterSession refuses every later RPC) → the
 reconciliation read is refused → unknown → quarantine.
+
+And the FW-R1 narrow window: the step COMPLETES server-side (the cached
+obs advances to the post-mutation state) and execute_candidate raises
+afterwards → reconciliation compares against the pre-mutation baseline
+captured before dispatch; the executed mutation reconciles to "executed"
+and is NEVER resent (no duplicate mutation).
 """
 
 from __future__ import annotations
 
+from lechonk.adapter.session import SessionError
 from lechonk.core.ledger import load_transcript
 from lechonk.core.schemas import (
     ActionResultRecord,
@@ -336,3 +343,76 @@ def test_mutation_deadline_timeout_quarantines(tmp_path):
     assert len(_events(records, "mutation_quarantine")) == 1
     assert isinstance(records[-1], OutcomeRecord)
     assert records[-1].outcome == "TRUNCATED"
+
+
+# ---------------------------------------------------------------------------
+# case 5 (FW-R1): the narrow window — the step completes, the execute
+# raises afterwards → reconciliation against the TRUE pre-mutation state
+# ---------------------------------------------------------------------------
+
+
+class _PostExecuteFailSession(LifecycleSession):
+    """The FW-R1 narrow window: the mutation's step SUCCEEDS server-side
+    (the cached obs/info advance to the post-mutation state, exactly like
+    the real AdapterSession on a completed step) and then
+    execute_candidate raises afterwards — injected as a ONE-SHOT
+    production_name_map failure inside the read-back verification
+    (execute.py raises after the successful step). The reconciliation's
+    own production_name_map call (the reconnect) succeeds, so the
+    comparison runs for real."""
+
+    def __init__(self, worlds, **kwargs):
+        super().__init__(worlds, **kwargs)
+        self._pnm_failures = 1
+
+    def production_name_map(self):
+        if self._pnm_failures > 0:
+            self._pnm_failures -= 1
+            raise SessionError(
+                "injected post-step failure: the read-back verification "
+                "raised after the step completed")
+        return super().production_name_map()
+
+
+def test_step_completed_execute_raised_after_reconciles_true_pre_state(
+        tmp_path):
+    """The narrow FW-R1 window: the step completes server-side (unit 10
+    moved; the session's cached obs is POST-mutation) and
+    execute_candidate raises afterwards. Reconciliation must compare
+    against the PRE-mutation baseline captured before dispatch — the
+    executed mutation reconciles to "executed" and is NEVER resent (a
+    stale post-mutation baseline would reconcile non-execution and
+    duplicate the move)."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = _PostExecuteFailSession(worlds)
+    client = FakeModelClient([
+        ok_response([GOTO_REF], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert "quarantined" in result.reason
+    # The mutation was sent exactly ONCE: reconciliation proved EXECUTION
+    # against the true pre-state (unit at (1,1) before the send vs (2,1)
+    # on reconnect) and quarantined — never resent (no duplicate move to
+    # (3,1)).
+    assert len(_goto_sends(session)) == 1
+    unit = session._worlds[0][0]["unit"][10]
+    assert (unit["x"], unit["y"]) == (2, 1)
+
+    records = _records(runner.ledger.path)
+    by_ref = [a for a in _actions(records) if a.ref == GOTO_REF]
+    assert len(by_ref) == 1
+    assert by_ref[0].outcome == "executed"
+    assert by_ref[0].readback == "inconclusive"
+    reconciliations = _events(records, "mutation_reconciliation")
+    assert len(reconciliations) == 1
+    assert f"{GOTO_REF}: executed (" in reconciliations[0].value
+    quarantines = _events(records, "mutation_quarantine")
+    assert len(quarantines) == 1
+    assert GOTO_REF in quarantines[0].value
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "TRUNCATED"
+    assert "quarantined" in records[-1].reason

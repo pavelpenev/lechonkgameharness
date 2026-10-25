@@ -85,7 +85,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from lechonk.comparator import defaults as defaults_mod
 from lechonk.core.ledger import TranscriptLedger
@@ -1060,6 +1060,11 @@ class GameRunner:
         action_result seq); raises _QuarantineFailStop when the mutation
         is executed-or-unknown (never resent)."""
         target, affected, actor_tile = self._describe(cand)
+        # Snapshot the caller-supplied pre-dispatch baseline BEFORE any
+        # send (§3 line 35): reconciliation compares against the true
+        # pre-mutation state, never a post-mutation re-read.
+        pre_obs = self._session.obs
+        pre_info = self._session.info
         try:
             result = adapter.execute.execute_candidate(
                 self._session, cand,
@@ -1071,7 +1076,8 @@ class GameRunner:
                 call_seq=call_seq, snapshot_seq=snapshot_seq,
                 candidates_seq=candidates_seq, reason=reason,
                 origin_seq=origin_seq, target=target, affected=affected,
-                actor_tile=actor_tile)
+                actor_tile=actor_tile,
+                pre_obs=pre_obs, pre_info=pre_info)
         seq = self._emit_action_result(
             turn=turn, ref=cand.id, domain=cand.domain, verb=cand.verb,
             target=target, affected=affected, actor_tile=actor_tile,
@@ -1094,7 +1100,9 @@ class GameRunner:
                               origin_seq: Optional[int],
                               target: Optional[str],
                               affected: Optional[str],
-                              actor_tile: Optional[tuple[int, int]]
+                              actor_tile: Optional[tuple[int, int]],
+                              pre_obs: Mapping[str, Any],
+                              pre_info: Mapping[str, Any]
                               ) -> tuple[Any, int]:
         """§3 line 35: settle a mutation whose read-back is inconclusive
         after a disconnect, ONLY by full-state reconciliation — the
@@ -1118,9 +1126,10 @@ class GameRunner:
                     f"blind replay, §3 line 35)"),
             durable=True)
         # Full-state reconciliation: re-read (the reconnect) and compare
-        # the target postconditions against the pre-mutation state.
-        pre_obs = self._session.obs
-        pre_info = self._session.info
+        # the target postconditions against the caller-captured
+        # pre-mutation baseline (captured BEFORE the send — the session's
+        # cached obs may already be post-mutation when the send failed,
+        # e.g. a step that completed and an execute that raised after it).
         try:
             fresh = self._session.refresh()
             readback = adapter.execute.verify_readback(
