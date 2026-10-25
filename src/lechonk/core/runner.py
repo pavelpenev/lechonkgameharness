@@ -247,6 +247,10 @@ class _IngestResult:
     # FW-R2: every attempt's memory_update for the turn, in attempt order;
     # _model_phase attaches the shared list to the result it returns.
     attempt_memory_updates: list = field(default_factory=list)
+    # FW-16: every attempt's batch-level ActionBatch.commitments, in
+    # attempt order; _model_phase attaches the shared list to the result
+    # it returns.
+    attempt_batch_commitments: list = field(default_factory=list)
 
 
 @dataclass
@@ -601,8 +605,14 @@ class GameRunner:
         # memory_update — a repair replaces the executed batch, never a
         # commitment the model already made this turn
         updates = result.attempt_memory_updates
+        # FW-16: the batch-level ActionBatch.commitments are ingested too —
+        # one CommitmentRecord per batch carrying the UNION of both sources
+        # (and of every attempt), identical commitments deduplicated. No
+        # source tagging: CommitmentRecord forbids extra fields.
+        batch_commitments = result.attempt_batch_commitments
         if updates:
             self.memory.apply(updates[-1], turn=turn)
+        if updates or batch_commitments:
             commitments: list = []
             threats: list = []
             for update in updates:
@@ -612,6 +622,9 @@ class GameRunner:
                 for t in update.threats:
                     if t not in threats:
                         threats.append(t)
+            for c in batch_commitments:
+                if c not in commitments:
+                    commitments.append(c)
             self._emit(CommitmentRecord(
                 turn=turn,
                 commitments=commitments,
@@ -771,6 +784,9 @@ class GameRunner:
         # turn's CommitmentRecord unions them, so a repair never drops
         # what an earlier attempt already stated.
         memory_updates: list = []
+        # FW-16: every attempt's batch-level ActionBatch.commitments, in
+        # attempt order — the turn's CommitmentRecord unions both sources.
+        batch_commitments: list = []
         prompt = TurnPrompt(
             call_id=f"{run_id}/t{turn}/call1", turn_id=f"{run_id}/t{turn}",
             memory=self.memory.render_for_prompt(),
@@ -790,7 +806,10 @@ class GameRunner:
             provenance=provenance)
         if result.batch is not None and result.batch.memory_update is not None:
             memory_updates.append(result.batch.memory_update)
+        if result.batch is not None:
+            batch_commitments.extend(result.batch.commitments)
         result.attempt_memory_updates = memory_updates
+        result.attempt_batch_commitments = batch_commitments
         result.call_seq = call_seq
         result.why = self._why_unusable(resp, result)
 
@@ -815,6 +834,7 @@ class GameRunner:
                        f"degraded default applies")))
             result2 = _IngestResult(batch=None, failed=True)
             result2.attempt_memory_updates = memory_updates
+            result2.attempt_batch_commitments = batch_commitments
             result2.degraded = True
             why = (f"repair skipped: insufficient ACTING budget "
                    f"({remaining_s:.1f}s remaining < "
@@ -851,7 +871,10 @@ class GameRunner:
             provenance=provenance)
         if result2.batch is not None and result2.batch.memory_update is not None:
             memory_updates.append(result2.batch.memory_update)
+        if result2.batch is not None:
+            batch_commitments.extend(result2.batch.commitments)
         result2.attempt_memory_updates = memory_updates
+        result2.attempt_batch_commitments = batch_commitments
         result2.call_seq = call_seq2
         result2.why = self._why_unusable(resp2, result2)
         # The degraded default applies when the model is unresponsive after

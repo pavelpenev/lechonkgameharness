@@ -16,13 +16,17 @@ from pathlib import Path
 
 from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
+from lechonk.core.metrics import commitment_board
+from lechonk.core.model_client import ModelResponse
 from lechonk.core.runner import ENTITY_ID_RE
 from lechonk.core.schemas import (
+    ActionBatch,
     ActionResultRecord,
     CandidatesRefRecord,
     CityView,
     CommitmentRecord,
     MapView,
+    MemoryUpdate,
     MetricEventRecord,
     ModelCallRecord,
     OutcomeRecord,
@@ -1357,3 +1361,89 @@ def test_runner_repair_budget_skip_still_ledgers_attempt_memory_update(
     assert len(records) == 1
     assert [(c.domain, c.target) for c in records[0].commitments] == [
         ("research", "Alphabet")]
+
+
+# ---------------------------------------------------------------------------
+# FW-16: batch-level ActionBatch.commitments are ingested alongside the
+# memory_update ones; an engine-automatic resolution that fulfills a
+# commitment credits fulfilled_other on the commitment board
+# ---------------------------------------------------------------------------
+
+
+def test_runner_batch_commitments_ingested_with_memory_update_ones(tmp_path):
+    """FW-16: the batch-level ActionBatch.commitments reach the turn's
+    CommitmentRecord alongside the memory_update ones — the union of both
+    sources, identical commitments deduplicated."""
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    shared = {"domain": "research", "target": "Alphabet", "deadline_turn": 3}
+    batch = ActionBatch(
+        turn_id="t1",
+        actions=[{"ref": "unit:10:goto_e"}],
+        commitments=[shared,
+                     {"domain": "expansion", "target": "city:2",
+                      "deadline_turn": 5}],
+        finish_requested=True,
+        memory_update=MemoryUpdate(
+            commitments=[shared,
+                         {"domain": "military", "target": "unit:20",
+                          "deadline_turn": 4}]),
+    )
+    client = FakeModelClient([
+        ModelResponse(call_id="fake-call", prompt_hash="ph", batch=batch,
+                      latency_ms=1, tokens_in=10, tokens_out=10,
+                      cost_usd=0.0, fingerprint="fp"),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = [r for r in _records(runner.ledger.path)
+               if isinstance(r, CommitmentRecord) and r.turn == 1]
+    assert len(records) == 1
+    assert [(c.domain, c.target, c.deadline_turn)
+            for c in records[0].commitments] == [
+        ("research", "Alphabet", 3),  # in both sources: deduplicated
+        ("military", "unit:20", 4),   # memory_update only
+        ("expansion", "city:2", 5),   # batch-level only
+    ]
+
+
+def test_runner_engine_automatic_resolution_credits_fulfilled_other(tmp_path):
+    """FW-16: an engine-automatic resolution (readback "none" by
+    construction) that fulfills a batch-level commitment produces a
+    fulfilled_other — never fulfilled_model — credit on the commitment
+    board, end to end."""
+    # Turn 1: researching Alphabet, the model moves a unit and commits (at
+    # batch level) to the Pottery research. Turn 2: the engine continued
+    # research to Pottery (tech 2) during WAITING — no executed tech action
+    # of ours -> engine_automatic, which fulfills the commitment.
+    worlds = [
+        turn_world(1, researching=1),
+        turn_world(2, researching=2),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False,
+                    commitments=[("research", "Pottery", 2)]),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    # The batch-level commitment reached the turn's CommitmentRecord.
+    commitments = [r for r in records if isinstance(r, CommitmentRecord)]
+    assert len(commitments) == 1
+    assert [(c.domain, c.target) for c in commitments[0].commitments] == [
+        ("research", "Pottery")]
+    # The engine-automatic research resolution fulfilled it: a
+    # fulfilled_other credit on the board, never fulfilled_model.
+    board = commitment_board(records)
+    entry = next(e for e in board if e["target"] == "Pottery")
+    assert entry["status"] == "fulfilled_other"
+    assert entry["fulfilled_by"] == ["engine_automatic:research:Pottery"]
+    assert entry["fulfilled_model_by"] == []
