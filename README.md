@@ -161,7 +161,11 @@ recorded as `model` / `continued_model_order` (linked to its origin) / `scripted
 candidates, the choice, the call ID, the execution result and the verification evidence.
 The participation gate (model participation on >=80% of turns-with-opportunities) is
 enforced on every run: a failing gate labels the run `degraded-dominant` — the run is
-still reported in full, but excluded from model-performance claims. Engine-automatic
+still reported in full, but excluded from model-performance claims. The gate passes
+iff participation >= 0.80 AND every numeric-status (ok) per-domain share is
+majority-model (> 0.5). Small domains (n/a at zero decisions, insufficient sample at
+1-4) are exempt by design and cannot block the gate; insufficient participation
+leaves the gate unset rather than passed. Engine-automatic
 resolutions of new research/production choices are counted, never hidden.
 
 ## OSS disclosure
