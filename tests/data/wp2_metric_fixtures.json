@@ -246,6 +246,82 @@
         "participation": {"numerator": 0, "denominator": 0, "value": null, "status": "n/a"},
         "participation_gate_pass": null
       }
+    },
+
+    "verb-mismatch-does-not-fulfill": {
+      "description": "FW-11 verb compatibility (dated addendum 2026-10-24-verb-typed-targets §5): a set commitment verb gates fulfillment. Two military commitments (unit:20 and unit:21, verb 'attack', deadline 2). The turn-2 attack_n action on unit:20 is verb-compatible ('attack' -> attack_* prefix) and fulfills its commitment; the turn-2 goto_n action on unit:21 matches domain and target but its verb is not in the 'attack' class, so that commitment is NOT fulfilled.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "commitment", "turn": 1, "commitments": [
+          {"domain": "military", "target": "unit:20", "target_kind": "unit", "verb": "attack", "deadline_turn": 2},
+          {"domain": "military", "target": "unit:21", "target_kind": "unit", "verb": "attack", "deadline_turn": 2}
+        ], "threats": []},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "action_result", "turn": 2, "ref": "unit:10:attack_n", "domain": "unit", "verb": "attack_n", "target": "unit:20", "affected": "unit:20", "actor_tile": [2, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "action_result", "turn": 2, "ref": "unit:10:goto_n", "domain": "unit", "verb": "goto_n", "target": "unit:21", "affected": "unit:21", "actor_tile": [2, 1], "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "run [1,2]; 2 commitments emitted (keys (unit:20, military) and (unit:21, military) are distinct) -> total 2, deduped 0; both deadlines 2 lie inside [1,2] -> censored 0, denominator 2. c1 (unit:20, verb attack, emitted turn 1, deadline 2): the turn-2 attack_n action is executed, its metric domain unit_action is in the military commitment-domain map, target 'unit:20' equals the typed unit descriptor, and verb 'attack_n' starts with the 'attack_' prefix of the 'attack' class -> FULFILLED by a model action. c2 (unit:21, verb attack): the only otherwise-matching action is the turn-2 goto_n on unit:21 - domain and target match, but 'goto_n' is not in the 'attack' class (attack_*) -> NOT fulfilled (the attack_n action targets unit:20, not unit:21). fulfilled_any = 1/2, fulfilled_model = 1/2; denominator 2 < 5 -> both shares 'insufficient sample', value null (§3 line 42).",
+        "run_turns": [1, 2],
+        "commitment_total": 2,
+        "commitment_deduped": 0,
+        "commitment_censored": 0,
+        "commitment_followthrough_any": {"numerator": 1, "denominator": 2, "value": null, "status": "insufficient sample"},
+        "commitment_followthrough_model": {"numerator": 1, "denominator": 2, "value": null, "status": "insufficient sample"}
+      }
+    },
+
+    "pre-emission-action-does-not-fulfill": {
+      "description": "FW-11 emission-turn lower bound: a fulfilling action's turn must lie in [emission turn, deadline]. The Pottery research commitment is emitted on turn 2 (deadline 3); the only matching Pottery action is the turn-1 research (executed, model) - it predates the emission and does NOT fulfill. The Alphabet commitment (also emitted turn 2, deadline 3) is the positive control: the turn-3 research on Alphabet lies inside [2, 3] and fulfills.",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "action_result", "turn": 1, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "commitment", "turn": 2, "commitments": [
+          {"domain": "research", "target": "Pottery", "verb": "research", "deadline_turn": 3},
+          {"domain": "research", "target": "Alphabet", "verb": "research", "deadline_turn": 3}
+        ], "threats": []},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "action_result", "turn": 3, "ref": "tech:cur_player:research_tech_alphabet_0", "domain": "tech", "verb": "research_tech_alphabet_0", "target": "Alphabet", "affected": "Alphabet", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "run [1,3]; 2 commitments emitted (keys (Pottery, research) and (Alphabet, research) are distinct) -> total 2, deduped 0; both deadlines 3 lie inside [1,3] -> censored 0, denominator 2. Pottery commitment (emitted turn 2, deadline 3): its only matching action is the turn-1 research_tech_pottery_1 on Pottery - executed, domain research, target Pottery, verb compatible ('research' -> research_* prefix) - but turn 1 < emission turn 2, so the FW-11 lower bound emitted_turn <= action.turn <= deadline excludes it -> NOT fulfilled (the turn-3 action targets Alphabet, not Pottery). Alphabet commitment (emitted turn 2, deadline 3): the turn-3 research_tech_alphabet_0 on Alphabet satisfies 2 <= 3 <= 3, domain, target and verb -> FULFILLED by a model action. fulfilled_any = 1/2, fulfilled_model = 1/2; denominator 2 < 5 -> both shares 'insufficient sample', value null (§3 line 42).",
+        "run_turns": [1, 3],
+        "commitment_total": 2,
+        "commitment_deduped": 0,
+        "commitment_censored": 0,
+        "commitment_followthrough_any": {"numerator": 1, "denominator": 2, "value": null, "status": "insufficient sample"},
+        "commitment_followthrough_model": {"numerator": 1, "denominator": 2, "value": null, "status": "insufficient sample"}
+      }
+    },
+
+    "duplicate-prefers-in-run": {
+      "description": "FW-11 dedup preference: two emissions share the key (Pottery, research). The first (turn 1) is memory-carried with a stale deadline 20, outside the run [1, 9]; the second (turn 2) is the in-run emission with deadline 4. The preference keeps the in-run emission, so the commitment still counts (first-wins would keep the stale one and silently censor it out of the metric). The turn-3 research on Pottery fulfills the kept emission (2 <= 3 <= 4).",
+      "records": [
+        {"kind": "turn_start", "turn": 1},
+        {"kind": "commitment", "turn": 1, "commitments": [
+          {"domain": "research", "target": "Pottery", "verb": "research", "deadline_turn": 20}
+        ], "threats": []},
+        {"kind": "turn_start", "turn": 2},
+        {"kind": "commitment", "turn": 2, "commitments": [
+          {"domain": "research", "target": "Pottery", "verb": "research", "deadline_turn": 4}
+        ], "threats": []},
+        {"kind": "turn_start", "turn": 3},
+        {"kind": "action_result", "turn": 3, "ref": "tech:cur_player:research_tech_pottery_1", "domain": "tech", "verb": "research_tech_pottery_1", "target": "Pottery", "affected": "Pottery", "outcome": "executed", "provenance_class": "model", "readback": "verified"},
+        {"kind": "turn_start", "turn": 9},
+        {"kind": "outcome", "outcome": "COMPLETED", "reason": "horizon reached"}
+      ],
+      "expectation": {
+        "hand_computed": "run [1,9]; 2 emissions share the key (Pottery, research) -> total 2, deduped 1. Dedup preference: the bucket is [(turn 1, deadline 20), (turn 2, deadline 4)]; the in-run emission is the one whose deadline 4 lies inside [1,9] (20 does not), so the kept emission is (turn 2, deadline 4, emitted_turn 2) - first-wins would have kept (turn 1, deadline 20). Kept deadline 4 lies inside [1,9] -> denominator 1, censored = kept - in_run = 1 - 1 = 0. The kept commitment is fulfilled by the turn-3 research_tech_pottery_1 on Pottery: executed, 2 <= 3 <= 4, domain research, target Pottery, verb 'research_tech_pottery_1' starts with the 'research_' prefix of the 'research' class, provenance model -> fulfilled_any = 1/1, fulfilled_model = 1/1; denominator 1 < 5 -> both shares 'insufficient sample', value null (§3 line 42).",
+        "run_turns": [1, 9],
+        "commitment_total": 2,
+        "commitment_deduped": 1,
+        "commitment_censored": 0,
+        "commitment_followthrough_any": {"numerator": 1, "denominator": 1, "value": null, "status": "insufficient sample"},
+        "commitment_followthrough_model": {"numerator": 1, "denominator": 1, "value": null, "status": "insufficient sample"}
+      }
     }
   }
 }

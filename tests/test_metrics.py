@@ -559,12 +559,86 @@ def test_fw10_typed_target_kinds_are_kind_aware():
     assert entry["status"] == "fulfilled_model"
     buy = _fw10_action(turn=2, domain="city", verb="city_buy_production",
                        target="city:3", ref="city:3:city_buy_production")
+    # verb unset: any action — FW-11 enforces a set verb, and 'build' is
+    # not compatible with city_buy_production (dated addendum §5)
     entry = _fw10_board(
         Commitment(domain="other", target_kind="city", target="city:3",
-                   verb="build", deadline_turn=2), buy)
+                   deadline_turn=2), buy)
     assert entry["status"] == "fulfilled_model"
     # exact string equality alone is NOT enough: the family must agree
     entry = _fw10_board(
         Commitment(domain="military", target_kind="tile", target="unit:7",
                    deadline_turn=2), fortify)
     assert entry["status"] == "missed"
+
+
+# ---------------------------------------------------------------------------
+# FW-11: verb compatibility, emission-turn lower bound, in-run dedup
+# preference (dated addendum
+# artifacts/runs/wp2-schema-coverage/2026-10-24-verb-typed-targets/ §5)
+# ---------------------------------------------------------------------------
+
+
+def _assert_fw11_commitment_fixture(fixtures, tmp_path, name):
+    """Build a fixture's records through the real TranscriptLedger and
+    assert its hand-computed commitment expectations: run turns, the
+    dedup/censor accounting, and both follow-through shares (the full
+    arithmetic is spelled out in the fixture's hand_computed field)."""
+    records = build_records(fixtures[name], tmp_path)
+    report = compute_metrics(records)
+    exp = fixtures[name]["expectation"]
+    assert report.run_turns == tuple(exp["run_turns"])
+    assert report.commitment_total == exp["commitment_total"]
+    assert report.commitment_deduped == exp["commitment_deduped"]
+    assert report.commitment_censored == exp["commitment_censored"]
+    _assert_share(report.commitment_followthrough_any,
+                  exp["commitment_followthrough_any"],
+                  "commitment_followthrough_any")
+    _assert_share(report.commitment_followthrough_model,
+                  exp["commitment_followthrough_model"],
+                  "commitment_followthrough_model")
+    return records
+
+
+def test_fw11_fixture_verb_mismatch_does_not_fulfill(fixtures, tmp_path):
+    """Hand-computed (see the fixture): two military commitments with verb
+    'attack'; the attack_n action fulfills unit:20 (verb class attack_*),
+    the goto_n action on unit:21 matches domain+target but its verb is
+    outside the 'attack' class -> only 1/2 fulfilled; denominator 2 < 5
+    -> 'insufficient sample' (not a number, §3 line 42)."""
+    _assert_fw11_commitment_fixture(
+        fixtures, tmp_path, "verb-mismatch-does-not-fulfill")
+
+
+def test_fw11_fixture_pre_emission_action_does_not_fulfill(fixtures,
+                                                          tmp_path):
+    """Hand-computed (see the fixture): the Pottery commitment is emitted
+    on turn 2 (deadline 3); its only matching action is the turn-1
+    research, which predates the emission -> the emission-turn lower
+    bound (emitted_turn <= action.turn <= deadline) excludes it. The
+    Alphabet commitment is fulfilled by the turn-3 research (2 <= 3 <= 3)
+    -> 1/2 fulfilled; denominator 2 < 5 -> 'insufficient sample'."""
+    _assert_fw11_commitment_fixture(
+        fixtures, tmp_path, "pre-emission-action-does-not-fulfill")
+
+
+def test_fw11_fixture_duplicate_prefers_in_run(fixtures, tmp_path):
+    """Hand-computed (see the fixture): two emissions share the key
+    (Pottery, research) - a stale memory-carried one (turn 1, deadline 20,
+    outside the run [1, 9]) and the in-run one (turn 2, deadline 4). The
+    dedup preference keeps the in-run emission -> total 2, deduped 1,
+    censored 0, denominator 1, fulfilled 1/1 by the turn-3 research
+    (2 <= 3 <= 4); denominator 1 < 5 -> 'insufficient sample'."""
+    records = _assert_fw11_commitment_fixture(
+        fixtures, tmp_path, "duplicate-prefers-in-run")
+    # the board uses the same dedup preference: the kept emission is the
+    # in-run one (emitted turn 2, deadline 4), not the stale turn-1 one
+    # (first-wins would have kept it and censored the commitment away)
+    from lechonk.core.metrics import commitment_board
+    board = commitment_board(records)
+    assert len(board) == 1
+    assert board[0]["emitted_turn"] == 2
+    assert board[0]["deadline_turn"] == 4
+    assert board[0]["status"] == "fulfilled_model"
+    assert board[0]["fulfilled_by"] == [
+        "tech:cur_player:research_tech_pottery_1"]

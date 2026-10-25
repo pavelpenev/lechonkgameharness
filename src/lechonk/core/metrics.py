@@ -23,12 +23,17 @@ ledger-only — no free-text parsing anywhere):
   executed decisions), never hidden.
 - commitment follow-through: commitments are the structured objects the
   model emits (domain, target kind, target, optional verb, deadline turn),
-  de-duplicated per (target, domain) — first emission wins. Denominator =
-  commitments whose deadline falls inside the run [first_turn, last_turn];
-  censored-at-horizon commitments are excluded, not failed. A commitment
-  is fulfilled by a ledger-verified matching EXECUTED action (same domain +
-  registered target + compatible verb) with turn ≤ deadline. Two shares:
-  intent realized by any policy (fulfilled_any), and model-attributed
+  de-duplicated per (target, domain) — FW-11 (2026-10-24): when duplicates
+  share a key, the in-run emission (its deadline inside the run window) is
+  preferred over a memory-carried restatement, falling back to first-wins.
+  Denominator = kept commitments whose deadline falls inside the run
+  [first_turn, last_turn]; censored-at-horizon commitments are excluded,
+  not failed. A commitment is fulfilled by a ledger-verified matching
+  EXECUTED action (same domain + registered target + compatible verb) with
+  turn in [emission turn, deadline] — FW-11: an action cannot predate the
+  commitment's emission, and an unset verb accepts any action while a set
+  verb must be compatible per the dated addendum's verb mapping. Two
+  shares: intent realized by any policy (fulfilled_any), and model-attributed
   (fulfilled_model: the fulfilling action's provenance is model, or
   continued_model_order whose ORIGIN action is model-class and itself
   matches the commitment) — a scripted default realizing the promise is
@@ -106,6 +111,18 @@ _COMMITMENT_DOMAIN_MAP: Mapping[str, frozenset[str]] = {
     "diplomacy": frozenset({"diplomacy"}),
     "other": frozenset({"research", "production", "expansion", "unit_action",
                          "diplomacy", "city_other"}),
+}
+
+# FW-11 (dated addendum 2026-10-24, §5): commitment verb -> compatible
+# action verbs. An entry ending in "_" is an action-verb prefix; any other
+# entry is an exact action verb.
+COMMITMENT_VERB_ACTIONS: Mapping[str, tuple[str, ...]] = {
+    "research": ("research_", "set_tech_goal_"),
+    "build": ("build_city", "produce_", "build_road", "irrigation", "mine"),
+    "attack": ("attack_",),
+    "move": ("goto_",),
+    "negotiate": ("stop_negotiation", "cancel_treaty", "accept_treaty"),
+    "defend": ("fortify", "sentry"),
 }
 
 
@@ -199,6 +216,23 @@ def _target_match(action: ActionResultRecord, commitment: Commitment) -> bool:
     if kind == "production":
         return action.domain == "city" and action.verb.startswith("produce_")
     return False
+
+
+def _verb_compatible(action: ActionResultRecord, commitment: Commitment) -> bool:
+    """FW-11 (dated addendum §5): an unset commitment verb accepts any
+    action (backward compatible); a set verb requires the action's verb to
+    be compatible per the documented mapping (prefix entries end in "_");
+    a verb outside the documented vocabulary falls back to exact normalized
+    equality with the action verb."""
+    want = _norm(commitment.verb)
+    if not want:
+        return True
+    patterns = COMMITMENT_VERB_ACTIONS.get(want)
+    if patterns is None:
+        return _norm(action.verb) == want
+    have = _norm(action.verb)
+    return any(have == p or (p.endswith("_") and have.startswith(p))
+               for p in patterns)
 
 
 def _chebyshev(ax: int, ay: int, bx: int, by: int) -> int:
@@ -324,12 +358,13 @@ def _is_attempt(rec: ActionResultRecord) -> bool:
 
 def _commitment_matches(action: ActionResultRecord, c: Commitment) -> bool:
     """The frozen commitment-matching predicate (§3 line 40): the action's
-    metric domain is compatible with the commitment's domain and its
-    registered target matches (kind-aware exact equality, FW-10)."""
+    metric domain is compatible with the commitment's domain, its registered
+    target matches (kind-aware exact equality, FW-10), and its verb is
+    compatible (FW-11)."""
     md = _action_metric_domain(action)
     if md not in _COMMITMENT_DOMAIN_MAP.get(c.domain, frozenset()):
         return False
-    return _target_match(action, c)
+    return _target_match(action, c) and _verb_compatible(action, c)
 
 
 def _commitment_fulfills_model(action: ActionResultRecord, c: Commitment,
@@ -363,11 +398,53 @@ def _unique_refs(refs: Sequence[str]) -> list[str]:
     return out
 
 
+def _dedupe_commitments(
+    records: Sequence[TranscriptRecord],
+    first_turn: int,
+    last_turn: int,
+) -> tuple[list[tuple[Commitment, int, Optional[int]]], int, int]:
+    """Collect and de-duplicate commitments per (target, domain), carrying
+    each kept emission's turn and call seq (FW-11: the emission turn is the
+    lower bound for fulfilling actions, so it must survive deduplication).
+
+    FW-11 dedup preference: when several emissions share a key, prefer the
+    in-run emission — the one whose deadline falls inside
+    [first_turn, last_turn] and which the frozen denominator therefore
+    counts — over a memory-carried restatement whose stale deadline falls
+    outside the run window (keeping that would silently drop the commitment
+    from the metric). Ties fall back to first-wins. Returns the kept
+    (commitment, emission turn, call seq) triples in first-emission key
+    order, the deduplicated count, and the emission total.
+    """
+    emissions: dict[tuple[str, str], list[tuple[Commitment, int, Optional[int]]]] = {}
+    order: list[tuple[str, str]] = []
+    total = 0
+    for r in records:
+        if not isinstance(r, CommitmentRecord):
+            continue
+        for c in r.commitments:
+            total += 1
+            key = (c.target, c.domain)
+            bucket = emissions.get(key)
+            if bucket is None:
+                bucket = []
+                emissions[key] = bucket
+                order.append(key)
+            bucket.append((c, r.turn, r.call_seq))
+    kept: list[tuple[Commitment, int, Optional[int]]] = []
+    for key in order:
+        bucket = emissions[key]
+        in_run = [e for e in bucket
+                  if first_turn <= e[0].deadline_turn <= last_turn]
+        kept.append((in_run or bucket)[0])
+    return kept, total - len(kept), total
+
+
 def commitment_board(records: Sequence[TranscriptRecord]
                      ) -> list[dict[str, Any]]:
     """Per-commitment status board for the replay viewer (§7.6 commitments
-    board): every de-duplicated commitment (first emission wins, the same
-    rule as ``compute_metrics``) with its status — ``fulfilled_model`` /
+    board): every de-duplicated commitment (same dedup preference as
+    ``compute_metrics``, FW-11) with its status — ``fulfilled_model`` /
     ``fulfilled_other`` / ``missed`` / ``open`` (deadline outside the run
     window: censored at horizon, excluded not failed) — computed with the
     SAME frozen matching semantics as ``compute_metrics`` (no parallel
@@ -375,19 +452,10 @@ def commitment_board(records: Sequence[TranscriptRecord]
     actions = [r for r in records if isinstance(r, ActionResultRecord)]
     by_seq = {r.seq: r for r in actions}
     first_turn, last_turn = _run_turns(records)
-    commitments: list[tuple[Commitment, int, Optional[int]]] = []
-    seen: set[tuple[str, str]] = set()
-    for r in records:
-        if not isinstance(r, CommitmentRecord):
-            continue
-        for c in r.commitments:
-            key = (c.target, c.domain)
-            if key in seen:
-                continue
-            seen.add(key)
-            commitments.append((c, r.turn, r.call_seq))
+    kept, _deduped, _total = _dedupe_commitments(records, first_turn,
+                                                 last_turn)
     board: list[dict[str, Any]] = []
-    for c, emitted_turn, call_seq in commitments:
+    for c, emitted_turn, call_seq in kept:
         entry: dict[str, Any] = {
             "domain": c.domain, "target": c.target,
             "deadline_turn": c.deadline_turn, "emitted_turn": emitted_turn,
@@ -401,7 +469,7 @@ def commitment_board(records: Sequence[TranscriptRecord]
             continue
         fulfilling = [a for a in actions
                       if a.outcome == "executed"
-                      and a.turn <= c.deadline_turn
+                      and emitted_turn <= a.turn <= c.deadline_turn
                       and _commitment_matches(a, c)]
         model_fulfilling = [a for a in fulfilling
                             if _commitment_fulfills_model(a, c, by_seq)]
@@ -461,29 +529,24 @@ def compute_metrics(records: Sequence[TranscriptRecord]) -> MetricsReport:
     # ------------------------------------------------------------------
     # commitment follow-through (§3 line 40, §7.7)
     # ------------------------------------------------------------------
-    commitments: list[Commitment] = []
-    seen: set[tuple[str, str]] = set()
-    for r in records:
-        if not isinstance(r, CommitmentRecord):
-            continue
-        for c in r.commitments:
-            key = (c.target, c.domain)
-            if key in seen:
-                report.commitment_deduped += 1
-                continue
-            seen.add(key)
-            commitments.append(c)
-    report.commitment_total = len(commitments) + report.commitment_deduped
-    in_run = [c for c in commitments
+    kept, deduped, total = _dedupe_commitments(records, first_turn,
+                                               last_turn)
+    report.commitment_total = total
+    report.commitment_deduped = deduped
+    in_run = [(c, emitted_turn)
+              for c, emitted_turn, _ in kept
               if first_turn <= c.deadline_turn <= last_turn]
-    report.commitment_censored = len(commitments) - len(in_run)
+    # censored-at-horizon = kept commitments excluded from the denominator;
+    # deduped emissions are counted separately (commitment_deduped), so the
+    # accounting stays total = deduped + censored + in_run.
+    report.commitment_censored = len(kept) - len(in_run)
 
     fulfilled_any_count = 0
     fulfilled_model_count = 0
-    for c in in_run:
+    for c, emitted_turn in in_run:
         fulfilling = [a for a in actions
                       if a.outcome == "executed"
-                      and a.turn <= c.deadline_turn
+                      and emitted_turn <= a.turn <= c.deadline_turn
                       and _commitment_matches(a, c)]
         if fulfilling:
             fulfilled_any_count += 1
