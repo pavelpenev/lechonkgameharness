@@ -25,6 +25,7 @@ from lechonk.core.ledger import (
     canonical_json,
     compute_checksum,
     load_transcript,
+    valid_prefix_bytes,
 )
 from lechonk.core.schemas import (
     ActionResultRecord,
@@ -220,6 +221,54 @@ def test_trailing_partial_record_is_discarded(tmp_path):
     assert load.discarded_trailing_partial
     assert load.discarded_bytes > 0
     assert [r.seq for r in load.records] == [0, 1]
+
+
+def test_corrupt_final_line_and_unterminated_tail_both_discarded(tmp_path):
+    # The exact combined torn-write case (D10, keep both): valid records,
+    # then a corrupt FINAL newline-terminated line, then an unterminated
+    # tail — both trailing artifacts are silently discarded together and
+    # no LedgerCorruptionError is raised (only a failure BEFORE the
+    # trailing record raises).
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_action(), durable=True)
+    ledger.close()
+    good_bytes = path.read_bytes()
+    corrupt_line = b'{"kind":"turn_start","turn":2,"seq":2\n'  # no closing brace
+    tail = b'{"kind":"action_result","turn":2,"ref":"unit:7:g'
+    path.write_bytes(good_bytes + corrupt_line + tail)
+    load = load_transcript(path)  # must not raise
+    assert load.discarded_trailing_partial
+    assert [r.seq for r in load.records] == [0, 1]
+    assert load.discarded_bytes == len(corrupt_line) + len(tail)
+
+
+def test_discarded_bytes_match_valid_prefix_bytes(tmp_path):
+    # The discarded byte total is exactly what valid_prefix_bytes implies:
+    # everything after the valid prefix — for each trailing-partial shape.
+    def build(path, torn):
+        ledger = TranscriptLedger(path)
+        ledger.append(TurnStartRecord(turn=1), durable=True)
+        ledger.append(_action(), durable=True)
+        ledger.close()
+        with open(path, "ab") as fh:
+            fh.write(torn)
+
+    cases = [
+        b'{"kind":"turn_start","turn":2,"seq":2\n',   # corrupt final line
+        b'{"kind":"action_result","turn":2,"ref":"x',  # unterminated tail
+        b'{"kind":"turn_start","turn":2,"seq":2\n'     # both at once
+        b'{"kind":"action_result","turn":2,"ref":"x',
+    ]
+    for i, torn in enumerate(cases):
+        path = tmp_path / f"t{i}.jsonl"
+        build(path, torn)
+        size = path.stat().st_size
+        load = load_transcript(path)
+        assert load.discarded_trailing_partial
+        assert load.discarded_bytes == size - valid_prefix_bytes(str(path))
+        assert load.discarded_bytes > 0
 
 
 def test_seq_duplicates_raise(tmp_path):

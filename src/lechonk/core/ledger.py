@@ -21,16 +21,27 @@ mechanics:
 - ``fsync()`` forces the intent-before-write boundary explicitly.
 - ``load_transcript(path)`` re-reads a transcript for the metrics: every
   line is schema-validated and checksum-verified, and seqs must be
-  exactly 0..n-1 (a duplicate or gap raises LedgerCorruptionError); a
-  trailing partial record is DISCARDED and reported. A tail record
-  without its terminating newline is ALWAYS a trailing partial — even
-  when it decodes and parses: its newline never landed, so it comes from
-  a torn-write window (never fsynced-complete); its mutation state is
-  settled by read-back reconciliation, so discarding is safe (never
-  "repair" by appending a newline). Corruption anywhere before the
-  trailing record raises LedgerCorruptionError (never silently dropped).
+  exactly 0..n-1 (a duplicate or gap raises LedgerCorruptionError);
+  "the last newline-terminated line" is the last line that ends with a
+  newline — the record preceding any unterminated tail — and a trailing
+  partial record is DISCARDED and reported. The trailing partial is
+  EITHER that final newline-terminated line failing validation/checksum
+  OR unterminated bytes after the newline, and both may be discarded
+  together when they co-occur. Unterminated tail bytes are ALWAYS a
+  trailing partial — even when they decode and parse: their newline
+  never landed, so they come from a torn-write window (never
+  fsynced-complete); the mutation state is settled by read-back
+  reconciliation, so discarding is safe (never "repair" by appending a
+  newline). Corruption anywhere before the trailing record raises
+  LedgerCorruptionError (never silently dropped).
 - ``TranscriptLedger.attach(path)`` recovers a transcript after a kill and
-  resumes appending at the next seq.
+  resumes appending at the next seq. ``load_transcript`` is read-only —
+  it never modifies the file — while attach additionally truncates the
+  recoverable working transcript to the valid prefix. Discarding is
+  conservative by design: torn trailing bytes are treated as a torn
+  write, not proven harmless; operational records preceding a discarded
+  tail may remain uncorrelated, and the P11 audit's pending-intent
+  scanner is the tool that reports them.
 
 The ledger never imports civrealm or the adapter (core purity,
 tests/test_core_purity.py).
@@ -106,15 +117,25 @@ def load_transcript(path: Union[str, Path]) -> TranscriptLoad:
     A torn write at EOF (the mid-write kill) leaves either unterminated
     bytes after the last newline or a final newline-terminated line that
     fails validation/checksum — both are the trailing partial record and
-    are discarded. Unterminated bytes at EOF are ALWAYS a trailing
-    partial, even when they decode and parse: the terminating newline
-    never landed, so the record comes from a torn-write window (never
-    fsynced-complete); its mutation state is settled by read-back
+    are discarded. "The last newline-terminated line" is the last line
+    that actually ends with a newline: the record preceding any
+    unterminated tail, and both trailing artifacts are discarded
+    together when they co-occur. Unterminated bytes at EOF are ALWAYS a
+    trailing partial, even when they decode and parse: the terminating
+    newline never landed, so the record comes from a torn-write window
+    (never fsynced-complete); its mutation state is settled by read-back
     reconciliation, so discarding is safe — never "repair" by appending
     a newline. The record seqs must be exactly 0..n-1 (no duplicates or
     gaps); a violation raises LedgerCorruptionError naming the file. Any
     other failure BEFORE the trailing record raises LedgerCorruptionError:
     the transcript is never silently truncated.
+
+    This read is conservative by design and never modifies the file: a
+    discarded trailing artifact is treated as a torn write, not proven
+    harmless. Recovery that truncates the file to the valid prefix is
+    TranscriptLedger.attach's job. Operational records preceding a
+    discarded tail may remain uncorrelated; the P11 audit's
+    pending-intent scanner is the tool that reports them.
     """
     path = str(path)
     raw = Path(path).read_bytes() if Path(path).exists() else b""
