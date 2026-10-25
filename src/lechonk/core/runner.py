@@ -119,6 +119,7 @@ from lechonk.core.schemas import (
     ActionResultRecord,
     Candidate,
     CandidateTable,
+    CandidateTableCapExceeded,
     CommitmentRecord,
     MetricEventRecord,
     ModelCallRecord,
@@ -592,7 +593,19 @@ class GameRunner:
             token_count=snapshot.estimated_tokens()))
         table = self._session.build_candidate_table()
         mark_armed_in_contact(table, snapshot)
-        offered = table.offered()
+        # W2-3: a cap overflow (armed-in-contact lines plus the mandatory
+        # overhead exceeding the budget — D4/W2-2) is a dedicated bounded
+        # failure like the prompt budget (FW-13): the metric event names
+        # the condition, never a generic infrastructure truncation.
+        try:
+            offered = table.offered()
+        except CandidateTableCapExceeded as exc:
+            self._emit(MetricEventRecord(
+                name="candidate_table_cap_exceeded",
+                value=f"turn {turn}: {exc}"))
+            self._transition(RunState.FAILED)
+            return ("TRUNCATED", f"candidate table cap exceeded: {exc}",
+                    prev_snapshot)
         by_domain: dict[str, int] = {}
         for cand in offered.candidates:
             by_domain[cand.domain] = by_domain.get(cand.domain, 0) + 1
@@ -1167,6 +1180,35 @@ class GameRunner:
         # pre-mutation state, never a post-mutation re-read.
         pre_obs = self._session.obs
         pre_info = self._session.info
+        # W2-3 pre-dispatch classification: map the candidate BEFORE any
+        # send. candidate_to_action is pure, so a mapping failure is fully
+        # classified here — outcome "rejected" (nothing was sent), no
+        # reconciliation and no resend — and can never fall into the
+        # disconnect path below. A failure raised after the send stays
+        # with the generic handler: something WAS sent.
+        try:
+            adapter.execute.candidate_to_action(cand)
+        except ValueError as exc:
+            detail = (f"pre-dispatch mapping failed ({exc!r}): the "
+                      f"candidate cannot be mapped to an action tuple — "
+                      f"never sent, never reconciled, never resent")
+            seq = self._emit_action_result(
+                turn=turn, ref=cand.id, domain=cand.domain, verb=cand.verb,
+                target=target, affected=affected, actor_tile=actor_tile,
+                outcome="rejected", rejection_class="schema_error",
+                provenance_class=provenance, origin_seq=origin_seq,
+                reason=reason, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq, call_seq=call_seq,
+                readback="none", detail=detail)
+            turn_before = int((pre_info or {}).get("turn", 0) or 0)
+            return adapter.execute.ExecutionResult(
+                candidate_id=cand.id, action=("", "", ""),
+                status="rejected",
+                readback=adapter.execute.Readback(status="none",
+                                                  detail=detail),
+                terminated=False, truncated=False,
+                turn_before=turn_before, turn_after=turn_before,
+                elapsed_s=0.0, detail=detail), seq
         try:
             result = adapter.execute.execute_candidate(
                 self._session, cand,
@@ -1292,6 +1334,18 @@ class GameRunner:
         model-originated). A second disconnect, a contradicted resend, or
         an inconclusive resend read-back quarantines; the resubmission is
         never repeated."""
+        # W2-3: never resend an unmappable candidate. The pre-dispatch
+        # classification in _execute_one keeps an unmappable candidate out
+        # of the reconciliation path entirely; this guard is the backstop
+        # at the resend site itself — the bounded fail-stop, never a
+        # resubmission.
+        try:
+            adapter.execute.candidate_to_action(cand)
+        except ValueError as exc:
+            raise _QuarantineFailStop(
+                f"unmappable candidate {cand.id} reached the resend path "
+                f"({exc!r}) — never resent (pre-dispatch classification, "
+                f"W2-3)") from None
         # Provenance honesty (§3 line 45): continued_model_order is a
         # MODEL-arm label — a scripted arm's resubmission mirrors its
         # origin attempt's provenance class, with the same origin linkage.

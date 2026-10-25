@@ -20,11 +20,13 @@ from typing import Any
 
 import pytest
 
+from lechonk.adapter import candidates as candidates_mod
 from lechonk.adapter.candidates import (
     UNIT_FIXED_VERBS,
     build_candidates,
 )
-from lechonk.core.schemas import CANDIDATE_ID_RE, CandidateTable
+from lechonk.adapter.execute import candidate_to_action
+from lechonk.core.schemas import CANDIDATE_ID_RE, CandidateTable, is_candidate_id
 
 from tests.fog_fixtures import (
     MY_PLAYER,
@@ -406,3 +408,44 @@ def test_verb_sanitization_collision_backstop():
     assert len(set(city_ids)) == 2
     for cid in city_ids:
         assert CANDIDATE_ID_RE.match(cid)
+
+
+# ---------------------------------------------------------------------------
+# W2-3: construction invariant — an unmappable candidate is unconstructable
+# ---------------------------------------------------------------------------
+
+
+def test_build_candidates_payloads_satisfy_candidate_to_action():
+    """W2-3 construction invariant: every candidate built from the full
+    surface carries execute.candidate_to_action's ENTIRE validation set —
+    a valid id, all three mapping keys (ctrl_type/actor_id/action_key),
+    and a non-empty action_key — so no execute-time mapping failure is
+    possible for a constructed candidate."""
+    table = _build()
+    assert table.candidates, "expected a non-empty table"
+    for cand in table.candidates:
+        assert is_candidate_id(cand.id)
+        assert "ctrl_type" in cand.payload
+        assert "actor_id" in cand.payload
+        assert "action_key" in cand.payload
+        assert isinstance(cand.payload["action_key"], str) \
+            and cand.payload["action_key"]
+        # The full mapping itself must succeed for every candidate.
+        ctrl_type, actor_id, action_key = candidate_to_action(cand)
+        assert ctrl_type == cand.payload["ctrl_type"]
+        assert actor_id == cand.payload["actor_id"]
+        assert action_key == cand.payload["action_key"]
+
+
+def test_build_candidates_rejects_payload_missing_actor_id(monkeypatch):
+    """W2-3: add() raises ValueError — not KeyError — when a builder
+    returns a payload missing a mapping key (the reachable regression:
+    a future builder forgetting actor_id), so the construction invariant
+    fails loudly at build time. (ctrl_type/action_key are set by add()
+    itself from the domain and the raw key; the remaining gap is
+    actor_id.)"""
+    monkeypatch.setattr(candidates_mod, "_city_candidate",
+                        lambda raw_key, actor_key:
+                        ("city_buy_production", "city 1 buy production", {}))
+    with pytest.raises(ValueError, match="missing 'actor_id'"):
+        build_candidates(base_world(), _info(), my_player_id=MY_PLAYER)

@@ -16,6 +16,8 @@ import inspect
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from lechonk.adapter.session import StepOutcome
 from lechonk.core.ledger import load_transcript
 from lechonk.core.metrics import commitment_board
@@ -23,6 +25,7 @@ from lechonk.core.model_client import ModelResponse
 from lechonk.core.runner import (
     ENTITY_ID_RE,
     GameRunner,
+    _QuarantineFailStop,
     _StandingOrder,
     mark_armed_in_contact,
 )
@@ -31,6 +34,7 @@ from lechonk.core.schemas import (
     ActionResultRecord,
     Candidate,
     CandidateTable,
+    CandidateTableCapExceeded,
     CandidatesRefRecord,
     CityView,
     CommitmentRecord,
@@ -1758,6 +1762,107 @@ def test_runner_prompt_budget_exceeded_bounded_fail_stop(tmp_path):
     assert isinstance(records[-1], OutcomeRecord)
     assert records[-1].outcome == "TRUNCATED"
     assert records[-1].reason.startswith("prompt budget exceeded")
+    assert "infrastructure" not in records[-1].reason.lower()
+    # Bounded: the failed turn never reached a model_call record.
+    assert _by_kind(records, ModelCallRecord) == []
+    assert session.closed
+
+
+# ---------------------------------------------------------------------------
+# W2-3: pre-dispatch error classification + the run-loop cap catch
+# ---------------------------------------------------------------------------
+
+
+class _UnmappableTableSession(_SyntheticTableSession):
+    """Serves a synthetic table AND fails loudly if any real mutation is
+    sent (the pipeline-owned finish step, action None, still works)."""
+
+    def step(self, action, *, deadline=None):
+        if action is not None:
+            raise AssertionError(
+                "a mutation was sent for an unmappable candidate")
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_pre_dispatch_mapping_failure_rejected_not_sent(tmp_path):
+    """W2-3: a candidate that cannot be mapped to an action tuple is
+    classified BEFORE any send — outcome rejected / schema_error /
+    readback none — never ledgered as 'send failed after dispatch',
+    never reconciled, never resent; the turn still completes."""
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:10:sentry", domain="unit", actor_id="10",
+                  verb="sentry", summary="sentry (payload-less)")])
+    session = _UnmappableTableSession([turn_world(1), turn_world(2)], table)
+    client = FakeModelClient([
+        ok_response(["unit:10:sentry"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    records = _records(runner.ledger.path)
+    by_ref = [a for a in _actions(records) if a.ref == "unit:10:sentry"]
+    assert len(by_ref) == 1
+    assert by_ref[0].outcome == "rejected"
+    assert by_ref[0].rejection_class == "schema_error"
+    assert by_ref[0].readback == "none"
+    assert "pre-dispatch mapping failed" in by_ref[0].detail
+    assert "after dispatch" not in by_ref[0].detail
+    # No reconciliation, no quarantine: nothing was ever sent.
+    assert [r for r in records
+            if isinstance(r, MetricEventRecord)
+            and r.name in ("mutation_reconciliation",
+                           "mutation_quarantine")] == []
+    # The session-level guard never fired: only the pipeline-owned
+    # finish steps (action None) reached the session — no send, no resend.
+    assert session.calls
+    assert all(c[0] is None for c in session.calls)
+
+
+def test_runner_resend_path_never_resends_unmappable_candidate(tmp_path):
+    """W2-3: the resend path itself refuses an unmappable candidate —
+    the bounded fail-stop (never a resubmission) and no send reaches
+    the session."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    runner = make_runner(tmp_path, client=FakeModelClient([]),
+                         session=session, max_turns=1)
+    adapter = runner._load_adapter()
+    cand = Candidate(id="unit:10:sentry", domain="unit", actor_id="10",
+                     verb="sentry")  # payload-less: unmappable
+    with pytest.raises(_QuarantineFailStop, match="never resent"):
+        runner._resend_verified_non_execution(
+            adapter, cand, turn=1, provenance="model", snapshot_seq=0,
+            candidates_seq=0, origin_seq=1, target=None, affected=None,
+            actor_tile=None)
+    assert [c for c in session.calls if c[0] is not None] == []
+
+
+def test_runner_candidate_table_cap_exceeded_bounded_fail_stop(tmp_path):
+    """W2-3: a candidate-table cap overflow (armed-in-contact lines plus
+    the mandatory overhead exceeding the budget) is the dedicated bounded
+    fail-stop — the candidate_table_cap_exceeded metric event, the
+    ACTING->FAILED transition, and a TRUNCATED outcome naming the cap —
+    never a generic infrastructure truncation."""
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:10:sentry", domain="unit", actor_id="10",
+                  verb="sentry", summary="a" * 8000, in_contact=True)])
+    session = _SyntheticTableSession([turn_world(1), turn_world(2)], table)
+    client = FakeModelClient([])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.reason.startswith("candidate table cap exceeded")
+    records = _records(runner.ledger.path)
+    cap_events = [r for r in _by_kind(records, MetricEventRecord)
+                  if r.name == "candidate_table_cap_exceeded"]
+    assert len(cap_events) == 1
+    assert "candidate-table cap" in cap_events[0].value
+    transitions = [r.value for r in _by_kind(records, MetricEventRecord)
+                   if r.name == "state_transition"]
+    assert "ACTING->FAILED" in transitions
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "TRUNCATED"
     assert "infrastructure" not in records[-1].reason.lower()
     # Bounded: the failed turn never reached a model_call record.
     assert _by_kind(records, ModelCallRecord) == []

@@ -211,10 +211,27 @@ def build_candidates(
             raise ValueError(
                 f"candidate id {cid!r} does not match CANDIDATE_ID_RE "
                 f"(raw action key {raw_key!r})")
+        if "actor_id" not in payload:
+            raise ValueError(
+                f"candidate {cid!r} payload is missing 'actor_id'; cannot "
+                f"map it to an action tuple (raw action key {raw_key!r})")
         full_payload = {"ctrl_type": CTRL_DOMAIN_REVERSE[domain],
                         "actor_id": payload["actor_id"],
                         "action_key": raw_key}
         full_payload.update(payload)
+        # W2-3 construction invariant: this mirrors execute.candidate_to_action's
+        # validation set (valid id above, all three mapping keys, a non-empty
+        # action_key), so an unmappable candidate cannot be CONSTRUCTED — a
+        # mapping failure can never happen at execute time.
+        missing = [k for k in ("ctrl_type", "actor_id", "action_key")
+                   if k not in full_payload]
+        if missing:
+            raise ValueError(
+                f"candidate {cid!r} payload is missing {missing}; cannot "
+                f"map it to an action tuple")
+        if not isinstance(full_payload["action_key"], str) \
+                or not full_payload["action_key"]:
+            raise ValueError(f"candidate {cid!r} has an empty action_key")
         candidates.append(Candidate(
             id=cid, domain=domain, actor_id=actor, verb=verb,
             summary=summary, payload=full_payload))
