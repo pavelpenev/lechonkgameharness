@@ -496,13 +496,15 @@ def cmd_arm(policy):
             probe1 = client.probe_fingerprint()
             fingerprint = probe1.fingerprint
             re_probe = None
-            status = ("match" if reference is None or fingerprint == reference
+            status = ("match" if reference is None
+                      or paired.fingerprint_match(reference, fingerprint)
                       else "mismatch")
-            if reference is not None and fingerprint != reference:
+            if reference is not None and status == "mismatch":
                 probe2 = client.probe_fingerprint()
                 re_probe = probe2.fingerprint
                 status = ("match_after_reprobe"
-                          if re_probe == reference else "mismatch_persistent")
+                          if paired.fingerprint_match(reference, re_probe)
+                          else "mismatch_persistent")
             log(f"arm fingerprint: {fingerprint} (reference={reference}, "
                 f"status={status}, re_probe={re_probe})")
             # The probe is an API call too (decision 4) — logged with
