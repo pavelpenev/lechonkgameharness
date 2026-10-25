@@ -228,6 +228,159 @@ def test_offered_counts_exactly_the_admitted_lines():
 
 
 # ---------------------------------------------------------------------------
+# W2-2: protected-first ADMISSION (D4) — protected tokens reserved up-front
+# ---------------------------------------------------------------------------
+
+
+def _w22_candidate(i, summary_chars, in_contact=False):
+    return Candidate(
+        id=f"unit:8{i:02d}:wait",
+        domain="unit",
+        actor_id=f"8{i:02d}",
+        verb="wait",
+        summary="z" * summary_chars,
+        in_contact=in_contact,
+    )
+
+
+def test_claim5_fixture_render_stays_within_budget():
+    """W2-2 (claim 5): a non-contact ~1,101-token line followed by a
+    150-token protected line used to render ~1,300 tokens — past the
+    1,200-token budget with NOTHING elided — because the protected
+    admission had no fit check. With the up-front reservation the
+    non-contact line no longer fits (its fit check runs against a `used`
+    that already includes the protected tokens plus the mandatory
+    rendering overhead), so it is elided and disclosed."""
+    table = CandidateTable(turn=1, candidates=[
+        _w22_candidate(0, 4390),                    # ~1,101-token line
+        _w22_candidate(1, 584, in_contact=True),    # 150-token protected line
+        _w22_candidate(2, 200),                     # ~54-token line
+    ])
+    offered = table.offered()
+    # the protected candidate is still offered, order preserved
+    assert [c.id for c in offered.candidates] == ["unit:801:wait",
+                                                  "unit:802:wait"]
+    rendered = table.render()
+    assert rendered.endswith("candidates omitted: 1 (beyond budget, table order)")
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+def test_late_protected_is_reserved_before_later_non_contact_lines():
+    """W2-2 late-protected fixture: the protected candidate sits late in
+    table order, after a non-contact line that is admitted and after lines
+    that end up elided; it is still admitted, and the non-contact lines
+    AFTER it fit-check against a `used` that includes its tokens."""
+    table = CandidateTable(turn=1, candidates=[
+        _w22_candidate(0, 385),                     # ~101-token line, admitted
+        _w22_candidate(1, 4184, in_contact=True),   # ~1,050-token protected line
+        _w22_candidate(2, 385),                     # no longer fits, elided
+        _w22_candidate(3, 385),                     # no longer fits, elided
+    ])
+    offered = table.offered()
+    # protected admitted; non-contact admission preserves table order and
+    # stops where the budget (including the reserved protected tokens and
+    # the mandatory overhead) runs out
+    assert [c.id for c in offered.candidates] == ["unit:800:wait",
+                                                  "unit:801:wait"]
+    rendered = table.render()
+    assert rendered.endswith("candidates omitted: 2 (beyond budget, table order)")
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+    # A non-contact line BEFORE the late protected line that only fits when
+    # the protected tokens are NOT reserved: pre-fix it was admitted and the
+    # rendered table overflowed (~2,133 tokens); with the up-front
+    # reservation its fit check runs against `used` including the protected
+    # tokens, it is elided, and the protected line alone renders within
+    # budget.
+    table = CandidateTable(turn=1, candidates=[
+        _w22_candidate(0, 4264),                    # ~1,070-token line
+        _w22_candidate(1, 4184, in_contact=True),   # ~1,050-token protected line
+        _w22_candidate(2, 385),
+    ])
+    offered = table.offered()
+    # the ~1,070-token line is elided; the protected line is still offered,
+    # and the small non-contact line AFTER it fit-checks against a `used`
+    # that includes the protected tokens (1,065 + 102 <= 1,200 — it fits)
+    assert [c.id for c in offered.candidates] == ["unit:801:wait",
+                                                  "unit:802:wait"]
+    rendered = table.render()
+    assert rendered.endswith("candidates omitted: 1 (beyond budget, table order)")
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+def test_protected_near_cap_with_omission_line_stays_within_budget():
+    """W2-2 protected-near-cap plus omission-line case: protected lines
+    that (with the mandatory overhead) just fit leave no room for
+    non-contact lines — they are elided and disclosed, and the rendered
+    table stays within the budget."""
+    table = CandidateTable(turn=1, candidates=[
+        _w22_candidate(0, 2344, in_contact=True),   # 590-token protected line
+        _w22_candidate(1, 200),
+        _w22_candidate(2, 2344, in_contact=True),   # 590-token protected line
+        _w22_candidate(3, 200),
+        _w22_candidate(4, 200),
+    ])
+    offered = table.offered()
+    assert [c.id for c in offered.candidates] == ["unit:800:wait",
+                                                  "unit:802:wait"]
+    rendered = table.render()
+    assert rendered.endswith("candidates omitted: 3 (beyond budget, table order)")
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+def test_protected_plus_mandatory_overhead_raises_cap_exceeded():
+    """W2-2 mandatory-content case: protected lines that fit the budget
+    ALONE but not together with the mandatory rendering overhead (join
+    separators + omission-disclosure line) raise CandidateTableCapExceeded
+    explicitly — never a protected-line drop, never a silent overflow."""
+    # One ~1,190-token protected line: 1,190 <= 1,200, but 1,191 + 14 > 1,200.
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:820:wait", domain="unit", actor_id="820",
+                  verb="wait", summary="x" * 4744, in_contact=True),
+    ])
+    with pytest.raises(CandidateTableCapExceeded):
+        table.offered()
+
+    # Two ~600-token protected lines: 1,202 + 14 > 1,200.
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id=f"unit:82{i}:wait", domain="unit", actor_id=f"82{i}",
+                  verb="wait", summary="x" * 2384, in_contact=True)
+        for i in (1, 2)
+    ])
+    with pytest.raises(CandidateTableCapExceeded):
+        table.offered()
+
+
+@pytest.mark.parametrize("nc_len", [0, 200, 800, 4400])
+@pytest.mark.parametrize("prot_len", [0, 300, 1150])
+def test_render_never_exceeds_budget_across_compositions(prot_len, nc_len):
+    """W2-2: across compositions, render either stays within
+    CANDIDATE_TABLE_TOKEN_BUDGET or raises CandidateTableCapExceeded —
+    it never silently exceeds the budget."""
+    candidates = []
+    if prot_len:
+        candidates.append(Candidate(id="unit:830:wait", domain="unit",
+                                    actor_id="830", verb="wait",
+                                    summary="p" * prot_len, in_contact=True))
+    candidates.append(Candidate(id="unit:831:wait", domain="unit",
+                                actor_id="831", verb="wait",
+                                summary="q" * nc_len))
+    if prot_len:
+        candidates.append(Candidate(id="unit:832:wait", domain="unit",
+                                    actor_id="832", verb="wait",
+                                    summary="p" * prot_len, in_contact=True))
+    candidates.append(Candidate(id="unit:833:wait", domain="unit",
+                                actor_id="833", verb="wait",
+                                summary="r" * nc_len))
+    table = CandidateTable(turn=1, candidates=candidates)
+    try:
+        rendered = table.render()
+    except CandidateTableCapExceeded:
+        return  # explicit misconfiguration raise — never a silent overflow
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+# ---------------------------------------------------------------------------
 # TranscriptRecord union + RunManifest (drafts, frozen in WP2)
 # ---------------------------------------------------------------------------
 

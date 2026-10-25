@@ -58,8 +58,9 @@ CANDIDATE_TABLE_TOKEN_BUDGET = 1200
 
 
 class CandidateTableCapExceeded(ValueError):
-    """Armed-in-contact candidates alone exceed the candidate-table cap —
-    an explicit misconfiguration (never a silent drop, FW-13)."""
+    """Armed-in-contact candidates plus the mandatory rendering overhead
+    exceed the candidate-table cap — an explicit misconfiguration (never a
+    silent drop, FW-13; never a protected-line drop, D4)."""
 
 # Candidate IDs are opaque tokens of the form ``domain:actor:verb``
 # (e.g. ``unit:7:goto_n``, ``city:3:produce_settlers``,
@@ -346,38 +347,48 @@ class CandidateTable(BaseModel):
 
     def offered(self) -> "CandidateTable":
         """The deterministically capped offered subset (§3 line 32 overflow
-        policy): armed-in-contact candidates are never dropped; the rest
-        are admitted in table order while they fit
-        CANDIDATE_TABLE_TOKEN_BUDGET, reserving room for the omission
-        disclosure line. Armed-in-contact candidates alone exceeding the
-        cap is a misconfiguration, not a drop — CandidateTableCapExceeded."""
+        policy, D4 protected-first admission): armed-in-contact candidates
+        are never dropped — their line tokens plus the mandatory rendering
+        overhead (join separators and the worst-case omission-disclosure
+        line) are reserved UP-FRONT, and the remaining candidates are
+        admitted in table order while they fit the residual
+        CANDIDATE_TABLE_TOKEN_BUDGET. Protected lines plus the mandatory
+        overhead exceeding the cap is a misconfiguration, not a drop —
+        CandidateTableCapExceeded."""
+        # Mandatory rendering overhead: the join separator ahead of each
+        # line and the trailing omission-disclosure line, reserved at the
+        # worst case (the omitted count can only shrink as candidates are
+        # dropped).
+        reserve = estimate_tokens(_omission_line(len(self.candidates))) + 1
+        # W2-2 admission fit, not just accounting: reserve the protected
+        # (in-contact) lines' tokens up-front — each line's join separator
+        # included — so the non-contact fit check below runs against a
+        # `used` that already includes them. Accounting alone (the pre-W2-2
+        # behavior) admitted a late-protected line unconditionally and let
+        # the rendered table drift past the budget with nothing elided.
         protected_tokens = sum(
-            estimate_tokens(_render_line(c))
+            estimate_tokens(_render_line(c)) + 1
             for c in self.candidates if c.in_contact)
-        if protected_tokens > CANDIDATE_TABLE_TOKEN_BUDGET:
+        if protected_tokens + reserve > CANDIDATE_TABLE_TOKEN_BUDGET:
             raise CandidateTableCapExceeded(
-                f"armed-in-contact candidates alone exceed the "
-                f"candidate-table cap: {protected_tokens} > "
+                f"armed-in-contact candidates plus the mandatory rendering "
+                f"overhead exceed the candidate-table cap: "
+                f"{protected_tokens + reserve} > "
                 f"{CANDIDATE_TABLE_TOKEN_BUDGET} tokens")
-        # Reserve the worst-case disclosure line (the omitted count can
-        # only shrink as candidates are dropped).
-        reserve = estimate_tokens(_omission_line(len(self.candidates)))
         kept: list[Candidate] = []
-        # `used` counts exactly the tokens of the admitted lines — contact
-        # and non-contact alike. The protected_tokens sum above is only the
-        # misconfiguration check, not a running total: counting it here too
-        # would double-count the in-contact lines and elide more than the
-        # budget requires.
-        used = 0
+        # `used` counts exactly the reserved/admitted lines' tokens:
+        # protected lines are reserved here up-front (already counted in
+        # protected_tokens — re-adding them in the loop would double-count),
+        # non-contact lines are added as they are admitted.
+        used = protected_tokens
         for cand in self.candidates:
-            line_tokens = estimate_tokens(_render_line(cand))
             if cand.in_contact:
-                # armed-in-contact candidates are never dropped (§3): they
-                # are admitted ahead of the budget check.
+                # armed-in-contact candidates are never dropped (§3, D4):
+                # their tokens are already reserved above.
                 kept.append(cand)
-                used += line_tokens
                 continue
-            if used + line_tokens + reserve > CANDIDATE_TABLE_TOKEN_BUDGET:
+            line_tokens = estimate_tokens(_render_line(cand)) + 1
+            if used + line_tokens > CANDIDATE_TABLE_TOKEN_BUDGET:
                 continue  # elided: beyond budget, table order
             kept.append(cand)
             used += line_tokens
