@@ -380,6 +380,49 @@ def test_render_never_exceeds_budget_across_compositions(prot_len, nc_len):
     assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
 
 
+def test_offered_is_idempotent():
+    """W3-7: repeated offered() calls return the same result — the capped
+    subset is a pure function of the table, never accumulated state."""
+    candidates = [_fw13_candidate(0, 760, in_contact=False),
+                  _fw13_candidate(1, 200, in_contact=True)]
+    table = CandidateTable(turn=1, candidates=candidates)
+    first = table.offered()
+    second = table.offered()
+    assert [c.id for c in first.candidates] == [c.id for c in second.candidates]
+
+
+def test_render_preserves_table_order():
+    """W2-2: the render does not hoist protected lines ahead of
+    non-contact lines — the original table order is preserved."""
+    candidates = [_fw13_candidate(0, 760, in_contact=False),
+                  _fw13_candidate(1, 200, in_contact=True)]
+    table = CandidateTable(turn=1, candidates=candidates)
+    rendered_lines = [line for line in table.render().splitlines() if line.strip()]
+    # Non-contact candidate is table-first, protected second: render must
+    # keep that order — the protected line is not hoisted ahead.
+    assert len(rendered_lines) == 2
+    assert candidates[0].id in rendered_lines[0]
+    assert candidates[1].id in rendered_lines[1]
+
+
+def test_protected_only_table_renders_within_budget():
+    """W3-7: a table with ONLY protected candidates renders within budget."""
+    candidates = [_fw13_candidate(0, 760, in_contact=True)]
+    table = CandidateTable(turn=1, candidates=candidates)
+    rendered = table.render()
+    assert estimate_tokens(rendered) <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+def test_protected_only_table_accounts_protected_line_tokens():
+    """W3-7: the protected-only table's token accounting includes the
+    protected lines' tokens — `used` counts them."""
+    candidates = [_fw13_candidate(0, 760, in_contact=True)]
+    table = CandidateTable(turn=1, candidates=candidates)
+    offered = table.offered()
+    rendered = table.render()
+    assert offered.estimated_tokens() == estimate_tokens(rendered)
+
+
 # ---------------------------------------------------------------------------
 # TranscriptRecord union + RunManifest (drafts, frozen in WP2)
 # ---------------------------------------------------------------------------

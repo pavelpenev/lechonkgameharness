@@ -354,7 +354,13 @@ class CandidateTable(BaseModel):
         admitted in table order while they fit the residual
         CANDIDATE_TABLE_TOKEN_BUDGET. Protected lines plus the mandatory
         overhead exceeding the cap is a misconfiguration, not a drop —
-        CandidateTableCapExceeded."""
+        CandidateTableCapExceeded.
+
+        D4 (admission order): in-contact candidates are always admitted; the
+        remainder are admitted in table order within the residual budget;
+        render order preserves the original table order (protected lines are
+        not hoisted).
+        """
         # Mandatory rendering overhead: the join separator ahead of each
         # line and the trailing omission-disclosure line, reserved at the
         # worst case (the omitted count can only shrink as candidates are
