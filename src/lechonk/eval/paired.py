@@ -77,10 +77,12 @@ ARMS: tuple[str, ...] = (ARM_COMPARATOR, ARM_MODEL)
 ARM_ORDER: tuple[str, ...] = (ARM_COMPARATOR, ARM_MODEL)
 
 # The frozen §3 numeric budgets the contract predeclares.
-SNAPSHOT_TOKEN_BUDGET = 8000
-DELTA_TOKEN_BUDGET = 800
-MEMORY_TOKEN_BUDGET = 1500
-ACTION_BATCH_MAX_ACTIONS = 20
+from lechonk.core.schemas import (
+    ACTION_BATCH_MAX_ACTIONS,
+    DELTA_TOKEN_BUDGET,
+    MEMORY_TOKEN_BUDGET,
+    SNAPSHOT_TOKEN_BUDGET,
+)
 MAX_API_ATTEMPTS_PER_TURN = 2
 
 

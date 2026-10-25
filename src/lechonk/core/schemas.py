@@ -51,6 +51,15 @@ SNAPSHOT_TOKEN_BUDGET = 8000
 DELTA_TOKEN_BUDGET = 800
 MEMORY_TOKEN_BUDGET = 1500
 ACTION_BATCH_MAX_ACTIONS = 20
+# Candidate-table render cap (§3 line 32 overflow policy): the rendered
+# table may not exceed this budget; armed-in-contact candidates are never
+# dropped, the rest are elided lowest-priority-first.
+CANDIDATE_TABLE_TOKEN_BUDGET = 1200
+
+
+class CandidateTableCapExceeded(ValueError):
+    """Armed-in-contact candidates alone exceed the candidate-table cap —
+    an explicit misconfiguration (never a silent drop, FW-13)."""
 
 # Candidate IDs are opaque tokens of the form ``domain:actor:verb``
 # (e.g. ``unit:7:goto_n``, ``city:3:produce_settlers``,
@@ -309,6 +318,19 @@ class Candidate(BaseModel):
     verb: str
     summary: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    # FW-13: armed-in-contact units' candidates are never elided by the
+    # candidate-table cap (the runner marks them from the snapshot).
+    in_contact: bool = False
+
+
+def _render_line(c: Candidate) -> str:
+    """One candidate-table line: ``id — summary`` (id alone unsummarized)."""
+    return f"{c.id} — {c.summary}" if c.summary else c.id
+
+
+def _omission_line(omitted: int) -> str:
+    """The §3 line-32 omission disclosure appended to a capped table."""
+    return f"candidates omitted: {omitted} (lowest priority)"
 
 
 class CandidateTable(BaseModel):
@@ -318,11 +340,49 @@ class CandidateTable(BaseModel):
     def by_id(self) -> dict[str, Candidate]:
         return {c.id: c for c in self.candidates}
 
+    def offered(self) -> "CandidateTable":
+        """The deterministically capped offered subset (§3 line 32 overflow
+        policy): armed-in-contact candidates are never dropped; the rest
+        are admitted in table order while they fit
+        CANDIDATE_TABLE_TOKEN_BUDGET, reserving room for the omission
+        disclosure line. Armed-in-contact candidates alone exceeding the
+        cap is a misconfiguration, not a drop — CandidateTableCapExceeded."""
+        protected_tokens = sum(
+            estimate_tokens(_render_line(c))
+            for c in self.candidates if c.in_contact)
+        if protected_tokens > CANDIDATE_TABLE_TOKEN_BUDGET:
+            raise CandidateTableCapExceeded(
+                f"armed-in-contact candidates alone exceed the "
+                f"candidate-table cap: {protected_tokens} > "
+                f"{CANDIDATE_TABLE_TOKEN_BUDGET} tokens")
+        # Reserve the worst-case disclosure line (the omitted count can
+        # only shrink as candidates are dropped).
+        reserve = estimate_tokens(_omission_line(len(self.candidates)))
+        kept: list[Candidate] = []
+        used = protected_tokens
+        for cand in self.candidates:
+            line_tokens = estimate_tokens(_render_line(cand))
+            if cand.in_contact:
+                # armed-in-contact candidates are never dropped (§3): they
+                # are admitted ahead of the budget check.
+                kept.append(cand)
+                used += line_tokens
+                continue
+            if used + line_tokens + reserve > CANDIDATE_TABLE_TOKEN_BUDGET:
+                continue  # elided: lowest priority, over the capped budget
+            kept.append(cand)
+            used += line_tokens
+        return CandidateTable(turn=self.turn, candidates=kept)
+
     def render(self) -> str:
         """Compact policy-facing rendering: one ``id — summary`` line per
-        candidate (the prompt's candidate table, §7.5)."""
-        lines = [f"{c.id} — {c.summary}" if c.summary else c.id
-                 for c in self.candidates]
+        offered candidate, capped by CANDIDATE_TABLE_TOKEN_BUDGET with the
+        dropped count disclosed in a trailing omission line."""
+        offered = self.offered()
+        lines = [_render_line(c) for c in offered.candidates]
+        omitted = len(self.candidates) - len(offered.candidates)
+        if omitted:
+            lines.append(_omission_line(omitted))
         return "\n".join(lines)
 
     def estimated_tokens(self) -> int:

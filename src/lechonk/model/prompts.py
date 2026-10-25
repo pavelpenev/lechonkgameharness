@@ -30,16 +30,28 @@ import string
 from pathlib import Path
 
 from lechonk.core.schemas import (
+    CANDIDATE_TABLE_TOKEN_BUDGET,
     DELTA_TOKEN_BUDGET,
+    MEMORY_TOKEN_BUDGET,
     SNAPSHOT_TOKEN_BUDGET,
     estimate_tokens,
 )
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
+# The final assembled-payload budget (§3): the fully assembled turn prompt's
+# variable sections may not jointly exceed the sum of the per-section
+# budgets — each section is capped individually by _SECTIONS, and the
+# assembled check in turn_prompt guards the total.
+ASSEMBLED_PROMPT_TOKEN_BUDGET = (
+    MEMORY_TOKEN_BUDGET + SNAPSHOT_TOKEN_BUDGET
+    + DELTA_TOKEN_BUDGET + CANDIDATE_TABLE_TOKEN_BUDGET
+)
+
 # Token budgets (§3) — the prompt text annotates them; the assembler enforces
-# them on the variable sections as defense-in-depth.
-MEMORY_TOKEN_BUDGET = 1500
+# them on the variable sections as defense-in-depth. MEMORY_TOKEN_BUDGET,
+# SNAPSHOT_TOKEN_BUDGET, DELTA_TOKEN_BUDGET and CANDIDATE_TABLE_TOKEN_BUDGET
+# are the single definitions in core.schemas — imported, never redefined.
 
 SYSTEM_PROMPT = "system_v3"  # FW-10: v3 documents the typed commitment
 # grammar (target_kind + verb vocabulary); v1/v2 retained on disk for history
@@ -149,7 +161,7 @@ _SECTIONS: tuple[tuple[str, int], ...] = (
     ("MEMORY", MEMORY_TOKEN_BUDGET),
     ("SNAPSHOT", SNAPSHOT_TOKEN_BUDGET),
     ("DELTA", DELTA_TOKEN_BUDGET),
-    ("CANDIDATE TABLE", 0),  # the candidate table has no §3 token budget
+    ("CANDIDATE TABLE", CANDIDATE_TABLE_TOKEN_BUDGET),
 )
 
 
@@ -185,7 +197,14 @@ def turn_prompt(
                 f"{estimate_tokens(body)} > {budget} tokens")
         annotation = f" (≤ {budget:,} tokens)" if budget else ""
         parts.append(f"## {header}{annotation}\n{body}")
-    return "\n\n".join(parts)
+    assembled = "\n\n".join(parts)
+    if enforce_budgets:
+        total = sum(estimate_tokens(bodies[h].strip()) for h, _ in _SECTIONS)
+        if total > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+            raise PromptBudgetExceeded(
+                f"assembled turn prompt exceeds its budget: "
+                f"{total} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+    return assembled
 
 
 # ---------------------------------------------------------------------------

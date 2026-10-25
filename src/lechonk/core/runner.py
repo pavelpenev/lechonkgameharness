@@ -563,16 +563,18 @@ class GameRunner:
                 snapshot.render().encode("utf-8")).hexdigest(),
             token_count=snapshot.estimated_tokens()))
         table = self._session.build_candidate_table()
+        self._mark_armed_in_contact(table, snapshot)
+        offered = table.offered()
         by_domain: dict[str, int] = {}
-        for cand in table.candidates:
+        for cand in offered.candidates:
             by_domain[cand.domain] = by_domain.get(cand.domain, 0) + 1
         candidates_seq = self._emit(CandidatesRefRecord(
             turn=turn,
             table_hash=hashlib.sha256(
-                table.render().encode("utf-8")).hexdigest(),
-            candidate_count=len(table.candidates),
+                offered.render().encode("utf-8")).hexdigest(),
+            candidate_count=len(offered.candidates),
             by_domain=by_domain,
-            opportunity_domains=opportunity_domains(table.candidates)))
+            opportunity_domains=opportunity_domains(offered.candidates)))
 
         # Engine-automatic resolutions (counted, never hidden, §3 line 38):
         # a research/production target that changed during WAITING with no
@@ -593,11 +595,23 @@ class GameRunner:
         self._check_acting_deadline(acting_entered)
 
         # --- the model phase (≤2 API attempts incl. at most one repair) -
-        result, repair_used, why = self._model_phase(
-            adapter, turn=turn, table=table, snapshot=snapshot,
-            delta_text=delta_text, snapshot_seq=snapshot_seq,
-            candidates_seq=candidates_seq, candidates_text=candidates_text,
-            acting_entered=acting_entered, provenance=provenance)
+        # FW-13 failure policy: a prompt-budget failure is a dedicated,
+        # bounded fail-stop — the metric event names the budget condition
+        # and the run never reports it as a generic infrastructure
+        # truncation.
+        try:
+            result, repair_used, why = self._model_phase(
+                adapter, turn=turn, table=table, snapshot=snapshot,
+                delta_text=delta_text, snapshot_seq=snapshot_seq,
+                candidates_seq=candidates_seq, candidates_text=candidates_text,
+                acting_entered=acting_entered, provenance=provenance)
+        except PromptBudgetExceeded as exc:
+            self._emit(MetricEventRecord(
+                name="prompt_budget_exceeded",
+                value=f"turn {turn}: {exc}"))
+            self._transition(RunState.FAILED)
+            return ("TRUNCATED", f"prompt budget exceeded: {exc}",
+                    prev_snapshot)
         self._check_acting_deadline(acting_entered)
         self._check_abort()
 
@@ -705,6 +719,16 @@ class GameRunner:
     # ------------------------------------------------------------------
     # game-over classification
     # ------------------------------------------------------------------
+
+    def _mark_armed_in_contact(self, table: CandidateTable,
+                               snapshot: Snapshot) -> None:
+        """FW-13: candidates of armed-in-contact own units are never elided
+        by the candidate-table cap (the §3 overflow policy keeps the
+        tactical surface intact; idle/distant candidates elide first)."""
+        contact = {str(u.id) for u in snapshot.units if u.in_contact}
+        for cand in table.candidates:
+            if cand.domain == "unit" and cand.actor_id in contact:
+                cand.in_contact = True
 
     def _session_game_over_flags(self) -> tuple[bool, bool, bool]:
         """The session-cached game-over flags: (terminated, truncated,
