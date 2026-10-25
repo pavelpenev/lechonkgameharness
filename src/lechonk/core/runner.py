@@ -1595,16 +1595,19 @@ class GameRunner:
         """Count engine-automatic resolutions of new research/production
         choices — never hidden (§3 line 38). A target change between turn
         starts that our own executed actions did not cause is the engine's
-        resolution (the fork's research-continuation default)."""
+        resolution (the fork's research-continuation default). This
+        includes the None -> target first choice, gated the same way: a
+        first research/production action of ours attributes the choice to
+        the model, never to the engine."""
         if prev_snapshot is None:
             return
         prev_research = prev_snapshot.player.research
         cur_research = snapshot.player.research
-        if (prev_research.current_target_id is not None
-                and cur_research.current_target_id is not None
-                and prev_research.current_target_id
-                != cur_research.current_target_id
-                and self._research_last_turn != cur_research.current_target_id):
+        prev_target_id = prev_research.current_target_id
+        cur_target_id = cur_research.current_target_id
+        if (cur_target_id is not None
+                and prev_target_id != cur_target_id
+                and self._research_last_turn != cur_target_id):
             name = cur_research.current_target or \
                 f"tech#{cur_research.current_target_id}"
             self._emit_action_result(
@@ -1624,8 +1627,7 @@ class GameRunner:
             if not city.is_own or city.id not in prev_cities:
                 continue
             prev_city = prev_cities[city.id]
-            if (prev_city.production is not None
-                    and city.production is not None
+            if (city.production is not None
                     and prev_city.production != city.production
                     and self._produce_last_turn.get(city.id)
                     != city.production):

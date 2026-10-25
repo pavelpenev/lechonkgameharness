@@ -39,6 +39,13 @@ from lechonk.core.schemas import (
 )
 
 from tests.lifecycle_fixtures import LifecycleSession
+from tests.fog_fixtures import (
+    NUM_IMPROVEMENTS,
+    SETTLERS,
+    VUT_UTYPE,
+    foreign_city,
+    own_city,
+)
 from tests.runner_fixtures import (
     FakeClock,
     FakeModelClient,
@@ -543,6 +550,142 @@ def test_runner_counts_engine_automatic_research_continuation(tmp_path):
     research_share = result.metrics.domain_model_shares["research"]
     assert research_share.denominator == 1  # only the engine resolution
     assert research_share.numerator == 0
+
+
+def test_runner_counts_engine_automatic_first_research_choice(tmp_path):
+    # FW-R3: turn 1 has NO research target (the player domain carries no
+    # "researching" — current_target_id None); the model only moves a
+    # unit. Turn 2: the engine auto-set an initial target (tech 2 =
+    # Pottery) during WAITING with no executed tech action of ours — a
+    # None -> target first choice is a new research choice:
+    # engine_automatic, counted.
+    worlds = [
+        turn_world(1),
+        turn_world(2, researching=2),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 1
+    assert automatic[0].turn == 2
+    assert automatic[0].domain == "tech"
+    assert automatic[0].target == "Pottery"
+    assert automatic[0].outcome == "executed"
+
+
+def test_runner_first_research_choice_with_own_action_is_model_attributed(
+        tmp_path):
+    # FW-R3: turn 1 has NO research target and the model's OWN first
+    # research action executes (verified: the scripted tech_id 1 lands as
+    # "researching"). Turn 2: the world shows that same target id
+    # (researching=1 = Alphabet) — the None -> target transition is
+    # accounted for by our executed action: model-attributed, never
+    # engine_automatic (the first choice must not bypass the own-action
+    # suppression).
+    worlds = [
+        turn_world(1),
+        turn_world(2, researching=1),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["tech:cur_player:research_tech_pottery_1"],
+                    turn_id="t1", with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    research = [a for a in actions
+                if a.ref == "tech:cur_player:research_tech_pottery_1"]
+    assert len(research) == 1
+    assert research[0].provenance_class == "model"
+    assert research[0].outcome == "executed"
+    assert research[0].readback == "verified"
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
+
+
+def test_runner_counts_engine_automatic_first_city_production(tmp_path):
+    # FW-R3: turn 1: Rome has no production (production_kind VUT_NONE);
+    # the model only moves a unit. Turn 2: the engine auto-set the city's
+    # first production (Settlers) during WAITING with no executed produce
+    # action of ours — a None -> production first choice is a new
+    # production choice: engine_automatic, counted.
+    worlds = [
+        turn_world(1),
+        turn_world(2, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=SETTLERS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    automatic = [a for a in actions
+                 if a.provenance_class == "engine_automatic"]
+    assert len(automatic) == 1
+    assert automatic[0].turn == 2
+    assert automatic[0].domain == "city"
+    assert automatic[0].target == "Settlers"
+    assert automatic[0].outcome == "executed"
+
+
+def test_runner_first_city_production_with_own_action_is_model_attributed(
+        tmp_path):
+    # FW-R3: turn 1: Rome has no production and the model's OWN first
+    # produce action (Settlers) executes (verified via the production name
+    # map). Turn 2: the scripted world shows that same production — the
+    # None -> production transition is accounted for by our executed
+    # action: model-attributed, never engine_automatic.
+    worlds = [
+        turn_world(1),
+        turn_world(2, cities=[
+            own_city(production_kind=VUT_UTYPE,
+                     production_value=SETTLERS + NUM_IMPROVEMENTS),
+            foreign_city(),
+        ]),
+        turn_world(3),
+    ]
+    session = FakeSession(worlds)
+    client = FakeModelClient([
+        ok_response(["city:1:produce_settlers"], turn_id="t1",
+                    with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    produce = [a for a in actions if a.ref == "city:1:produce_settlers"]
+    assert len(produce) == 1
+    assert produce[0].provenance_class == "model"
+    assert produce[0].outcome == "executed"
+    assert produce[0].readback == "verified"
+    assert not [a for a in actions
+                if a.provenance_class == "engine_automatic"]
 
 
 # ---------------------------------------------------------------------------
