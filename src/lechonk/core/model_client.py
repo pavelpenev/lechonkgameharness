@@ -47,6 +47,16 @@ REPAIR_CLASSES: tuple[str, ...] = (
 REPAIR_TIMEOUT_MARGIN_S = 5.0
 
 
+class PromptBudgetExceeded(RuntimeError):
+    """An assembled prompt exceeded its §3 token budget.
+
+    Canonical home is core so the runner can catch it without importing the
+    model package; the model-side assembler (lechonk.model.prompts)
+    re-exports this name. The runner maps it to the dedicated bounded
+    fail-stop — the ``prompt_budget_exceeded`` metric event, never a generic
+    infrastructure truncation (FW-13)."""
+
+
 @dataclass
 class TurnPrompt:
     """One turn's prompt payload (the runner renders the sections; the

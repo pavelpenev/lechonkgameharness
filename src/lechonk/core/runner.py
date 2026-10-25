@@ -109,6 +109,7 @@ from lechonk.core.model_client import (
     REPAIR_CLASS_UNRESPONSIVE,
     ModelClient,
     ModelResponse,
+    PromptBudgetExceeded,
     RepairPrompt,
     TurnPrompt,
 )

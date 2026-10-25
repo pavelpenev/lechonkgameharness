@@ -11,11 +11,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from lechonk.core.schemas import (
     ACTION_BATCH_MAX_ACTIONS,
+    CANDIDATE_TABLE_TOKEN_BUDGET,
     COMMITMENT_TARGET_KINDS,
     ActionBatch,
     ActionItem,
     Candidate,
     CandidateTable,
+    CandidateTableCapExceeded,
     Commitment,
     CommitmentRecord,
     Delta,
@@ -133,6 +135,96 @@ def test_candidate_table_roundtrip():
     with pytest.raises(ValidationError):
         Candidate(id="unit:1:goto_n", domain="unit", actor_id="1",
                   verb="goto_n", bogus=1)  # extra="forbid"
+
+
+# ---------------------------------------------------------------------------
+# FW-13: the candidate-table cap — capping, in-contact retention, cap error
+# ---------------------------------------------------------------------------
+
+def _fw13_candidate(i, summary_chars, in_contact=False):
+    return Candidate(
+        id=f"unit:9{i:02d}:wait",
+        domain="unit",
+        actor_id=f"9{i:02d}",
+        verb="wait",
+        summary="y" * summary_chars,
+        in_contact=in_contact,
+    )
+
+
+def test_oversized_candidate_table_renders_capped_with_omission_line():
+    """FW-13 acceptance: an oversized table renders capped — the
+    in-contact candidates are always retained, the rest are admitted in
+    table order while they fit, and the trailing omission line discloses
+    the elided count with the honest policy wording."""
+    total = 10
+    table = CandidateTable(turn=3, candidates=[
+        _fw13_candidate(i, summary_chars=760, in_contact=i in (0, 5))
+        for i in range(total)])
+    offered = table.offered()
+    assert len(offered.candidates) < total  # the cap engaged
+    kept_ids = {c.id for c in offered.candidates}
+    # in-contact candidates are never elided
+    assert "unit:900:wait" in kept_ids
+    assert "unit:905:wait" in kept_ids
+    # the trailing omission line discloses the elision honestly
+    omitted = total - len(offered.candidates)
+    assert omitted > 0
+    rendered = table.render()
+    assert rendered.endswith(
+        f"candidates omitted: {omitted} (beyond budget, table order)")
+    assert "lowest priority" not in rendered
+    # the capped table (with its omission line) fits the budget
+    assert offered.estimated_tokens() <= CANDIDATE_TABLE_TOKEN_BUDGET
+
+
+def test_candidate_cap_raises_when_in_contact_alone_exceed_budget():
+    """FW-13: in-contact candidates alone over CANDIDATE_TABLE_TOKEN_BUDGET
+    are an explicit misconfiguration — CandidateTableCapExceeded, never a
+    silent drop. A non-protected candidate of the same size is instead
+    elided deterministically."""
+    huge = "x" * (CANDIDATE_TABLE_TOKEN_BUDGET * 5)
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:1:hold", domain="unit", actor_id="1",
+                  verb="hold", summary=huge, in_contact=True),
+    ])
+    with pytest.raises(CandidateTableCapExceeded):
+        table.offered()
+
+    elided = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:2:wait", domain="unit", actor_id="2",
+                  verb="wait", summary=huge),
+    ])
+    offered = elided.offered()
+    assert offered.candidates == []
+    assert elided.render() == "candidates omitted: 1 (beyond budget, table order)"
+
+
+def test_offered_counts_exactly_the_admitted_lines():
+    """Finding-3 accounting fix: `used` counts exactly the admitted lines'
+    tokens. Pre-fix, `used` started at the protected-lines sum and then
+    re-added each in-contact line in the loop — double-counting contact
+    candidates and eliding more non-contact candidates than the budget
+    requires. Here the 1104-token in-contact line plus the first 54-token
+    non-contact line (plus the 13-token omission reserve) fits the
+    1,200-token cap with the fix; the second non-contact line does not fit
+    and is elided. Pre-fix, the doubled contact total (2,208) alone
+    exceeded the budget, so both non-contact lines were dropped."""
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id="unit:1:hold", domain="unit", actor_id="1",
+                  verb="hold", summary="a" * 4400, in_contact=True),
+        Candidate(id="unit:2:wait", domain="unit", actor_id="2",
+                  verb="wait", summary="b" * 200),
+        Candidate(id="unit:3:wait", domain="unit", actor_id="3",
+                  verb="wait", summary="b" * 200),
+        Candidate(id="unit:4:wait", domain="unit", actor_id="4",
+                  verb="wait", summary="b" * 200),
+    ])
+    offered = table.offered()
+    assert [c.id for c in offered.candidates] == ["unit:1:hold",
+                                                  "unit:2:wait"]
+    assert table.render().endswith(
+        "candidates omitted: 2 (beyond budget, table order)")
 
 
 # ---------------------------------------------------------------------------

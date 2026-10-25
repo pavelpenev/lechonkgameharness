@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from lechonk.core.runner import ENTITY_ID_RE
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
+    Candidate,
+    CandidateTable,
     CandidatesRefRecord,
     CityView,
     CommitmentRecord,
@@ -37,6 +40,7 @@ from lechonk.core.schemas import (
     TurnStartRecord,
     UnitView,
 )
+from lechonk.model.prompts import PromptBudgetExceeded
 
 from tests.lifecycle_fixtures import LifecycleSession
 from tests.fog_fixtures import (
@@ -1672,3 +1676,83 @@ def test_runner_engine_automatic_resolution_credits_fulfilled_other(tmp_path):
     assert entry["status"] == "fulfilled_other"
     assert entry["fulfilled_by"] == ["engine_automatic:research:Pottery"]
     assert entry["fulfilled_model_by"] == []
+
+
+# ---------------------------------------------------------------------------
+# FW-13: the candidate-table cap in the pipeline + the prompt-budget
+# bounded fail-stop
+# ---------------------------------------------------------------------------
+
+
+class _SyntheticTableSession(FakeSession):
+    """Serves a fixed synthetic candidate table (oversized for the cap)."""
+
+    def __init__(self, worlds, table):
+        super().__init__(worlds)
+        self._table = table
+
+    def build_candidate_table(self):
+        return self._table
+
+
+def test_runner_candidates_ref_hashes_the_offered_capped_text(tmp_path):
+    """FW-13 acceptance: candidates_ref pins the OFFERED (capped) candidate
+    text — sha256 over the capped rendering, with the capped count — not
+    the pre-cap table."""
+    # 20 unit candidates x ~80 tokens ~ 1600 tokens: over the 1,200 cap.
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id=f"unit:9{i:02d}:wait", domain="unit",
+                  actor_id=f"9{i:02d}", verb="wait", summary="y" * 300)
+        for i in range(20)])
+    session = _SyntheticTableSession([turn_world(1), turn_world(2)], table)
+    client = FakeModelClient([ok_response([], turn_id="t1",
+                                          with_memory=False)])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    ref = _by_kind(_records(runner.ledger.path), CandidatesRefRecord)[0]
+    # The same deterministic capped subset the runner computed.
+    offered = table.offered()
+    assert len(offered.candidates) < 20  # the cap engaged
+    assert ref.candidate_count == len(offered.candidates)
+    assert ref.by_domain == {"unit": len(offered.candidates)}
+    assert ref.table_hash == hashlib.sha256(
+        offered.render().encode("utf-8")).hexdigest()
+    # The model-facing prompt carries the capped table + omission line.
+    assert "candidates omitted" in client.turn_prompts[0].candidates
+
+
+def test_runner_prompt_budget_exceeded_bounded_fail_stop(tmp_path):
+    """FW-13 failure policy: a prompt-budget failure is the dedicated
+    bounded fail-stop — the prompt_budget_exceeded metric event, the
+    ACTING->FAILED transition, and a TRUNCATED outcome whose reason names
+    the budget — never a generic infrastructure truncation."""
+    worlds = [turn_world(1), turn_world(2)]
+    session = FakeSession(worlds)
+
+    def over_budget(prompt):
+        raise PromptBudgetExceeded(
+            "assembled turn prompt exceeds its budget: 11000 > 10200 tokens")
+
+    client = FakeModelClient([over_budget])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=1)
+    result = runner.run()
+    assert result.outcome == "TRUNCATED"
+    assert result.reason.startswith("prompt budget exceeded")
+    records = _records(runner.ledger.path)
+    budget_events = [r for r in _by_kind(records, MetricEventRecord)
+                     if r.name == "prompt_budget_exceeded"]
+    assert len(budget_events) == 1
+    assert "assembled turn prompt" in budget_events[0].value
+    transitions = [r.value for r in _by_kind(records, MetricEventRecord)
+                   if r.name == "state_transition"]
+    assert "ACTING->FAILED" in transitions
+    assert isinstance(records[-1], OutcomeRecord)
+    assert records[-1].outcome == "TRUNCATED"
+    assert records[-1].reason.startswith("prompt budget exceeded")
+    assert "infrastructure" not in records[-1].reason.lower()
+    # Bounded: the failed turn never reached a model_call record.
+    assert _by_kind(records, ModelCallRecord) == []
+    assert session.closed

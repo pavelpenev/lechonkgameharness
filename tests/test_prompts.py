@@ -29,6 +29,7 @@ import pytest
 from lechonk.model import prompts
 from lechonk.model.prompts import (
     ALL_PROMPTS,
+    ASSEMBLED_PROMPT_TOKEN_BUDGET,
     FINGERPRINT_PROBE,
     MEMORY_TOKEN_BUDGET,
     PROMPT_DIR,
@@ -36,9 +37,11 @@ from lechonk.model.prompts import (
     SYSTEM_PROMPT,
     TURN_PREFIX,
     PromptBudgetExceeded,
+    PromptConfigError,
     PromptNotFoundError,
     PromptRenderError,
     all_prompt_hashes,
+    check_fixed_prompt_budget,
     fingerprint_probe_prompt,
     load_prompt,
     prompt_hash,
@@ -407,3 +410,36 @@ def test_no_template_references_the_api_key_or_secrets():
         assert "MISTRAL_API_KEY" not in text, f"{path.name} references the key var"
         assert "api_key" not in text.lower(), f"{path.name} references api_key"
         assert "sk-" not in text, f"{path.name} contains a key-shaped string"
+
+
+# ---------------------------------------------------------------------------
+# FW-13 budget sub-items: the fixed-text startup invariant + the exception
+# seam (canonical PromptBudgetExceeded in core, re-exported here)
+# ---------------------------------------------------------------------------
+
+
+def test_check_fixed_prompt_budget_fits_and_is_deterministic():
+    """FW-13 startup invariant: the fixed text (system prompt + stable turn
+    prefix) is trivially small today — the check returns its cost, within
+    the assembled-prompt budget, deterministically."""
+    cost = check_fixed_prompt_budget()
+    assert 0 < cost <= ASSEMBLED_PROMPT_TOKEN_BUDGET
+    assert check_fixed_prompt_budget() == cost
+
+
+def test_check_fixed_prompt_budget_raises_config_error(monkeypatch):
+    """A fixed text that alone exceeds the assembled-prompt budget is a
+    startup configuration error — PromptConfigError, fail fast at startup,
+    not a mid-game kill."""
+    monkeypatch.setattr(prompts, "ASSEMBLED_PROMPT_TOKEN_BUDGET", 1)
+    with pytest.raises(PromptConfigError):
+        check_fixed_prompt_budget()
+
+
+def test_prompt_budget_exceeded_is_canonical_in_core():
+    """The exception seam: lechonk.model.prompts re-exports the canonical
+    core class (the runner catches the same object without importing the
+    model package)."""
+    from lechonk.core.model_client import PromptBudgetExceeded as canonical
+    assert prompts.PromptBudgetExceeded is canonical
+    assert issubclass(canonical, RuntimeError)

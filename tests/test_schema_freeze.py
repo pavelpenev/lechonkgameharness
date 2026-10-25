@@ -243,9 +243,18 @@ FW10_ADDENDUM = (Path(__file__).parents[1] / "artifacts" / "runs" /
 
 def test_fw10_dated_schema_coverage_addendum_exists():
     """FW-10: the dated additive-amendment addendum artifact exists next to
-    the frozen coverage check (artifacts/ is gitignored; the addendum is
-    committed with git add -f in a separate evidence-only commit)."""
-    assert FW10_ADDENDUM.is_file(), f"missing addendum: {FW10_ADDENDUM}"
+    the frozen coverage check.
+
+    Clone-safety (finding 4): evidence artifacts under artifacts/runs/** are
+    LOCAL RECORDED EVIDENCE — untracked by user ruling (commit b1c521d), so
+    a fresh clone does not have them. This test pins the addendum's content
+    only when the local tree carries it; it is skipped otherwise and must
+    never fail a clone."""
+    if not FW10_ADDENDUM.is_file():
+        pytest.skip(
+            "local recorded evidence only: the FW-10 addendum under "
+            "artifacts/runs/** is not part of a clone (untracked per user "
+            "ruling); the artifact is pinned only when the local tree has it")
     text = FW10_ADDENDUM.read_text(encoding="utf-8")
     # the addendum records the additive change, the verb grammar, and the
     # legacy fallback

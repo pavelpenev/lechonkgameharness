@@ -40,6 +40,7 @@ from typing import Any, Callable, Optional
 
 from lechonk.core.model_client import (
     REPAIR_TIMEOUT_MARGIN_S,
+    PromptBudgetExceeded,
     ModelResponse,
     RepairPrompt,
     TurnPrompt,
@@ -47,6 +48,7 @@ from lechonk.core.model_client import (
 from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.schemas import estimate_tokens
 from lechonk.model import prompts as prompt_templates
+from lechonk.model.prompts import ASSEMBLED_PROMPT_TOKEN_BUDGET
 from lechonk.model.mistral_client import MistralClient
 
 _TURN_ID_RE = re.compile(r"/t(\d+)\Z")
@@ -96,6 +98,20 @@ def _raw_attempts_from(content: str) -> list[str]:
     return []
 
 
+def _check_repair_conversation_budget(messages: list[dict[str, str]]) -> None:
+    """FW-13: the repair is inside the budget check. The COMPLETE repair
+    conversation — prior messages (system prompt + turn prompt), the failed
+    assistant output, the repair instruction, and the re-attached candidate
+    table — must fit the assembled-prompt budget. An oversize repair raises
+    PromptBudgetExceeded so the runner's dedicated bounded fail-stop handles
+    it, never a silent oversize."""
+    total = sum(estimate_tokens(m["content"]) for m in messages)
+    if total > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+        raise PromptBudgetExceeded(
+            f"complete repair conversation exceeds the assembled-prompt "
+            f"budget: {total} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+
+
 class MistralTurnClient:
     """The core ``ModelClient`` protocol over a ``MistralClient``.
 
@@ -106,6 +122,12 @@ class MistralTurnClient:
 
     def __init__(self, client: MistralClient, *,
                  api_log: Optional[Callable[[dict[str, Any]], None]] = None):
+        # FW-13 startup invariant: the fixed prompt text (system prompt +
+        # stable turn prefix) must fit the assembled-prompt budget on its
+        # own, or no turn could ever be assembled. Computed once, here at
+        # initialization — fail fast at startup, not as a mid-game kill on
+        # some later turn.
+        prompt_templates.check_fixed_prompt_budget()
         self.client = client
         self._api_log = api_log
         self._turn_messages: Optional[list[dict[str, str]]] = None
@@ -158,6 +180,16 @@ class MistralTurnClient:
             {"role": "assistant", "content": failed_content},
             {"role": "user", "content": repair_text},
         ]
+        # FW-13: the repair is inside the budget check. Enforce the
+        # assembled-prompt budget over the COMPLETE repair conversation —
+        # prior messages, the failed assistant output, the repair
+        # instruction, and the re-attached candidate table — so an
+        # oversized repair surfaces as the dedicated bounded fail-stop
+        # (prompt_budget_exceeded), never a silent oversize or a generic
+        # infrastructure truncation. The unresponsive re-ask above sends
+        # the exact turn prompt the initial check already bounded; this
+        # check guards the branch that adds content.
+        _check_repair_conversation_budget(messages)
         return self._attempt(messages, prompt, attempt=2, kind="repair")
 
     # ------------------------------------------------------------------

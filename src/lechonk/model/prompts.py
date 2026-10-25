@@ -29,6 +29,7 @@ import hashlib
 import string
 from pathlib import Path
 
+from lechonk.core.model_client import PromptBudgetExceeded
 from lechonk.core.schemas import (
     CANDIDATE_TABLE_TOKEN_BUDGET,
     DELTA_TOKEN_BUDGET,
@@ -86,11 +87,18 @@ class PromptNotFoundError(PromptError):
 
 
 class PromptRenderError(PromptError):
-    """A template could not be rendered (missing placeholder field)."""
+    """A template could not be rendered (missing placeholder fields)."""
 
 
-class PromptBudgetExceeded(PromptError):
-    """A variable section exceeds its §3 token budget."""
+class PromptConfigError(PromptError):
+    """Startup configuration error: the fixed prompt text alone exceeds the
+    assembled-prompt budget, so no turn could ever be assembled. Raised once
+    at client initialization (fail fast, not a mid-game kill)."""
+
+
+# PromptBudgetExceeded is canonical in lechonk.core.model_client so the
+# runner can catch it without importing the model package; the raise sites
+# are the prompt assembler here, which re-exports the same class.
 
 
 def prompt_path(name: str) -> Path:
@@ -146,6 +154,25 @@ def render_template(name: str, **fields: str) -> str:
 
 def system_prompt() -> str:
     return load_prompt(SYSTEM_PROMPT)
+
+
+def check_fixed_prompt_budget() -> int:
+    """FW-13 startup invariant: the fixed (turn-invariant) prompt text — the
+    system prompt plus the stable turn prefix — must fit the assembled-prompt
+    budget on its own, or no turn could ever be assembled. Meant to be
+    computed once at client initialization (fail fast at startup, not as a
+    mid-game kill). Returns the fixed-text token cost.
+
+    The check is a cheap invariant: the fixed templates are trivially small
+    today, and this pins that against future template growth.
+    """
+    cost = (estimate_tokens(system_prompt())
+            + estimate_tokens(load_prompt(TURN_PREFIX)))
+    if cost > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+        raise PromptConfigError(
+            f"fixed prompt text exceeds the assembled-prompt budget: "
+            f"{cost} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+    return cost
 
 
 def fingerprint_probe_prompt() -> str:

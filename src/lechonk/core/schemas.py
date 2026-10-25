@@ -53,7 +53,7 @@ MEMORY_TOKEN_BUDGET = 1500
 ACTION_BATCH_MAX_ACTIONS = 20
 # Candidate-table render cap (§3 line 32 overflow policy): the rendered
 # table may not exceed this budget; armed-in-contact candidates are never
-# dropped, the rest are elided lowest-priority-first.
+# dropped, the rest are admitted in table order while they fit.
 CANDIDATE_TABLE_TOKEN_BUDGET = 1200
 
 
@@ -329,8 +329,12 @@ def _render_line(c: Candidate) -> str:
 
 
 def _omission_line(omitted: int) -> str:
-    """The §3 line-32 omission disclosure appended to a capped table."""
-    return f"candidates omitted: {omitted} (lowest priority)"
+    """The §3 line-32 omission disclosure appended to a capped table.
+
+    The honest policy statement: elision is deterministic table order —
+    candidates are admitted in table order while they fit, so everything
+    past the budget is dropped regardless of any priority notion."""
+    return f"candidates omitted: {omitted} (beyond budget, table order)"
 
 
 class CandidateTable(BaseModel):
@@ -359,7 +363,12 @@ class CandidateTable(BaseModel):
         # only shrink as candidates are dropped).
         reserve = estimate_tokens(_omission_line(len(self.candidates)))
         kept: list[Candidate] = []
-        used = protected_tokens
+        # `used` counts exactly the tokens of the admitted lines — contact
+        # and non-contact alike. The protected_tokens sum above is only the
+        # misconfiguration check, not a running total: counting it here too
+        # would double-count the in-contact lines and elide more than the
+        # budget requires.
+        used = 0
         for cand in self.candidates:
             line_tokens = estimate_tokens(_render_line(cand))
             if cand.in_contact:
@@ -369,7 +378,7 @@ class CandidateTable(BaseModel):
                 used += line_tokens
                 continue
             if used + line_tokens + reserve > CANDIDATE_TABLE_TOKEN_BUDGET:
-                continue  # elided: lowest priority, over the capped budget
+                continue  # elided: beyond budget, table order
             kept.append(cand)
             used += line_tokens
         return CandidateTable(turn=self.turn, candidates=kept)

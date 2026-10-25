@@ -26,6 +26,10 @@ from lechonk.core.model_client import (
 from lechonk.core.schemas import estimate_tokens
 from lechonk.model import mistral_client as mc
 from lechonk.model import prompts
+from lechonk.model.prompts import (
+    ASSEMBLED_PROMPT_TOKEN_BUDGET,
+    PromptBudgetExceeded,
+)
 from lechonk.model.turn_client import (
     MistralTurnClient,
     _prompt_hash,
@@ -538,3 +542,46 @@ def test_prompt_hash_clean_payload_unchanged_vs_pre_fw18_json_dumps():
         messages, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False).encode("utf-8")).hexdigest()
     assert _prompt_hash(messages) == expected
+
+
+# ---------------------------------------------------------------------------
+# FW-13 budget sub-items: the repair conversation inside the budget check +
+# the fixed-text startup invariant
+# ---------------------------------------------------------------------------
+
+
+def test_repair_conversation_over_budget_raises_prompt_budget_exceeded():
+    """FW-13: the repair is inside the budget check. A complete repair
+    conversation (prior messages + failed output + repair instruction +
+    re-attached candidate table) over the assembled-prompt budget raises
+    PromptBudgetExceeded BEFORE any transport call — the runner's dedicated
+    bounded fail-stop handles it, never a silent oversize."""
+    client, transport = make_client([raw(MALFORMED_BATCH), raw(VALID_BATCH)])
+    adapter = MistralTurnClient(client)
+    adapter.complete_turn(turn_prompt())
+    oversized_table = "x" * (prompts.ASSEMBLED_PROMPT_TOKEN_BUDGET * 4)
+    with pytest.raises(PromptBudgetExceeded):
+        adapter.complete_repair(RepairPrompt(
+            call_id="run/t1/call2", turn_id="run/t1",
+            memory="memory text", snapshot="snapshot text", delta="delta text",
+            candidates="unit:1:goto_n — move north",
+            error_class="schema_error", failed_refs=["unit:1:goto_n"],
+            refreshed_candidates=oversized_table))
+    # The oversize repair never reached the transport.
+    assert len(transport.calls) == 1
+
+
+def test_client_initialization_checks_fixed_prompt_budget(monkeypatch):
+    """FW-13 startup invariant: client construction fails fast with an
+    explicit configuration error when the fixed prompt text (system + turn
+    prefix) alone exceeds the assembled-prompt budget — at startup, not as
+    a mid-game kill. Normal construction (the trivially small templates)
+    is unaffected."""
+    monkeypatch.setattr(prompts, "ASSEMBLED_PROMPT_TOKEN_BUDGET", 1)
+    client, _ = make_client([raw(VALID_BATCH)])
+    with pytest.raises(prompts.PromptConfigError):
+        MistralTurnClient(client)
+    # With the real (trivially small) templates, construction succeeds.
+    monkeypatch.undo()
+    client, _ = make_client([raw(VALID_BATCH)])
+    MistralTurnClient(client)
