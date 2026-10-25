@@ -40,14 +40,35 @@ from lechonk.core.schemas import (
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
-# The final assembled-payload budget (§3): the fully assembled turn prompt's
-# variable sections may not jointly exceed the sum of the per-section
+# W1-7: the former single ASSEMBLED_PROMPT_TOKEN_BUDGET guarded TWO
+# different sums — the initial assembled check sums ONLY the four variable
+# section bodies, while the repair check
+# (turn_client._check_repair_conversation_budget) sums the COMPLETE repair
+# conversation (system prompt + full turn prompt + failed assistant output
+# + repair instruction). Same value for both meant an initial prompt that
+# passed could fail the repair check purely on the fixed text. The two
+# checks now each name the budget they enforce; both keep the pre-split
+# value, so no live behavior changes.
+
+# The initial-assembled-check budget (§3): the fully assembled turn prompt's
+# variable section bodies may not jointly exceed the sum of the per-section
 # budgets — each section is capped individually by _SECTIONS, and the
-# assembled check in turn_prompt guards the total.
-ASSEMBLED_PROMPT_TOKEN_BUDGET = (
+# assembled check in turn_prompt guards the total:
+#   MEMORY_TOKEN_BUDGET + SNAPSHOT_TOKEN_BUDGET + DELTA_TOKEN_BUDGET
+#   + CANDIDATE_TABLE_TOKEN_BUDGET  (= 1,500 + 8,000 + 800 + 1,200 = 11,500).
+ASSEMBLED_SECTION_BODY_TOKEN_BUDGET = (
     MEMORY_TOKEN_BUDGET + SNAPSHOT_TOKEN_BUDGET
     + DELTA_TOKEN_BUDGET + CANDIDATE_TABLE_TOKEN_BUDGET
 )
+
+# The repair-conversation budget (§3, FW-13): bounds the COMPLETE repair
+# conversation — system prompt + full turn prompt (fixed prefix + the four
+# section bodies) + the failed assistant output + the repair instruction —
+# a strictly larger sum than the section-body budget above covers. Current
+# value is the pre-split constant's value (11,500), so the repair check
+# behaves exactly as before; the value is independent of the section sum
+# and may diverge from it.
+REPAIR_CONVERSATION_TOKEN_BUDGET = 11_500
 
 # Token budgets (§3) — the prompt text annotates them; the assembler enforces
 # them on the variable sections as defense-in-depth. MEMORY_TOKEN_BUDGET,
@@ -92,8 +113,8 @@ class PromptRenderError(PromptError):
 
 class PromptConfigError(PromptError):
     """Startup configuration error: the fixed prompt text alone exceeds the
-    assembled-prompt budget, so no turn could ever be assembled. Raised once
-    at client initialization (fail fast, not a mid-game kill)."""
+    repair-conversation budget, so no repair conversation could ever fit.
+    Raised once at client initialization (fail fast, not a mid-game kill)."""
 
 
 # PromptBudgetExceeded is canonical in lechonk.core.model_client so the
@@ -158,20 +179,24 @@ def system_prompt() -> str:
 
 def check_fixed_prompt_budget() -> int:
     """FW-13 startup invariant: the fixed (turn-invariant) prompt text — the
-    system prompt plus the stable turn prefix — must fit the assembled-prompt
-    budget on its own, or no turn could ever be assembled. Meant to be
-    computed once at client initialization (fail fast at startup, not as a
-    mid-game kill). Returns the fixed-text token cost.
+    system prompt plus the stable turn prefix — must fit the repair-
+    conversation budget on its own. The fixed text appears in every
+    conversation, and the repair-conversation budget is the only check whose
+    sum includes it (the initial assembled check sums only the four variable
+    section bodies) — so if the fixed text alone exceeds that budget, no
+    repair conversation could ever fit. Meant to be computed once at client
+    initialization (fail fast at startup, not as a mid-game kill). Returns
+    the fixed-text token cost.
 
     The check is a cheap invariant: the fixed templates are trivially small
     today, and this pins that against future template growth.
     """
     cost = (estimate_tokens(system_prompt())
             + estimate_tokens(load_prompt(TURN_PREFIX)))
-    if cost > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+    if cost > REPAIR_CONVERSATION_TOKEN_BUDGET:
         raise PromptConfigError(
-            f"fixed prompt text exceeds the assembled-prompt budget: "
-            f"{cost} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+            f"fixed prompt text exceeds the repair-conversation budget: "
+            f"{cost} > {REPAIR_CONVERSATION_TOKEN_BUDGET} tokens")
     return cost
 
 
@@ -226,11 +251,14 @@ def turn_prompt(
         parts.append(f"## {header}{annotation}\n{body}")
     assembled = "\n\n".join(parts)
     if enforce_budgets:
+        # Initial assembled check: the sum of the four variable section
+        # BODIES ONLY — the fixed prefix text is deliberately not part of
+        # this sum; the repair-conversation budget bounds it elsewhere.
         total = sum(estimate_tokens(bodies[h].strip()) for h, _ in _SECTIONS)
-        if total > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+        if total > ASSEMBLED_SECTION_BODY_TOKEN_BUDGET:
             raise PromptBudgetExceeded(
-                f"assembled turn prompt exceeds its budget: "
-                f"{total} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+                f"assembled turn prompt exceeds the section-body budget: "
+                f"{total} > {ASSEMBLED_SECTION_BODY_TOKEN_BUDGET} tokens")
     return assembled
 
 

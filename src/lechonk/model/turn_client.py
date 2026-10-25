@@ -48,7 +48,7 @@ from lechonk.core.model_client import (
 from lechonk.core.jsonutil import strict_dumps
 from lechonk.core.schemas import estimate_tokens
 from lechonk.model import prompts as prompt_templates
-from lechonk.model.prompts import ASSEMBLED_PROMPT_TOKEN_BUDGET
+from lechonk.model.prompts import REPAIR_CONVERSATION_TOKEN_BUDGET
 from lechonk.model.mistral_client import MistralClient
 
 _TURN_ID_RE = re.compile(r"/t(\d+)\Z")
@@ -102,14 +102,16 @@ def _check_repair_conversation_budget(messages: list[dict[str, str]]) -> None:
     """FW-13: the repair is inside the budget check. The COMPLETE repair
     conversation — prior messages (system prompt + turn prompt), the failed
     assistant output, the repair instruction, and the re-attached candidate
-    table — must fit the assembled-prompt budget. An oversize repair raises
-    PromptBudgetExceeded so the runner's dedicated bounded fail-stop handles
-    it, never a silent oversize."""
+    table — must fit the repair-conversation budget (W1-7: a different sum
+    from the initial check's section-body budget — this one includes the
+    fixed text). An oversize repair raises PromptBudgetExceeded so the
+    runner's dedicated bounded fail-stop handles it, never a silent
+    oversize."""
     total = sum(estimate_tokens(m["content"]) for m in messages)
-    if total > ASSEMBLED_PROMPT_TOKEN_BUDGET:
+    if total > REPAIR_CONVERSATION_TOKEN_BUDGET:
         raise PromptBudgetExceeded(
-            f"complete repair conversation exceeds the assembled-prompt "
-            f"budget: {total} > {ASSEMBLED_PROMPT_TOKEN_BUDGET} tokens")
+            f"complete repair conversation exceeds the repair-conversation "
+            f"budget: {total} > {REPAIR_CONVERSATION_TOKEN_BUDGET} tokens")
 
 
 class MistralTurnClient:
@@ -181,9 +183,9 @@ class MistralTurnClient:
             {"role": "user", "content": repair_text},
         ]
         # FW-13: the repair is inside the budget check. Enforce the
-        # assembled-prompt budget over the COMPLETE repair conversation —
-        # prior messages, the failed assistant output, the repair
-        # instruction, and the re-attached candidate table — so an
+        # repair-conversation budget (W1-7) over the COMPLETE repair
+        # conversation — prior messages, the failed assistant output, the
+        # repair instruction, and the re-attached candidate table — so an
         # oversized repair surfaces as the dedicated bounded fail-stop
         # (prompt_budget_exceeded), never a silent oversize or a generic
         # infrastructure truncation. The unresponsive re-ask above sends

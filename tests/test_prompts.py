@@ -29,10 +29,11 @@ import pytest
 from lechonk.model import prompts
 from lechonk.model.prompts import (
     ALL_PROMPTS,
-    ASSEMBLED_PROMPT_TOKEN_BUDGET,
+    ASSEMBLED_SECTION_BODY_TOKEN_BUDGET,
     FINGERPRINT_PROBE,
     MEMORY_TOKEN_BUDGET,
     PROMPT_DIR,
+    REPAIR_CONVERSATION_TOKEN_BUDGET,
     REPAIR_TEMPLATES,
     SYSTEM_PROMPT,
     TURN_PREFIX,
@@ -421,19 +422,35 @@ def test_no_template_references_the_api_key_or_secrets():
 def test_check_fixed_prompt_budget_fits_and_is_deterministic():
     """FW-13 startup invariant: the fixed text (system prompt + stable turn
     prefix) is trivially small today — the check returns its cost, within
-    the assembled-prompt budget, deterministically."""
+    the repair-conversation budget (the only check whose sum includes the
+    fixed text), deterministically."""
     cost = check_fixed_prompt_budget()
-    assert 0 < cost <= ASSEMBLED_PROMPT_TOKEN_BUDGET
+    assert 0 < cost <= REPAIR_CONVERSATION_TOKEN_BUDGET
     assert check_fixed_prompt_budget() == cost
 
 
 def test_check_fixed_prompt_budget_raises_config_error(monkeypatch):
-    """A fixed text that alone exceeds the assembled-prompt budget is a
+    """A fixed text that alone exceeds the repair-conversation budget is a
     startup configuration error — PromptConfigError, fail fast at startup,
     not a mid-game kill."""
-    monkeypatch.setattr(prompts, "ASSEMBLED_PROMPT_TOKEN_BUDGET", 1)
+    monkeypatch.setattr(prompts, "REPAIR_CONVERSATION_TOKEN_BUDGET", 1)
     with pytest.raises(PromptConfigError):
         check_fixed_prompt_budget()
+
+
+def test_assembled_budget_constants_split_documents_both_sums():
+    """W1-7: the former single ASSEMBLED_PROMPT_TOKEN_BUDGET guarded two
+    different sums. The section-body budget is the sum of the four
+    per-section budgets (what the initial check sums); the repair-conversation
+    budget keeps the pre-split value (what the repair check sums against —
+    the complete conversation, fixed text included). No live behavior change."""
+    assert ASSEMBLED_SECTION_BODY_TOKEN_BUDGET == (
+        prompts.MEMORY_TOKEN_BUDGET + prompts.SNAPSHOT_TOKEN_BUDGET
+        + prompts.DELTA_TOKEN_BUDGET + prompts.CANDIDATE_TABLE_TOKEN_BUDGET)
+    # Semantics-preserving split: the repair check keeps the pre-split value,
+    # currently equal to the section-body sum.
+    assert REPAIR_CONVERSATION_TOKEN_BUDGET == 11_500
+    assert REPAIR_CONVERSATION_TOKEN_BUDGET == ASSEMBLED_SECTION_BODY_TOKEN_BUDGET
 
 
 def test_prompt_budget_exceeded_is_canonical_in_core():

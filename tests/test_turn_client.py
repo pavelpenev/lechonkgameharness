@@ -27,11 +27,12 @@ from lechonk.core.schemas import estimate_tokens
 from lechonk.model import mistral_client as mc
 from lechonk.model import prompts
 from lechonk.model.prompts import (
-    ASSEMBLED_PROMPT_TOKEN_BUDGET,
+    REPAIR_CONVERSATION_TOKEN_BUDGET,
     PromptBudgetExceeded,
 )
 from lechonk.model.turn_client import (
     MistralTurnClient,
+    _check_repair_conversation_budget,
     _prompt_hash,
     _raw_attempts_from,
     _turn_number,
@@ -559,7 +560,7 @@ def test_repair_conversation_over_budget_raises_prompt_budget_exceeded():
     client, transport = make_client([raw(MALFORMED_BATCH), raw(VALID_BATCH)])
     adapter = MistralTurnClient(client)
     adapter.complete_turn(turn_prompt())
-    oversized_table = "x" * (prompts.ASSEMBLED_PROMPT_TOKEN_BUDGET * 4)
+    oversized_table = "x" * (prompts.REPAIR_CONVERSATION_TOKEN_BUDGET * 4)
     with pytest.raises(PromptBudgetExceeded):
         adapter.complete_repair(RepairPrompt(
             call_id="run/t1/call2", turn_id="run/t1",
@@ -577,7 +578,7 @@ def test_client_initialization_checks_fixed_prompt_budget(monkeypatch):
     prefix) alone exceeds the assembled-prompt budget — at startup, not as
     a mid-game kill. Normal construction (the trivially small templates)
     is unaffected."""
-    monkeypatch.setattr(prompts, "ASSEMBLED_PROMPT_TOKEN_BUDGET", 1)
+    monkeypatch.setattr(prompts, "REPAIR_CONVERSATION_TOKEN_BUDGET", 1)
     client, _ = make_client([raw(VALID_BATCH)])
     with pytest.raises(prompts.PromptConfigError):
         MistralTurnClient(client)
@@ -585,3 +586,77 @@ def test_client_initialization_checks_fixed_prompt_budget(monkeypatch):
     monkeypatch.undo()
     client, _ = make_client([raw(VALID_BATCH)])
     MistralTurnClient(client)
+
+
+# ---------------------------------------------------------------------------
+# W1-7: the two-budget reality — the initial check sums ONLY the four
+# section bodies; the repair check sums the COMPLETE conversation (fixed
+# text included). Same pre-split value, two different sums.
+# ---------------------------------------------------------------------------
+
+
+def test_initial_fits_section_budget_but_full_conversation_exceeds_repair_budget():
+    """W1-7 divergence case, at the natural (equal) budget values: the four
+    section bodies sit just under their per-section caps, so their joint sum
+    fits the section-body budget and the initial turn assembles and sends —
+    while the COMPLETE repair conversation (system prompt + full turn prompt
+    + failed output + repair instruction, fixed text included) exceeds the
+    repair-conversation budget and fails closed before any transport call.
+    Before the split this divergence was invisible: one constant guarded two
+    different sums."""
+    assert (prompts.ASSEMBLED_SECTION_BODY_TOKEN_BUDGET
+            == prompts.REPAIR_CONVERSATION_TOKEN_BUDGET)
+    client, transport = make_client([raw(MALFORMED_BATCH), raw(VALID_BATCH)])
+    adapter = MistralTurnClient(client)
+    adapter.complete_turn(turn_prompt(
+        memory="m" * (prompts.MEMORY_TOKEN_BUDGET * 4 - 4),
+        snapshot="s" * (prompts.SNAPSHOT_TOKEN_BUDGET * 4 - 4),
+        delta="d" * (prompts.DELTA_TOKEN_BUDGET * 4 - 4),
+        candidates="c" * (prompts.CANDIDATE_TABLE_TOKEN_BUDGET * 4 - 4),
+    ))
+    # The initial check passed (the section-body sum fits the section-body
+    # budget) and the turn reached the transport.
+    assert len(transport.calls) == 1
+    # The same turn's repair conversation — the bodies PLUS the fixed prompt
+    # text and the repair exchange — exceeds the repair-conversation budget.
+    with pytest.raises(PromptBudgetExceeded):
+        adapter.complete_repair(RepairPrompt(
+            call_id="run/t1/call2", turn_id="run/t1",
+            memory="memory text", snapshot="snapshot text", delta="delta text",
+            candidates="unit:1:goto_n — move north",
+            error_class="schema_error", failed_refs=["unit:1:goto_n"],
+            refreshed_candidates="unit:1:goto_n — move north"))
+    # The oversize repair never reached the transport.
+    assert len(transport.calls) == 1
+
+
+def test_inverse_divergence_sections_over_initial_but_repair_within_budget(
+        monkeypatch):
+    """W1-7, the inverse divergence. With the current equal values it cannot
+    occur naturally (the repair conversation strictly contains the section
+    bodies), so the test sets the two budgets apart: a section-body sum over
+    the section-body budget fails the initial check, while the same content
+    in a complete repair conversation fits the enlarged repair-conversation
+    budget — each check behaves per its own budget."""
+    monkeypatch.setattr(prompts, "ASSEMBLED_SECTION_BODY_TOKEN_BUDGET", 10)
+    monkeypatch.setattr(prompts, "REPAIR_CONVERSATION_TOKEN_BUDGET",
+                        10 * REPAIR_CONVERSATION_TOKEN_BUDGET)
+    bodies = dict(memory="m" * 400, snapshot="s" * 400,
+                  delta="d" * 400, candidate_summary="c" * 400)  # ~400 tokens
+    # Initial check: each section fits its own cap, but the joint sum
+    # exceeds the (tightened) section-body budget -> raises.
+    with pytest.raises(PromptBudgetExceeded):
+        prompts.turn_prompt(**bodies)
+    # The same content as a complete repair conversation: the repair check
+    # sums the full conversation against the (enlarged) repair budget —
+    # within it, so no raise.
+    turn = prompts.turn_prompt(**bodies, enforce_budgets=False)
+    messages = [
+        {"role": "system", "content": prompts.system_prompt()},
+        {"role": "user", "content": turn},
+        {"role": "assistant", "content": "{bad output}"},
+        {"role": "user", "content": prompts.repair_prompt(
+            "schema_error", detail="no JSON object", failed_refs="(none)",
+            refreshed_candidates="TABLE")},
+    ]
+    _check_repair_conversation_budget(messages)  # must not raise
