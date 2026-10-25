@@ -19,6 +19,12 @@ package-A surface (design-plan-freeciv-v1.1.md decision 4 + decision 8):
   serialized artifact;
 - the per-arm model fingerprint probe (fixed prompt v2, the arm sampling,
   the K=3 sample hash set) and the P10 probe methods under a mock transport;
+- the action_batch repair contract (W1-5): both repair attempts are
+  budgeted — disable_transport_retries=True plus the explicit timeout_ms
+  (the documented ACTION_BATCH_REPAIR_TIMEOUT_MS, caller-overridable);
+- the fingerprint probe's fail-closed sample validation (W1-5, DEF-4):
+  fewer than K=3 usable samples, or a non-string sample, raises
+  FingerprintProbeError (no silent partial fingerprint, no AttributeError);
 - the arm sampling (FW-20): every call path — turn calls and probes alike —
   carries temperature 1.0 and reasoning_effort "high" and never sends top_p;
 - the model package stays civrealm-free and MIT-marked (plan §7.1).
@@ -582,6 +588,79 @@ def test_repair_with_retries_disabled_makes_one_request_and_surfaces_failure():
 
 
 # ---------------------------------------------------------------------------
+# action_batch repair contract (W1-5: budgeted repair attempts)
+# ---------------------------------------------------------------------------
+
+
+def test_action_batch_repair_timeout_default_is_documented_constant():
+    """W1-5: action_batch has no runner budget input, so the repair bound
+    is the documented module constant (overridable per call), defaulting to
+    the per-logical-attempt wall-clock bound."""
+    assert mc.ACTION_BATCH_REPAIR_TIMEOUT_MS == mc.DEFAULT_TIMEOUT_MS
+    assert mc.ACTION_BATCH_REPAIR_TIMEOUT_MS > 0
+
+
+def test_action_batch_transport_failure_repair_is_bounded():
+    """W1-5 repair contract, transport-failure path: the repair attempt
+    passes disable_transport_retries=True and the explicit timeout_ms (its
+    TOTAL duration stays within the bound); the initial attempt keeps the
+    transport's transparent retries and no per-call timeout override."""
+    transport = MockTransport(outcomes=[TransportError("500 after retries"),
+                                        raw_completion(VALID_BATCH)])
+    client = make_client(transport)
+    result = client.action_batch(messages=turn_messages(),
+                                 prompt_hash="sha256:test",
+                                 attempts=TurnAttempts())
+    assert result.repairs_used == 1
+    assert transport.calls[0]["disable_transport_retries"] is False
+    assert transport.calls[0]["timeout_ms"] is None
+    assert transport.calls[1]["disable_transport_retries"] is True
+    assert transport.calls[1]["timeout_ms"] == mc.ACTION_BATCH_REPAIR_TIMEOUT_MS
+
+
+def test_action_batch_validation_failure_repair_is_bounded():
+    """W1-5 repair contract, validation-failure path: the same budgeted
+    kwargs on the repair attempt that re-asks after a schema/ref failure."""
+    transport = MockTransport(outcomes=[raw_completion("garbage"),
+                                        raw_completion(VALID_BATCH)])
+    client = make_client(transport)
+    result = client.action_batch(messages=turn_messages(),
+                                 prompt_hash="sha256:test",
+                                 attempts=TurnAttempts())
+    assert result.repairs_used == 1
+    assert transport.calls[0]["disable_transport_retries"] is False
+    assert transport.calls[0]["timeout_ms"] is None
+    assert transport.calls[1]["disable_transport_retries"] is True
+    assert transport.calls[1]["timeout_ms"] == mc.ACTION_BATCH_REPAIR_TIMEOUT_MS
+
+
+def test_action_batch_repair_timeout_is_caller_overridable():
+    """W1-5: the repair timeout is overridable per call and reaches the
+    transport exactly as passed."""
+    transport = MockTransport(outcomes=[raw_completion("garbage"),
+                                        raw_completion(VALID_BATCH)])
+    client = make_client(transport)
+    client.action_batch(messages=turn_messages(), prompt_hash="sha256:test",
+                        attempts=TurnAttempts(), timeout_ms=55_000)
+    assert transport.calls[1]["timeout_ms"] == 55_000
+    assert transport.calls[1]["disable_transport_retries"] is True
+
+
+def test_action_batch_both_transport_fail_repair_still_bounded():
+    """W1-5: on the both-attempts-fail path the (failed) repair attempt was
+    still dispatched with the budgeted kwargs."""
+    transport = MockTransport(outcomes=[TransportError("down"),
+                                        TransportError("down again")])
+    client = make_client(transport)
+    with pytest.raises(AttemptBudgetExhausted):
+        client.action_batch(messages=turn_messages(),
+                            prompt_hash="sha256:test",
+                            attempts=TurnAttempts())
+    assert transport.calls[1]["disable_transport_retries"] is True
+    assert transport.calls[1]["timeout_ms"] == mc.ACTION_BATCH_REPAIR_TIMEOUT_MS
+
+
+# ---------------------------------------------------------------------------
 # Enforcement paths (decision 4: both behind one interface)
 # ---------------------------------------------------------------------------
 
@@ -996,6 +1075,57 @@ def test_fingerprint_probe_transport_error_propagates():
     transport = MockTransport(outcomes=[TransportError("no route")])
     client = make_client(transport)
     with pytest.raises(TransportError):
+        client.probe_fingerprint()
+    assert client.arm_fingerprint is None
+
+
+@pytest.mark.parametrize("sample_contents", [
+    ["only-one"],
+    ["one", "two"],
+])
+def test_fingerprint_probe_fails_closed_on_missing_samples(sample_contents):
+    """W1-5 / DEF-4 fail-closed: fewer than FINGERPRINT_PROBE_SAMPLES
+    usable samples (a contract-violating transport returning fewer choices
+    than the requested n=3) FAILS the probe with a recorded
+    FingerprintProbeError — never a silent partial fingerprint."""
+    raw = raw_completion("content", sample_contents=list(sample_contents))
+    transport = MultiSampleMockTransport(outcomes=[raw])
+    client = make_client(transport)
+    with pytest.raises(mc.FingerprintProbeError):
+        client.probe_fingerprint()
+    assert client.arm_fingerprint is None
+
+
+def test_fingerprint_probe_fails_closed_on_missing_multi_sample_fallback():
+    """W1-5: a single-request outcome with no per-choice contents falls
+    back to ONE sample — below K=3, so the probe fails closed."""
+    transport = MultiSampleMockTransport(
+        outcomes=[raw_completion("single-content", sample_contents=[])])
+    client = make_client(transport)
+    with pytest.raises(mc.FingerprintProbeError):
+        client.probe_fingerprint()
+    assert client.arm_fingerprint is None
+
+
+def test_fingerprint_probe_fails_closed_on_none_sample_sequential():
+    """W1-5: a None sample content (contract-violating transport) must not
+    crash the probe with AttributeError — the probe fails closed instead."""
+    transport = MockTransport(outcomes=[raw_completion(None),
+                                        raw_completion("s2"),
+                                        raw_completion("s3")])
+    client = make_client(transport)
+    with pytest.raises(mc.FingerprintProbeError):
+        client.probe_fingerprint()
+    assert client.arm_fingerprint is None
+
+
+def test_fingerprint_probe_fails_closed_on_none_sample_multi_request():
+    """W1-5: a None choice content inside a multi-sample response also
+    fails the probe closed (no AttributeError escape)."""
+    raw = raw_completion("content", sample_contents=[None, "s2", "s3"])
+    transport = MultiSampleMockTransport(outcomes=[raw])
+    client = make_client(transport)
+    with pytest.raises(mc.FingerprintProbeError):
         client.probe_fingerprint()
     assert client.arm_fingerprint is None
 

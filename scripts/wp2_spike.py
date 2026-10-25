@@ -141,6 +141,8 @@ def offline_mock_verification():
                 'temperature': temperature, 'max_tokens': max_tokens,
                 'response_format': response_format,
                 'reasoning_effort': reasoning_effort, 'n': n,
+                'timeout_ms': timeout_ms,
+                'disable_transport_retries': disable_transport_retries,
             })
             outcome = self.outcomes.pop(0)
             if isinstance(outcome, Exception):
@@ -156,7 +158,8 @@ def offline_mock_verification():
             completion_tokens=kw.get('completion_tokens', 50),
             total_tokens=(kw.get('prompt_tokens', 100)
                           + kw.get('completion_tokens', 50)),
-            transport_retries=kw.get('transport_retries', 0))
+            transport_retries=kw.get('transport_retries', 0),
+            sample_contents=kw.get('sample_contents'))
 
     messages = [
         {'role': 'system', 'content': prompts.system_prompt()},
@@ -208,7 +211,10 @@ def offline_mock_verification():
         checks['attempt_cap_enforced'] = len(t.calls) == 2
 
     # 4. repair counting: garbage then valid -> 2 attempts, 1 repair, and
-    #    the repair messages carry the class-specific repair prompt
+    #    the repair messages carry the class-specific repair prompt; the
+    #    repair attempt is BUDGETED (core/model_client.py repair contract:
+    #    disable_transport_retries=True + the explicit timeout_ms default,
+    #    W1-5) while the initial attempt keeps transparent retries
     t = MockTransport(outcomes=[raw('garbage'), raw(valid_batch)])
     c = mc.MistralClient(api_key=canary, transport=t)
     res = c.action_batch(
@@ -221,7 +227,11 @@ def offline_mock_verification():
         and res.call_logs[1].kind == 'repair'
         and len(t.calls[1]['messages']) == len(messages) + 2
         and 'SCHEMA ERROR' in repair_user
-        and 'FULL TABLE: unit:1:goto_n' in repair_user)
+        and 'FULL TABLE: unit:1:goto_n' in repair_user
+        and t.calls[0]['disable_transport_retries'] is False
+        and t.calls[0]['timeout_ms'] is None
+        and t.calls[1]['disable_transport_retries'] is True
+        and t.calls[1]['timeout_ms'] == mc.ACTION_BATCH_REPAIR_TIMEOUT_MS)
 
     # 5. per-call logging fields (tokens, latency, cost, fingerprint data)
     t = MockTransport(outcomes=[raw(valid_batch, prompt_tokens=100,
@@ -254,8 +264,12 @@ def offline_mock_verification():
     checks['no_secret_in_logs'] = canary not in blob
 
     # 7. fingerprint probe: K=3 multi-sample, arm sampling (temperature
-    #    1.0, reasoning_effort "high", no top_p), set-encoded fingerprint
-    t = MockTransport(outcomes=[raw('LECHONK-FINGERPRINT-7f3a91c2')])
+    #    1.0, reasoning_effort "high", no top_p), set-encoded fingerprint.
+    #    The multi-sample outcome carries K=3 sample_contents — the probe
+    #    is fail-closed (W1-5, DEF-4) and rejects fewer.
+    t = MockTransport(outcomes=[raw('LECHONK-FINGERPRINT-7f3a91c2',
+                                    sample_contents=[
+                                        'LECHONK-FINGERPRINT-7f3a91c2'] * 3)])
     c = mc.MistralClient(api_key=canary, transport=t)
     p = c.probe_fingerprint()
     import hashlib
@@ -263,6 +277,7 @@ def offline_mock_verification():
         b'LECHONK-FINGERPRINT-7f3a91c2').hexdigest()
     checks['fingerprint_probe_mock'] = (
         p.fingerprint == expected
+        and p.sample_attempts == mc.FINGERPRINT_PROBE_SAMPLES
         and t.calls[0]['temperature'] == 1.0
         and t.calls[0]['reasoning_effort'] == 'high'
         and t.calls[0]['n'] == mc.FINGERPRINT_PROBE_SAMPLES
@@ -270,6 +285,17 @@ def offline_mock_verification():
         and p.prompt_hash == prompts.prompt_hash(
             mc.FINGERPRINT_PROBE_PROMPT)
         and c.arm_fingerprint == expected)
+
+    # 8. fingerprint probe fail-closed (W1-5, DEF-4): fewer than
+    #    FINGERPRINT_PROBE_SAMPLES usable samples FAILS the probe — a
+    #    recorded FingerprintProbeError, arm_fingerprint stays unset
+    t = MockTransport(outcomes=[raw('one', sample_contents=['one'])])
+    c = mc.MistralClient(api_key=canary, transport=t)
+    try:
+        c.probe_fingerprint()
+        checks['fingerprint_probe_fail_closed'] = False
+    except mc.FingerprintProbeError:
+        checks['fingerprint_probe_fail_closed'] = c.arm_fingerprint is None
 
     return {
         'checks': checks,

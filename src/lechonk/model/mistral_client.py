@@ -46,7 +46,9 @@ collects K=3 samples — one request with ``n=3`` when the SDK path supports
 it, else three sequential requests (the mode is recorded). The persisted
 fingerprint is the sorted, deduplicated SET of the sample output hashes
 (see ``encode_fingerprint_set``); it travels with every per-call log and
-goes into the run manifest.
+goes into the run manifest. The probe is fail-closed (DEF-4): fewer than
+FINGERPRINT_PROBE_SAMPLES usable samples raises ``FingerprintProbeError``
+(the caller aborts the evaluation with a recorded infrastructure failure).
 
 This module never imports civrealm (plan §7.1). The official ``mistralai``
 SDK is imported lazily by ``MistralSDKTransport`` only — offline tests drive
@@ -92,6 +94,13 @@ DEFAULT_TIMEOUT_MS = 120_000
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_REASONING_EFFORT = "high"
+
+# The action_batch repair attempts are BUDGETED (core/model_client.py
+# repair contract): each repair passes disable_transport_retries=True and
+# this explicit timeout_ms, so the repair's TOTAL duration stays within the
+# bound. action_batch has no runner budget input (spike path), so the bound
+# is this documented module constant, overridable per call.
+ACTION_BATCH_REPAIR_TIMEOUT_MS = DEFAULT_TIMEOUT_MS
 
 # Per-arm fingerprint probe (decision 8, FW-21): K samples collected under
 # the arm sampling. The probe's max_tokens is raised from 256 to 1024
@@ -164,6 +173,14 @@ class TransportError(MistralClientError):
     """A logical API attempt failed at transport level (after the SDK's own
     transparent retries). The attempt is logged and counts against the
     per-turn budget."""
+
+
+class FingerprintProbeError(MistralClientError):
+    """The fingerprint probe could not obtain a valid sample set (DEF-4,
+    fail-closed): fewer than FINGERPRINT_PROBE_SAMPLES usable samples
+    arrived, or a sample was not usable content. The caller must abort the
+    evaluation with a recorded infrastructure failure — never a
+    metric-bearing comparison against an invalid fingerprint."""
 
 
 class SchemaError(MistralClientError):
@@ -1144,6 +1161,7 @@ class MistralClient:
         repair_candidates_for: Optional[RepairCandidatesFor] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        timeout_ms: int = ACTION_BATCH_REPAIR_TIMEOUT_MS,
     ) -> ActionBatchResult:
         """One turn's model call under the one-request budget (decision 4):
         attempt 1, then at most one repair attempt (schema-error, or a
@@ -1160,6 +1178,13 @@ class MistralClient:
           the candidate text attached to the repair prompt (the runner renders
           the full table for schema errors, the refreshed candidates for the
           failed refs otherwise).
+        - ``timeout_ms``: the explicit per-call timeout bounding each REPAIR
+          attempt; both repair paths also pass
+          ``disable_transport_retries=True`` (the core/model_client.py repair
+          contract: a repair attempt's TOTAL duration stays within the
+          timeout). Defaults to the documented module constant
+          ``ACTION_BATCH_REPAIR_TIMEOUT_MS``, overridable per call. The
+          initial attempt is unaffected (transparent transport retries).
 
         Raises AttemptBudgetExhausted when the budget is spent with no valid
         ActionBatch (the runner then applies the degraded defaults).
@@ -1184,12 +1209,15 @@ class MistralClient:
                 max_tokens=max_tokens)
         except TransportError as exc:
             # No model output: the single repair slot re-asks the same turn.
+            # BUDGETED repair (core/model_client.py repair contract): one
+            # transport request, TOTAL duration within timeout_ms.
             attempt_no = attempts.begin_attempt(is_repair=True)
             try:
                 raw = self._complete(
                     messages=messages, attempt=attempt_no, kind="repair",
                     prompt_hash=prompt_hash, temperature=temperature,
-                    max_tokens=max_tokens)
+                    max_tokens=max_tokens, timeout_ms=timeout_ms,
+                    disable_transport_retries=True)
             except TransportError as exc2:
                 raise AttemptBudgetExhausted(
                     f"both API attempts failed at transport level "
@@ -1222,10 +1250,13 @@ class MistralClient:
         )
         attempt_no = attempts.begin_attempt(is_repair=True)
         try:
+            # BUDGETED repair (core/model_client.py repair contract): one
+            # transport request, TOTAL duration within timeout_ms.
             raw2 = self._complete(
                 messages=repair_messages, attempt=attempt_no, kind="repair",
                 prompt_hash=prompt_hash, temperature=temperature,
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, timeout_ms=timeout_ms,
+                disable_transport_retries=True)
         except TransportError as exc:
             raise AttemptBudgetExhausted(
                 f"repair attempt (2/{MAX_ATTEMPTS_PER_TURN}) failed at "
@@ -1318,7 +1349,14 @@ class MistralClient:
         persisted fingerprint is the sorted, deduplicated SET of the sample
         output hashes (``encode_fingerprint_set``). Cached on the client
         (``arm_fingerprint``) and carried by every subsequent per-call log.
-        K logical probe requests (not turn calls)."""
+        K logical probe requests (not turn calls).
+
+        Fail-closed (DEF-4): when fewer than FINGERPRINT_PROBE_SAMPLES
+        usable samples arrive, or a sample is not usable content (e.g.
+        None from a contract-violating transport), the probe raises
+        ``FingerprintProbeError`` — the caller must abort the evaluation
+        with a recorded infrastructure failure, never run a metric-bearing
+        comparison against an invalid fingerprint."""
         prompt_text = prompt_templates.load_prompt(FINGERPRINT_PROBE_PROMPT)
         prompt_hash = prompt_templates.prompt_hash(FINGERPRINT_PROBE_PROMPT)
         messages: list[Message] = [
@@ -1348,6 +1386,26 @@ class MistralClient:
                     response_format=None)
                 raws.append(raw)
                 samples.append(raw.content)
+        # DEF-4, fail-closed: a probe that cannot obtain the required
+        # sample set is a recorded infrastructure failure, never a
+        # metric-bearing comparison with an invalid fingerprint. The
+        # content guard also keeps a contract-violating transport (None
+        # sample) from crashing the probe with AttributeError.
+        if len(samples) != FINGERPRINT_PROBE_SAMPLES:
+            raise FingerprintProbeError(
+                f"fingerprint probe failed: expected "
+                f"{FINGERPRINT_PROBE_SAMPLES} samples, got {len(samples)} "
+                f"(mode {mode}); the caller must abort the evaluation with "
+                "a recorded infrastructure failure")
+        invalid = [i for i, sample in enumerate(samples)
+                   if not isinstance(sample, str)]
+        if invalid:
+            raise FingerprintProbeError(
+                f"fingerprint probe failed: sample(s) {invalid} are not "
+                f"usable content (types: "
+                f"{[type(samples[i]).__name__ for i in invalid]}); the "
+                "caller must abort the evaluation with a recorded "
+                "infrastructure failure")
         probe_logs = self.call_logs[logs_before:]
         output_hashes = sorted({
             hashlib.sha256(sample.encode("utf-8")).hexdigest()
