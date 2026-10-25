@@ -157,7 +157,7 @@ def load_transcript(path: Union[str, Path]) -> TranscriptLoad:
     return load
 
 
-def _valid_prefix_bytes(path: str) -> int:
+def valid_prefix_bytes(path: str) -> int:
     """The byte offset just after the last VALID record's line — the
     length of the transcript's valid prefix (used by attach() to truncate a
     trailing partial record out of the FILE)."""
@@ -214,7 +214,7 @@ class TranscriptLedger:
         load = load_transcript(path)
         if load.discarded_trailing_partial:
             with open(path, "r+b") as fh:
-                fh.truncate(_valid_prefix_bytes(str(path)))
+                fh.truncate(valid_prefix_bytes(str(path)))
         ledger = cls(path, clock=clock)
         ledger._next_seq = load.last_seq + 1
         return ledger

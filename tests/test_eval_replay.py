@@ -282,6 +282,48 @@ def test_render_bundle_missing_transcript_raises(tmp_path):
         replay.render_bundle(tmp_path / "nope.jsonl", tmp_path / "out")
 
 
+def test_render_bundle_torn_trailing_partial_not_embedded(tmp_path):
+    """A torn trailing partial (A-13) never reaches the viewer: the meta
+    still records the discard, but the embedded transcript block is the
+    VERIFIED byte prefix only — the viewer's parseJsonl (one JSON.parse
+    per non-empty line) must never see the torn fragment."""
+    from lechonk.core.ledger import load_transcript
+    transcript = _build_transcript(tmp_path)
+    torn = '{"kind": "turn_start", "turn": 3, "seq": 11, "ts"'
+    with open(transcript, "a", encoding="utf-8") as fh:
+        fh.write(torn)
+    out = tmp_path / "replay"
+    summary = replay.render_bundle(transcript, out)
+    meta = summary["meta"]
+    # the discard is still disclosed in meta
+    assert meta["discarded_trailing_partial"] is True
+    html = (out / "index.html").read_text(encoding="utf-8")
+    embedded = _script_block(html, "lechonk-transcript")
+    # the torn fragment is not embedded
+    assert torn not in embedded
+    # the viewer's parseJsonl: every non-empty line parses without throw
+    records = [json.loads(line) for line in embedded.splitlines()
+               if line.strip()]
+    # all valid records are present — exactly the kept records
+    kept = load_transcript(transcript).records
+    assert len(records) == len(kept)
+    assert [r["seq"] for r in records] == [rec.seq for rec in kept]
+
+
+def test_render_bundle_clean_transcript_embed_is_raw_text(tmp_path):
+    """A clean transcript's embed is the raw file text (modulo the
+    \\u003c escaping) — the prefix restriction changes nothing when
+    there is no trailing partial."""
+    transcript = _build_transcript(tmp_path, detail_breakout=True)
+    out = tmp_path / "replay"
+    summary = replay.render_bundle(transcript, out)
+    assert summary["meta"]["discarded_trailing_partial"] is False
+    html = (out / "index.html").read_text(encoding="utf-8")
+    embedded = _script_block(html, "lechonk-transcript")
+    assert embedded == transcript.read_text(encoding="utf-8").replace(
+        "<", "\\u003c")
+
+
 def test_embed_escapes_all_angle_brackets():
     payload = '{"detail": "</script> <!-- <script> </b>"}'
     embedded = replay._embed(payload)

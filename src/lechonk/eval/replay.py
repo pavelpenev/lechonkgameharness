@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from lechonk.core.jsonutil import strict_dumps
-from lechonk.core.ledger import load_transcript
+from lechonk.core.ledger import load_transcript, valid_prefix_bytes
 from lechonk.core.metrics import commitment_board
 from lechonk.core.schemas import (
     ActionResultRecord,
@@ -800,7 +800,15 @@ def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
     load = load_transcript(transcript)
     records = load.records
     board = commitment_board(records)
-    raw_text = transcript.read_text(encoding="utf-8")
+    # The embedded transcript block is parsed by the viewer with
+    # parseJsonl (one JSON.parse per non-empty line), so only the
+    # VERIFIED byte prefix is embedded — never the raw discarded
+    # trailing partial (a torn JSON fragment would break JSON.parse;
+    # the discard is still recorded in meta). For a clean transcript
+    # the prefix is the whole file (byte-identical embed).
+    raw_text = (transcript.read_bytes()
+                [:valid_prefix_bytes(str(transcript))]
+                .decode("utf-8"))
 
     # The raw copies (provenance / tooling).
     shutil.copyfile(transcript, out / "transcript.jsonl")
