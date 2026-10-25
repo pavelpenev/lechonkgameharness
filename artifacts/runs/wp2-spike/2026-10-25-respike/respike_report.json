@@ -1,0 +1,184 @@
+{
+  "execution_date": "2026-10-25",
+  "max_tokens_recheck": {
+    "fingerprint_k3": {
+      "finish_reason": "stop",
+      "output_hashes_unique": 2,
+      "sample_attempts": 3,
+      "sample_mode": "single_request_n3",
+      "tokens_in": 157,
+      "tokens_out": 1416,
+      "tokens_total": 1573
+    },
+    "p10a_model_id": {
+      "finish_reason": "length",
+      "tokens_in": null,
+      "tokens_out": null
+    },
+    "p10b_json_schema": {
+      "finish_reason": "stop",
+      "tokens_in": null,
+      "tokens_out": null
+    },
+    "scope_note": "probe-scale only: these are individual probe calls (max_tokens 16 / 1024 / 1024), not full turns; a full turn-scale finish_reason re-check requires a future live run under the same arm sampling"
+  },
+  "model_id": "mistral-large-4",
+  "probe": "FW-22 re-spike",
+  "probe_call_logs": [
+    {
+      "call_id": "call-0001",
+      "finish_reason": "length",
+      "kind": "probe",
+      "latency_ms": 1104,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "reasoning_effort": "high",
+      "temperature": 1.0,
+      "tokens_in": 8,
+      "tokens_out": 16,
+      "tokens_total": 24
+    },
+    {
+      "call_id": "call-0002",
+      "finish_reason": "stop",
+      "kind": "probe",
+      "latency_ms": 2537,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "reasoning_effort": "high",
+      "temperature": 1.0,
+      "tokens_in": 829,
+      "tokens_out": 383,
+      "tokens_total": 1212
+    },
+    {
+      "call_id": "call-0003",
+      "finish_reason": "stop",
+      "kind": "probe",
+      "latency_ms": 8186,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "reasoning_effort": "high",
+      "temperature": 1.0,
+      "tokens_in": 157,
+      "tokens_out": 1416,
+      "tokens_total": 1573
+    }
+  ],
+  "probes": {
+    "fingerprint_k3": {
+      "cost_usd": 0.002203,
+      "fingerprint": "sha256:800606ff1c14334c5e09939b5f51519149beeb85492fcc10a62e890c6aa3dd3b|sha256:a53e1e0b2a1a5df2e218ea32b3b22192ca2c9e58bfee4959004f13a445914b32",
+      "finish_reason": "stop",
+      "latency_ms": 8186,
+      "max_tokens": 1024,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "output_hashes": [
+        "800606ff1c14334c5e09939b5f51519149beeb85492fcc10a62e890c6aa3dd3b",
+        "a53e1e0b2a1a5df2e218ea32b3b22192ca2c9e58bfee4959004f13a445914b32"
+      ],
+      "prompt_hash": "sha256:29c72ee59512c80521b3d55975e3dd82e3ea624a4e186655649b968ef78035cb",
+      "response_id": "dc7afdf3695b4517be3c511b5359385a",
+      "sample_attempts": 3,
+      "sample_mode": "single_request_n3",
+      "temperature": 1.0,
+      "tokens_in": 157,
+      "tokens_out": 1416,
+      "tokens_total": 1573,
+      "ts": "2026-10-25T14:17:17.574+00:00"
+    },
+    "p10a_model_id": {
+      "error": null,
+      "finish_reason": "length",
+      "latency_ms": 1104,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "responded": true,
+      "response_id": "292dfa934ed24842b97b316a91e474f4",
+      "ts": "2026-10-25T14:17:06.848+00:00"
+    },
+    "p10b_json_schema": {
+      "error": null,
+      "json_schema_supported": true,
+      "latency_ms": 2537,
+      "model_requested": "mistral-large-4",
+      "model_responded": "mistral-large-4",
+      "responded": true,
+      "response_format_type": "json_schema",
+      "response_shape": {
+        "content_is_json_object": true,
+        "finish_reason": "stop",
+        "model_responded": "mistral-large-4",
+        "top_level_keys": [
+          "actions",
+          "commitments",
+          "finish_requested",
+          "notes",
+          "turn_id"
+        ],
+        "valid_action_batch": true
+      },
+      "schema_hash": "sha256:b87713f5dc2cea66ad574fb6cd066c75d2b0d4cf1ca50b68d05e72bde87353ad",
+      "strict": true,
+      "ts": "2026-10-25T14:17:09.387+00:00"
+    }
+  },
+  "sampling": {
+    "max_tokens_default": 16384,
+    "reasoning_effort": "high",
+    "sdk_chat_parameter_names": [
+      "frequency_penalty",
+      "guardrails",
+      "http_headers",
+      "logprobs",
+      "max_tokens",
+      "messages",
+      "metadata",
+      "min_tokens",
+      "model",
+      "n",
+      "parallel_tool_calls",
+      "prediction",
+      "presence_penalty",
+      "prompt_cache_key",
+      "prompt_logprobs",
+      "prompt_mode",
+      "random_seed",
+      "reasoning_effort",
+      "repetition_penalty",
+      "response_format",
+      "retries",
+      "safe_prompt",
+      "self",
+      "server_url",
+      "service_tier",
+      "stop",
+      "stream",
+      "temperature",
+      "timeout_ms",
+      "tool_choice",
+      "tools",
+      "top_k",
+      "top_logprobs",
+      "top_p",
+      "top_prompt_logprobs"
+    ],
+    "temperature": 1.0,
+    "top_p_sent": false,
+    "transport_parameter_names": [
+      "disable_transport_retries",
+      "max_tokens",
+      "messages",
+      "model",
+      "n",
+      "random_seed",
+      "reasoning_effort",
+      "response_format",
+      "self",
+      "temperature",
+      "timeout_ms"
+    ]
+  },
+  "session_calendar_note": "the session calendar said 2026-10-24; the host date at execution (2026-10-25) is used"
+}
