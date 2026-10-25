@@ -406,6 +406,71 @@ def test_runner_continues_standing_order_linked_to_origin(tmp_path):
     assert result.metrics.participation.numerator == 2
 
 
+class _SentryInconclusiveSession(FakeSession):
+    """A step-completed (no disconnect) sentry whose read-back is
+    INCONCLUSIVE: the send succeeded, but the upstream read path cancels
+    ACTIVITY_SENTRY in the same step, so the post-observation shows an
+    unchanged activity — sent-then-cancelled is indistinguishable from
+    never-sent (the state is known, only the read-back is non-probative)."""
+
+    def __init__(self, worlds):
+        super().__init__(worlds)
+        self._sentry_sends = 0
+
+    def step(self, action, *, deadline=None):
+        if action == ("unit", 11, "sentry"):
+            self._sentry_sends += 1
+            if self._sentry_sends == 1:
+                # Send completes normally; skip the scripted effect so the
+                # read-back verifier sees unchanged activity (INCONCLUSIVE).
+                return StepOutcome(
+                    observation=self.obs, reward=0.0, terminated=False,
+                    truncated=False, info=self.info, action=action,
+                    elapsed_s=0.01)
+        return super().step(action, deadline=deadline)
+
+
+def test_runner_step_completed_inconclusive_standing_order_continues(tmp_path):
+    """A step-completed INCONCLUSIVE read-back (the sentry quirk: the state
+    is known, the read-back is merely non-probative) is NOT the §3 line 35
+    disconnect quarantine: the standing order is stored on it and stays
+    continuable — the later re-issue by _continue_standing_orders is the
+    normal state-gated resend, never a quarantine."""
+    worlds = [
+        turn_world(1),
+        turn_world(2, unit_overrides=[(11, {"activity": 0})]),
+        turn_world(3),
+    ]
+    session = _SentryInconclusiveSession(worlds)
+    client = FakeModelClient([
+        ok_response(["unit:11:sentry"], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),  # responsive empty
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=2)
+    result = runner.run()
+    assert result.outcome == "COMPLETED"
+    actions = _actions(_records(runner.ledger.path))
+    sentries = [a for a in actions if a.ref == "unit:11:sentry"]
+    # The turn-1 model order: executed with an INCONCLUSIVE read-back.
+    assert sentries[0].provenance_class == "model"
+    assert sentries[0].outcome == "executed"
+    assert sentries[0].readback == "inconclusive"
+    # No disconnect occurred: nothing was quarantined.
+    records = _records(runner.ledger.path)
+    assert not [r for r in records if isinstance(r, MetricEventRecord)
+                and r.name == "mutation_quarantine"]
+    # The standing order was stored on the inconclusive read-back and the
+    # pipeline re-issued it once as the normal state-gated continuation.
+    continuations = [a for a in actions
+                     if a.provenance_class == "continued_model_order"]
+    assert len(continuations) == 1
+    cont = continuations[0]
+    assert cont.turn == 2 and cont.verb == "sentry"
+    assert cont.outcome == "executed" and cont.readback == "verified"
+    assert cont.origin_seq == sentries[0].seq
+
+
 def test_runner_fortifying_unit_counts_as_standing_in_effect(tmp_path):
     # Turn 1: the model orders unit 11 to fortify (executed, verified —
     # the fake session applies ACTIVITY_FORTIFIED). Turn 2: the unit shows

@@ -70,7 +70,14 @@ model attempt, or the standing order's own origin for continuations).
 An executed (VERIFIED) or unknown (INCONCLUSIVE / reconnect read failed)
 mutation is NEVER resent: it is quarantined (mutation_quarantine
 metric_event) and the run takes the bounded fail-stop — TRUNCATED with
-artifacts, never blind replay, no duplicate mutation. The resubmission
+artifacts, never blind replay, no duplicate mutation. This quarantine rule
+applies to send-failed-after-dispatch mutations (disconnect-context only).
+A step-completed INCONCLUSIVE read-back is different: the send succeeded and
+the execution state is known, only the read-back evidence is non-probative
+(e.g. sentry/build_city). Such a mutation is NOT quarantined — a standing
+order stored on it stays continuable, and the later resend by
+_continue_standing_orders is the normal state-gated re-issue (read-back
+proof of non-execution required, §3 line 32), not a blind replay. The resubmission
 itself is never repeated: a second disconnect (or a contradicted
 resend) quarantines the same way. Reconciliation decisions are ledgered
 as mutation_reconciliation metric_events so the P11 audit can verify the
