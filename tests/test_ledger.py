@@ -160,13 +160,69 @@ def test_trailing_partial_record_is_discarded(tmp_path):
     assert load.discarded_trailing_partial
     assert [r.seq for r in load.records] == [0, 1]
 
-    # A COMPLETE unterminated line (valid JSON + checksum) is accepted.
+    # A COMPLETE unterminated line (valid JSON + checksum) is STILL a
+    # trailing partial: its terminating newline never landed, so it comes
+    # from a torn-write window (never fsynced-complete) — always discarded,
+    # never repaired by appending a newline.
     complete = json.loads(good_bytes.splitlines()[0])
     path3 = tmp_path / "t3.jsonl"
     path3.write_bytes(good_bytes + canonical_json(complete).encode("utf-8"))
     load = load_transcript(path3)
-    assert not load.discarded_trailing_partial
-    assert [r.seq for r in load.records] == [0, 1, 0]
+    assert load.discarded_trailing_partial
+    assert load.discarded_bytes > 0
+    assert [r.seq for r in load.records] == [0, 1]
+
+
+def test_seq_duplicates_raise(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(TurnStartRecord(turn=2))
+    ledger.close()
+    lines = path.read_bytes().splitlines(keepends=True)
+    # Rewrite the second line as a duplicate of seq 0 (recompute checksum).
+    dup = {"kind": "turn_start", "turn": 1, "seq": 0, "ts": "x"}
+    dup["checksum"] = compute_checksum(dup)
+    lines[1] = canonical_json(dup).encode("utf-8") + b"\n"
+    path.write_bytes(b"".join(lines))
+    with pytest.raises(LedgerCorruptionError) as exc:
+        load_transcript(path)
+    assert str(path) in str(exc.value)
+
+
+def test_seq_gap_raises(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1))
+    ledger.append(TurnStartRecord(turn=2))
+    ledger.append(TurnStartRecord(turn=3))
+    ledger.close()
+    lines = path.read_bytes().splitlines(keepends=True)
+    # Bump the middle record's seq to 3 (leaving a gap at 1); recompute its
+    # checksum so only the continuity check can catch it.
+    gap = {"kind": "turn_start", "turn": 2, "seq": 3, "ts": "x"}
+    gap["checksum"] = compute_checksum(gap)
+    lines[1] = canonical_json(gap).encode("utf-8") + b"\n"
+    path.write_bytes(b"".join(lines))
+    with pytest.raises(LedgerCorruptionError) as exc:
+        load_transcript(path)
+    assert str(path) in str(exc.value)
+
+
+def test_trailing_blank_line_loads_cleanly_and_attach_truncates(tmp_path):
+    path = tmp_path / "t.jsonl"
+    ledger = TranscriptLedger(path)
+    ledger.append(TurnStartRecord(turn=1), durable=True)
+    ledger.append(_action(), durable=True)
+    ledger.close()
+    good_bytes = path.read_bytes()
+    path.write_bytes(good_bytes + b"\n")  # trailing blank line
+    load = load_transcript(path)
+    assert [r.seq for r in load.records] == [0, 1]  # loads cleanly
+
+    recovered = TranscriptLedger.attach(path)
+    recovered.close()
+    assert path.read_bytes() == good_bytes  # attach truncated the blank line
 
 
 def test_corruption_before_the_trailing_record_raises(tmp_path):

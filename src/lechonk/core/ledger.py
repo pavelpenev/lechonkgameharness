@@ -20,9 +20,14 @@ mechanics:
   of an executed mutation).
 - ``fsync()`` forces the intent-before-write boundary explicitly.
 - ``load_transcript(path)`` re-reads a transcript for the metrics: every
-  line is schema-validated and checksum-verified; a trailing partial
-  record (the mid-write kill case — torn bytes at EOF, with or without a
-  final newline) is DISCARDED and reported; corruption anywhere before the
+  line is schema-validated and checksum-verified, and seqs must be
+  exactly 0..n-1 (a duplicate or gap raises LedgerCorruptionError); a
+  trailing partial record is DISCARDED and reported. A tail record
+  without its terminating newline is ALWAYS a trailing partial — even
+  when it decodes and parses: its newline never landed, so it comes from
+  a torn-write window (never fsynced-complete); its mutation state is
+  settled by read-back reconciliation, so discarding is safe (never
+  "repair" by appending a newline). Corruption anywhere before the
   trailing record raises LedgerCorruptionError (never silently dropped).
 - ``TranscriptLedger.attach(path)`` recovers a transcript after a kill and
   resumes appending at the next seq.
@@ -107,8 +112,15 @@ def load_transcript(path: Union[str, Path]) -> TranscriptLoad:
     A torn write at EOF (the mid-write kill) leaves either unterminated
     bytes after the last newline or a final newline-terminated line that
     fails validation/checksum — both are the trailing partial record and
-    are discarded. Any failure BEFORE the trailing record raises
-    LedgerCorruptionError: the transcript is never silently truncated.
+    are discarded. Unterminated bytes at EOF are ALWAYS a trailing
+    partial, even when they decode and parse: the terminating newline
+    never landed, so the record comes from a torn-write window (never
+    fsynced-complete); its mutation state is settled by read-back
+    reconciliation, so discarding is safe — never "repair" by appending
+    a newline. The record seqs must be exactly 0..n-1 (no duplicates or
+    gaps); a violation raises LedgerCorruptionError naming the file. Any
+    other failure BEFORE the trailing record raises LedgerCorruptionError:
+    the transcript is never silently truncated.
     """
     path = str(path)
     raw = Path(path).read_bytes() if Path(path).exists() else b""
@@ -134,12 +146,20 @@ def load_transcript(path: Union[str, Path]) -> TranscriptLoad:
                 f"{path}: corrupt transcript line {i + 1} (before the "
                 f"trailing record)") from None
     if tail:
-        # Unterminated bytes after the last newline: a torn final write.
-        try:
-            load.records.append(_decode_line(tail))
-        except Exception:
-            load.discarded_trailing_partial = True
-            load.discarded_bytes += len(tail)
+        # Unterminated bytes after the last newline: ALWAYS a trailing
+        # partial, even when they decode and parse — the terminating
+        # newline never landed (torn-write window, never fsynced-complete);
+        # the mutation state is settled by read-back reconciliation, so
+        # discarding is safe. Never "repair" by appending a newline.
+        load.discarded_trailing_partial = True
+        load.discarded_bytes += len(tail)
+
+    # Seq continuity: the kept records must be exactly 0..n-1.
+    seqs = [r.seq for r in load.records]
+    if seqs != list(range(len(seqs))):
+        raise LedgerCorruptionError(
+            f"{path}: transcript seq continuity violation "
+            f"(expected 0..{len(seqs) - 1}, got {seqs})")
     return load
 
 
@@ -159,13 +179,9 @@ def _valid_prefix_bytes(path: str) -> int:
             break  # the trailing partial (load_transcript already validated
             # that any earlier failure would have raised)
         valid_end += len(line) + 1
-    else:
-        if tail:
-            try:
-                _decode_line(tail)
-                valid_end = len(raw)  # a complete unterminated line: keep
-            except Exception:
-                pass  # torn tail: truncate at the last newline
+    # An unterminated tail is ALWAYS a trailing partial (torn-write window,
+    # never fsynced-complete; see load_transcript): truncate at the last
+    # newline — never keep or repair it by appending a newline.
     return valid_end
 
 
