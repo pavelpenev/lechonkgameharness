@@ -1,0 +1,19 @@
+Your previous output was rejected as a SCHEMA ERROR: $error_detail
+
+Re-emit exactly one JSON ActionBatch, with no prose or markdown. Required
+shape: {"turn_id":string,"actions":[{"ref":"<candidate id>"}],
+"commitments":[{"domain":"research|production|expansion|military|diplomacy|other",
+"target_kind":"tech|production|unit|city|player|tile|any","target":string,
+"deadline_turn":integer,"verb":optional "research|build|attack|move|negotiate|defend"}],
+"finish_requested":true,"notes":string,"memory_update":optional
+{"commitments":array,"threats":array of entity-id strings,"notes":string}}.
+Use only exact opaque refs copied from the refreshed candidate table, at most
+20; never coordinates or invented actions. Keep notes <=2 sentences. Update
+memory_update only for changed durable goals, plans, threats, verified
+outcomes, or lessons; omit the entire field when unchanged so prior memory
+persists. If provided, commitments are upserts, while threats and notes
+replace prior values; repeat the full current lists/text or they clear. Do not
+add fields, restate the snapshot, or emit hidden reasoning.
+
+The current candidate table and state below are authoritative:
+$refreshed_candidates

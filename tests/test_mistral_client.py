@@ -41,6 +41,8 @@ import re
 import subprocess
 import sys
 import typing
+import types
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -63,8 +65,56 @@ from lechonk.model.mistral_client import (
     RepairRequest,
     SchemaError,
     TransportError,
+    ProviderCapacityError,
     TurnAttempts,
 )
+
+
+def test_provider_capacity_classification_requires_exact_structured_fields():
+    class Response:
+        status_code = 429
+        headers = {"Retry-After": "12"}
+
+        def json(self):
+            return {"error": {"type": "backend_out_of_capacity", "code": "3505"}}
+
+    err = types.SimpleNamespace(raw_response=Response())
+    classified = mc._capacity_error_from_sdk(err)
+    assert isinstance(classified, ProviderCapacityError)
+    assert classified.http_status == 429
+    assert classified.provider_code == "3505"
+    assert classified.retry_after == "12"
+
+    generic = types.SimpleNamespace(
+        raw_response=types.SimpleNamespace(
+            status_code=429,
+            json=lambda: {"error": {"type": "rate_limit", "code": "999"}},
+        ))
+    assert mc._capacity_error_from_sdk(generic) is None
+
+    class RenderedSDKError:
+        raw_response = None
+        status_code = None
+
+        def __str__(self):
+            return ('Status 429. Body: {"type":"backend_out_of_capacity",'
+                    '"code":"3505"}')
+
+    rendered = RenderedSDKError()
+    # SDK errors in some versions expose only their rendered body.
+    assert isinstance(mc._capacity_error_from_sdk(rendered), ProviderCapacityError)
+
+
+def test_provider_capacity_error_bypasses_action_batch_repair():
+    capacity = ProviderCapacityError("capacity")
+    transport = MockTransport(outcomes=[capacity])
+    client = make_client(transport)
+    with pytest.raises(ProviderCapacityError):
+        client.action_batch(messages=turn_messages(), prompt_hash="sha256:test",
+                            attempts=TurnAttempts())
+    assert len(transport.calls) == 1
+    assert len(client.call_logs) == 1
+    assert client.call_logs[0].error_kind == "provider_capacity"
 
 REPO = Path(__file__).resolve().parents[1]
 MODEL_DIR = REPO / "src" / "lechonk" / "model"
@@ -81,6 +131,167 @@ VALID_BATCH = json.dumps({
     "memory_update": {"commitments": [], "threats": ["unit:12"],
                       "notes": "watch the east"},
 })
+
+
+def test_reasoning_chunks_are_separated_from_final_answer():
+    class Text:
+        def __init__(self, text):
+            self.type = "text"
+            self.text = text
+
+    class Thinking:
+        type = "thinking"
+
+        def __init__(self, text):
+            self.thinking = [Text(text)]
+
+    assert mc._message_content_parts([
+        Thinking("first "),
+        {"type": "thinking", "thinking": [{"text": "second"}]},
+        Text('{"actions": []}'),
+    ]) == ("first second", '{"actions": []}')
+    assert mc._message_content_text("plain") == "plain"
+
+
+def test_sdk_tool_call_request_preserves_assistant_message(monkeypatch):
+    """The opt-in first call omits schema output and retains tool-call JSON."""
+    errors = types.ModuleType("mistralai.client.errors")
+    errors.NoResponseError = type("NoResponseError", (Exception,), {})
+    errors.ResponseValidationError = type("ResponseValidationError", (Exception,), {})
+    errors.SDKError = type("SDKError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "mistralai.client.errors", errors)
+    seen = {}
+    message = types.SimpleNamespace(
+        content=[{"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]}],
+        tool_calls=[{"id": "call-1", "type": "function", "function": {
+            "name": "lookup_freeciv", "arguments": '{"topics":["combat"]}'}}],
+    )
+    class Chat:
+        def complete(self, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=message, finish_reason="tool_calls")],
+                usage=types.SimpleNamespace(prompt_tokens=4, completion_tokens=3,
+                                            total_tokens=7), model=MODEL_ID,
+                id="resp-tool", created=1)
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = types.SimpleNamespace(chat=Chat())
+    raw = transport.complete(messages=[{"role": "user", "content": "x"}],
+                              model=MODEL_ID, temperature=1.0,
+                              reasoning_effort="high", max_tokens=None,
+                              response_format=None, random_seed=None,
+                              tools=[{"type": "function", "function": {"name": "lookup_freeciv"}}])
+    assert seen["tool_choice"] == "auto"
+    assert seen["parallel_tool_calls"] is False
+    assert "response_format" not in seen
+    assert raw.tool_calls[0]["function"]["arguments"] == '{"topics":["combat"]}'
+    assert raw.assistant_message["tool_calls"] == raw.tool_calls
+    assert raw.reasoning_text == "plan"
+
+
+def test_sdk_stream_aggregates_fragmented_tool_calls(monkeypatch):
+    errors = types.ModuleType("mistralai.client.errors")
+    errors.NoResponseError = type("NoResponseError", (Exception,), {})
+    errors.ResponseValidationError = type("ResponseValidationError", (Exception,), {})
+    errors.SDKError = type("SDKError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "mistralai.client.errors", errors)
+    seen = {}
+    events = [
+        types.SimpleNamespace(data=types.SimpleNamespace(
+            id="s1", model=MODEL_ID, created=1,
+            choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+                content=[{"type": "thinking", "signature": "sig-1",
+                           "thinking": [{"type": "text", "text": "plan"}]},
+                         {"type": "reference", "id": "ref-1"},
+                         {"type": "text"}],
+                tool_calls=[{"index": 0, "id": "call-1",
+                    "type": "function", "function": {"name": "lookup_", "arguments": '{"topics":'}}]),
+                finish_reason=None)], usage=None)),
+        types.SimpleNamespace(data=types.SimpleNamespace(
+            choices=[types.SimpleNamespace(delta=types.SimpleNamespace(
+                content=None, tool_calls=[{"index": 0, "function": {
+                    "name": "freeciv", "arguments": '["combat"]}'}}]),
+                finish_reason="tool_calls")], usage=types.SimpleNamespace(
+                    prompt_tokens=2, completion_tokens=4, total_tokens=6))),
+    ]
+    class Events:
+        def __aiter__(self):
+            self.i = 0
+            return self
+        async def __anext__(self):
+            if self.i == len(events):
+                raise StopAsyncIteration
+            item = events[self.i]; self.i += 1; return item
+        async def aclose(self):
+            pass
+    class Chat:
+        async def stream_async(self, **kwargs):
+            seen.update(kwargs)
+            return Events()
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = types.SimpleNamespace(chat=Chat())
+    raw = transport.stream_complete(messages=[{"role": "user", "content": "x"}],
+                                     model=MODEL_ID, temperature=1.0,
+                                     reasoning_effort="high", max_tokens=None,
+                                     response_format=None, random_seed=None,
+                                     tools=[{"type": "function", "function": {"name": "lookup_freeciv"}}])
+    assert seen["tool_choice"] == "auto"
+    assert raw.tool_calls[0]["id"] == "call-1"
+    assert raw.tool_calls[0]["function"] == {
+        "name": "lookup_freeciv", "arguments": '{"topics":["combat"]}'
+    }
+    assert raw.assistant_message["tool_calls"] == raw.tool_calls
+    assert {"type": "reference", "id": "ref-1"} in raw.content_chunks
+    assert {"type": "text"} in raw.content_chunks
+    assert {"type": "text", "text": ""} not in raw.assistant_message["content"]
+
+
+def test_replayable_content_chunks_filters_empty_stream_fragments():
+    content = [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "why"}]},
+        {"type": "thinking", "thinking": [{"type": "text", "text": ""}]},
+        "",
+        {"type": "text", "text": "{"},
+        {"type": "text", "text": "\"actions\": []}"},
+    ]
+    assert mc._replayable_content_chunks(content) == [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "why"}]},
+        {"type": "text", "text": "{\"actions\": []}"},
+    ]
+
+
+def test_replayable_content_chunks_preserves_reference_and_signature_fields():
+    content = [
+        {"type": "thinking", "signature": "sig-1", "thinking": [
+            {"type": "text", "text": "plan"},
+            {"type": "reference", "reference_ids": ["ref-1"]},
+        ]},
+        {"type": "reference", "reference_ids": ["ref-2"]},
+        {"type": "tool_reference", "tool": "web_search", "title": "Rules"},
+        {"type": "text"},
+    ]
+    assert mc._replayable_content_chunks(content) == content[:3]
+
+
+def test_replayable_content_chunks_canonicalizes_reasoning_alias():
+    content = [{"type": "reasoning", "signature": "sig-2",
+                "thinking": [{"type": "text", "text": "plan"}]}]
+    assert mc._replayable_content_chunks(content) == [
+        {"type": "thinking", "signature": "sig-2",
+         "thinking": [{"type": "text", "text": "plan"}]},
+    ]
+
+
+def test_replayable_content_chunks_drops_unknown_and_malformed_references():
+    content = [
+        {"type": "unknown", "value": "drop"},
+        {"type": "reference", "id": "missing-reference-ids"},
+        {"type": "tool_reference", "tool": "web_search"},
+        {"type": "text", "text": "valid"},
+    ]
+    assert mc._replayable_content_chunks(content) == [
+        {"type": "text", "text": "valid"},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +326,26 @@ class MockTransport:
         return outcome
 
 
+@dataclass
+class StreamMockTransport(MockTransport):
+    deltas: list = field(default_factory=list)
+
+    def stream_complete(self, *, messages, model, temperature,
+                        reasoning_effort, max_tokens, response_format,
+                        random_seed, timeout_ms=None,
+                        absolute_timeout_ms=None,
+                        disable_transport_retries=False, on_delta=None):
+        self.calls.append({"stream": True, "timeout_ms": timeout_ms,
+                           "absolute_timeout_ms": absolute_timeout_ms})
+        for delta in self.deltas:
+            if on_delta is not None:
+                on_delta(delta)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 def raw_completion(content, *, model=MODEL_ID, response_id="resp-1",
                    finish_reason="stop", prompt_tokens=100,
                    completion_tokens=50, transport_retries=0,
@@ -123,7 +354,9 @@ def raw_completion(content, *, model=MODEL_ID, response_id="resp-1",
         content=content, model=model, response_id=response_id, created=0,
         finish_reason=finish_reason, prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
+        total_tokens=(prompt_tokens + completion_tokens
+                      if prompt_tokens is not None and completion_tokens is not None
+                      else None),
         transport_retries=transport_retries,
         sample_contents=sample_contents)
 
@@ -155,6 +388,346 @@ class MultiSampleMockTransport:
 
 def make_client(transport, *, key=CANARY_KEY, **kwargs):
     return MistralClient(api_key=key, transport=transport, **kwargs)
+
+
+def test_opt_in_stream_routes_deltas_and_keeps_final_parser_input():
+    deltas = [{"reasoning": "thinking ", "answer": "", "content": []},
+              {"reasoning": "", "answer": VALID_BATCH,
+               "content": [{"type": "text", "text": VALID_BATCH}]}]
+    transport = StreamMockTransport(
+        outcomes=[mc.RawCompletion(
+            content=VALID_BATCH, model=MODEL_ID, response_id="stream-1",
+            created=0, finish_reason="stop", prompt_tokens=1,
+            completion_tokens=2, total_tokens=3,
+            reasoning_text="thinking ", answer_text=VALID_BATCH,
+            content_chunks=[{"type": "thinking", "thinking": [{"text": "thinking "}]},
+                            {"type": "text", "text": VALID_BATCH}])],
+        deltas=deltas)
+    seen = []
+    client = make_client(transport, stream=True,
+                         stream_callback=seen.append)
+    result = client.complete_once(messages=turn_messages(),
+                                  prompt_hash="sha256:test", attempt=1,
+                                  kind="initial")
+    assert result.batch is not None
+    assert result.raw_content == VALID_BATCH
+    assert seen == deltas
+    assert transport.calls == [{"stream": True, "timeout_ms": 120000,
+                                "absolute_timeout_ms": None}]
+
+
+def test_prompt_cache_key_is_opt_in_and_reaches_transport():
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH)])
+    client = make_client(transport, prompt_cache_key="run-epoch-1")
+    client.complete_once(messages=turn_messages(), prompt_hash="sha256:test",
+                         attempt=1, kind="initial")
+    assert transport.calls[0]["prompt_cache_key"] == "run-epoch-1"
+
+
+def test_cached_tokens_are_logged_without_exposing_cache_key():
+    raw = raw_completion(VALID_BATCH)
+    raw.cached_tokens = 64
+    transport = MockTransport(outcomes=[raw])
+    client = make_client(transport, prompt_cache_key="run-epoch-1")
+    client.complete_once(messages=turn_messages(), prompt_hash="sha256:test",
+                         attempt=1, kind="initial")
+    entry = client.call_logs[0].to_dict()
+    assert entry["cached_tokens"] == 64
+    assert "prompt_cache_key" not in entry
+
+
+def test_cached_input_tokens_use_discounted_price_and_are_bounded():
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH,
+                                                        prompt_tokens=1000,
+                                                        completion_tokens=200)])
+    raw = transport.outcomes[0]
+    raw.cached_tokens = 800
+    client = make_client(transport)
+    client.complete_once(messages=turn_messages(), prompt_hash="sha256:test",
+                         attempt=1, kind="initial")
+    entry = client.call_logs[0].to_dict()
+    expected = ((200 * 0.50) + (800 * 0.50 * 0.10) + (200 * 1.50)) / 1e6
+    assert entry["cost_usd"] == round(expected, 6)
+
+    # Provider metadata above the prompt count is clamped, never negative.
+    raw2 = raw_completion(VALID_BATCH, prompt_tokens=1000, completion_tokens=0)
+    raw2.cached_tokens = 5000
+    transport2 = MockTransport(outcomes=[raw2])
+    client2 = make_client(transport2)
+    client2.complete_once(messages=turn_messages(), prompt_hash="sha256:test",
+                          attempt=1, kind="initial")
+    assert client2.call_logs[0].cost_usd == round(1000 * 0.50 * 0.10 / 1e6, 6)
+
+
+def test_transport_error_with_partial_completion_keeps_usage_accounting():
+    partial = raw_completion(VALID_BATCH, prompt_tokens=900,
+                             completion_tokens=120)
+    partial.cached_tokens = 640
+    error = TransportError("read timed out")
+    error.partial = partial
+    transport = MockTransport(outcomes=[error])
+    client = make_client(transport)
+    outcome = client.complete_once(messages=turn_messages(), prompt_hash="sha256:test",
+                                   attempt=1, kind="initial")
+    assert outcome.error == "read timed out"
+    entry = client.call_logs[0]
+    assert entry.error == "read timed out"
+    assert entry.tokens_in == 900
+    assert entry.tokens_out == 120
+    assert entry.cached_tokens == 640
+    assert entry.cost_usd is not None
+
+
+def test_partial_completion_without_provider_usage_remains_unknown():
+    """A truncated provider stream must not be reported as zero usage."""
+    partial = raw_completion(VALID_BATCH, prompt_tokens=None,
+                             completion_tokens=None)
+    assert partial.total_tokens is None
+    client = make_client(MockTransport([partial]))
+    outcome = client.complete_once(messages=[{"role": "user", "content": "hi"}],
+                                   prompt_hash="sha256:unknown", attempt=1,
+                                   kind="initial")
+    assert outcome.error is None
+    log = client.call_logs[-1]
+    assert log.tokens_in is None
+    assert log.tokens_out is None
+    assert log.tokens_total is None
+    assert log.cost_usd is None
+    assert log.usage_status == "unavailable"
+
+
+def test_stream_usage_accepts_dict_shaped_usage():
+    class Events:
+        def __init__(self):
+            self.items = iter([{"data": {"id": "r", "model": MODEL_ID,
+                "created": 0, "choices": [{"delta": {"content":
+                    [{"type": "text", "text": VALID_BATCH}]},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4,
+                           "total_tokens": 14,
+                           "prompt_tokens_details": {"cached_tokens": 8}}}}])
+        def __aiter__(self): return self
+        async def __anext__(self):
+            try: return next(self.items)
+            except StopIteration: raise StopAsyncIteration
+        async def aclose(self): return None
+
+    class SDK:
+        class Chat:
+            async def stream_async(self, **kwargs): return Events()
+        chat = Chat()
+
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = SDK()
+    transport._sdk_no_retries = transport._sdk
+    raw = transport.stream_complete(
+        messages=turn_messages(), model=MODEL_ID, temperature=1.0,
+        reasoning_effort="none", max_tokens=100, response_format=None,
+        random_seed=None, timeout_ms=1000)
+    assert raw.prompt_tokens == 10
+    assert raw.completion_tokens == 4
+    assert raw.cached_tokens == 8
+
+
+def test_stream_timeout_partial_dict_usage_is_retained():
+    import asyncio
+
+    class Events:
+        def __init__(self):
+            self.items = iter([{
+                "data": {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 31,
+                        "completion_tokens": 7,
+                        "total_tokens": 38,
+                        "prompt_tokens_details": {"cached_tokens": 16},
+                    },
+                }
+            }])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.items:
+                self.items = None
+                return {"data": {"choices": [], "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 7,
+                    "total_tokens": 38,
+                    "prompt_tokens_details": {"cached_tokens": 16},
+                }}}
+            await asyncio.sleep(0.05)
+            return {"data": {"choices": []}}
+
+        async def aclose(self):
+            return None
+
+    class SDK:
+        class Chat:
+            async def stream_async(self, **kwargs):
+                return Events()
+        chat = Chat()
+
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = SDK()
+    transport._sdk_no_retries = transport._sdk
+    with pytest.raises(mc.TransportError, match="timed out") as raised:
+        transport.stream_complete(
+            messages=[], model=MODEL_ID, temperature=1.0,
+            reasoning_effort="high", max_tokens=10, response_format=None,
+            random_seed=None, timeout_ms=5)
+    partial = raised.value.partial
+    assert partial.prompt_tokens == 31
+    assert partial.completion_tokens == 7
+    assert partial.total_tokens == 38
+    assert partial.cached_tokens == 16
+
+
+def test_sdk_stream_collector_supports_two_sequential_calls():
+    class Events:
+        def __init__(self, items):
+            self.items = iter(items)
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                raise StopAsyncIteration
+        async def aclose(self):
+            return None
+
+    class Chat:
+        def __init__(self):
+            self.calls = 0
+        async def stream_async(self, **kwargs):
+            self.calls += 1
+            return Events([
+                {"data": {"id": f"s{self.calls}", "model": MODEL_ID,
+                          "choices": [{"delta": {"content": [
+                              {"type": "thinking", "thinking": [
+                                  {"type": "text", "text": "why"}]}]},
+                                        "finish_reason": None}]}},
+                {"data": {"id": f"s{self.calls}", "model": MODEL_ID,
+                          "usage": {"prompt_tokens": 1,
+                                    "completion_tokens": 2,
+                                    "total_tokens": 3},
+                          "choices": [{"delta": {"content": [
+                              {"type": "text", "text": VALID_BATCH}]},
+                                        "finish_reason": "stop"}]}}])
+
+    class SDK:
+        def __init__(self):
+            self.chat = Chat()
+
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = SDK()
+    transport._sdk_no_retries = transport._sdk
+    seen = []
+    for _ in range(2):
+        raw = transport.stream_complete(
+            messages=[], model=MODEL_ID, temperature=1.0,
+            reasoning_effort="high", max_tokens=100,
+            response_format=None, random_seed=None, on_delta=seen.append)
+        assert raw.finish_reason == "stop"
+        assert raw.content == VALID_BATCH
+        assert raw.reasoning_text == "why"
+    assert len(seen) == 4
+
+
+def test_sdk_stream_timeout_emits_partial_and_rejects_missing_finish():
+    import asyncio
+
+    class Events:
+        def __aiter__(self): return self
+        async def __anext__(self):
+            await asyncio.sleep(0.05)
+            return {"data": {"choices": []}}
+        async def aclose(self): return None
+
+    class SDK:
+        class Chat:
+            async def stream_async(self, **kwargs): return Events()
+        chat = Chat()
+
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = SDK()
+    transport._sdk_no_retries = transport._sdk
+    seen = []
+    with pytest.raises(mc.TransportError, match="timed out"):
+        transport.stream_complete(
+            messages=[], model=MODEL_ID, temperature=1.0,
+            reasoning_effort="high", max_tokens=10, response_format=None,
+            random_seed=None, timeout_ms=5, on_delta=seen.append)
+    assert seen and seen[-1]["complete"] is False
+
+    class EofSDK:
+        class Chat:
+            async def stream_async(self, **kwargs):
+                class Eof:
+                    def __aiter__(self): return self
+                    async def __anext__(self): raise StopAsyncIteration
+                    async def aclose(self): return None
+                return Eof()
+        chat = Chat()
+    transport._sdk = EofSDK()
+    with pytest.raises(mc.TransportError, match="finish reason"):
+        transport.stream_complete(
+            messages=[], model=MODEL_ID, temperature=1.0,
+            reasoning_effort="high", max_tokens=10, response_format=None,
+            random_seed=None)
+
+
+def test_sdk_stream_absolute_timeout_cancels_continuous_stream_and_keeps_partial():
+    """A stream that continually emits bytes still obeys the outer deadline."""
+    import asyncio
+
+    class Events:
+        def __init__(self):
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.001)
+            return {"data": {"id": "loop", "model": MODEL_ID,
+                              "choices": [{"delta": {"content": [
+                                  {"type": "thinking", "thinking": [
+                                      {"type": "text", "text": "hmm "}]}]},
+                                            "finish_reason": None}]}}
+
+        async def aclose(self):
+            self.closed = True
+
+    class Chat:
+        def __init__(self):
+            self.events = Events()
+
+        async def stream_async(self, **kwargs):
+            return self.events
+
+    class SDK:
+        def __init__(self):
+            self.chat = Chat()
+
+    sdk = SDK()
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = sdk
+    transport._sdk_no_retries = sdk
+    seen = []
+    with pytest.raises(mc.TransportError, match="timed out") as raised:
+        transport.stream_complete(
+            messages=[], model=MODEL_ID, temperature=1.0,
+            reasoning_effort="high", max_tokens=None, response_format=None,
+            random_seed=None, absolute_timeout_ms=20, on_delta=seen.append)
+    assert seen and seen[-1].get("partial") is True
+    partial = raised.value.partial
+    assert partial is not None
+    assert partial.reasoning_text.startswith("hmm ")
+    assert sdk.chat.events.closed is True
 
 
 def turn_messages():
@@ -554,6 +1127,22 @@ def test_complete_once_threads_disable_transport_retries_to_the_transport():
     assert transport.calls[0]["timeout_ms"] == 55_000
 
 
+def test_complete_once_explicit_none_disables_schema_for_tool_discovery():
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH)])
+    client = make_client(transport)
+    outcome = client.complete_once(
+        messages=turn_messages(), prompt_hash="sha256:tool",
+        attempt=1, kind="initial", response_format=None,
+        tools=[{"type": "function", "function": {"name": "lookup_freeciv"}}],
+        tool_choice="auto", parallel_tool_calls=False)
+    assert outcome.batch is not None
+    call = transport.calls[0]
+    assert call["response_format"] is None
+    assert call["tools"][0]["function"]["name"] == "lookup_freeciv"
+    assert call["tool_choice"] == "auto"
+    assert call["parallel_tool_calls"] is False
+
+
 def test_repair_with_retries_disabled_makes_one_request_and_surfaces_failure():
     """WP4 gating, end-to-end through the client: a repair attempt with
     ``disable_transport_retries=True`` makes EXACTLY ONE network request on a
@@ -883,8 +1472,9 @@ def test_per_call_logging_fields():
     assert entry["tokens_out"] == 200
     assert entry["tokens_total"] == 1200
     assert isinstance(entry["latency_ms"], int) and entry["latency_ms"] >= 0
-    # cost from the provisional pricing table ($0.50/$1.50 per MTok)
-    assert entry["cost_usd"] == round((1000 * 0.50 + 200 * 1.50) / 1e6, 6)
+    # Cache-adjusted cost is unknown when the provider omits cache details.
+    assert entry["cost_usd"] is None
+    assert entry["cost_status"] == "unknown"
     assert entry["model_requested"] == MODEL_ID
     assert entry["model_responded"] == MODEL_ID
     assert entry["prompt_hash"] == "sha256:test"
@@ -964,8 +1554,8 @@ def test_fingerprint_travels_with_call_logs_after_probe():
 
 def test_fingerprint_probe_k3_samples_sorted_hash_set():
     """FW-21: the probe collects K=3 samples under the arm sampling and
-    records the sorted, deduplicated hash set; the probe uses prompt v2
-    with the raised max_tokens (recorded)."""
+    records the sorted, deduplicated hash set; output budgeting remains
+    provider-managed."""
     contents = ["alpha-output", "beta-output", "gamma-output"]
     transport = MockTransport(outcomes=[raw_completion(c) for c in contents])
     client = make_client(transport)
@@ -973,21 +1563,21 @@ def test_fingerprint_probe_k3_samples_sorted_hash_set():
     expected_hashes = sorted(
         hashlib.sha256(c.encode("utf-8")).hexdigest() for c in contents)
     assert mc.FINGERPRINT_PROBE_SAMPLES == 3
-    assert mc.FINGERPRINT_PROBE_MAX_TOKENS == 1024
+    assert mc.FINGERPRINT_PROBE_MAX_TOKENS is None
     assert probe.sample_attempts == 3
     assert probe.sample_mode == mc.FINGERPRINT_MODE_SEQUENTIAL  # MockTransport declares no n
     assert probe.output_hashes == expected_hashes
     assert probe.fingerprint == "|".join(
         f"sha256:{h}" for h in expected_hashes)
-    assert probe.max_tokens == 1024
-    # arm sampling on every probe request (FW-20) + the raised budget
+    assert probe.max_tokens is None
+    # arm sampling on every probe request (FW-20), with no local output cap
     assert len(transport.calls) == 3
     for call in transport.calls:
         assert call["temperature"] == 1.0
         assert call["reasoning_effort"] == "high"
         assert "top_p" not in call
         assert call["response_format"] is None
-        assert call["max_tokens"] == 1024
+        assert call["max_tokens"] is None
     # the fixed probe prompt v2 (versioned file) with its recorded hash
     assert mc.FINGERPRINT_PROBE_PROMPT == "fingerprint_probe_v2"
     assert probe.prompt_hash == prompts.prompt_hash("fingerprint_probe_v2")
@@ -1032,7 +1622,7 @@ def test_fingerprint_probe_single_request_n3_mode():
     assert probe.sample_mode == mc.FINGERPRINT_MODE_SINGLE_REQUEST
     assert len(transport.calls) == 1
     assert transport.calls[0]["n"] == 3
-    assert transport.calls[0]["max_tokens"] == 1024
+    assert transport.calls[0]["max_tokens"] is None
     assert transport.calls[0]["temperature"] == 1.0
     assert transport.calls[0]["reasoning_effort"] == "high"
     assert "top_p" not in transport.calls[0]
@@ -1139,6 +1729,8 @@ def test_probe_model_id_mock_success():
     assert probe.model_responded == MODEL_ID
     assert probe.error is None
     assert client.call_logs[0].kind == "probe"
+    assert transport.calls[0]["max_tokens"] is None
+    assert "top_p" not in transport.calls[0]
 
 
 def test_probe_model_id_mock_transport_failure_captured():
@@ -1175,6 +1767,7 @@ def test_probe_json_schema_support_mock_supported():
     }
     assert transport.calls[0]["temperature"] == 1.0
     assert transport.calls[0]["reasoning_effort"] == "high"
+    assert transport.calls[0]["max_tokens"] is None
     assert "top_p" not in transport.calls[0]
 
 
@@ -1213,13 +1806,42 @@ def test_default_arm_sampling_settings():
     assert mc.DEFAULT_REASONING_EFFORT == "high"
 
 
-def test_default_max_tokens_16384():
-    """FW-05b: the constructor default max_tokens is 16384 (FW-05 decision
-    record raised it from 8192; the turn path initial and repair attempts
-    both inherit the constant when no override is passed)."""
+def test_default_max_tokens_is_provider_managed():
+    """Ordinary turns do not impose an application output-token cap."""
     client = make_client(MockTransport())
-    assert client.max_tokens == 16384
-    assert mc.DEFAULT_MAX_TOKENS == 16384
+    assert client.max_tokens is None
+    assert mc.DEFAULT_MAX_TOKENS is None
+
+
+def test_explicit_max_tokens_remains_available():
+    transport = MockTransport(outcomes=[raw_completion(VALID_BATCH)])
+    client = make_client(transport, max_tokens=1024)
+    client.action_batch(messages=turn_messages(), prompt_hash="sha256:test",
+                        attempts=TurnAttempts())
+    assert transport.calls[0]["max_tokens"] == 1024
+
+
+def test_sdk_request_omits_max_tokens_when_provider_managed():
+    """The ordinary SDK request leaves output budgeting to the provider."""
+    from types import SimpleNamespace
+
+    seen = {}
+    class Chat:
+        def complete(self, **kwargs):
+            seen.update(kwargs)
+            message = SimpleNamespace(content=VALID_BATCH)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2,
+                                      total_tokens=3),
+                model=MODEL_ID, id="resp", created=0)
+    transport = object.__new__(mc.MistralSDKTransport)
+    transport._sdk = SimpleNamespace(chat=Chat())
+    transport._sdk_no_retries = transport._sdk
+    transport.complete(messages=[], model=MODEL_ID, temperature=1.0,
+                       reasoning_effort="high", max_tokens=None,
+                       response_format=None, random_seed=None)
+    assert "max_tokens" not in seen
 
 
 def test_every_call_path_carries_arm_sampling():
@@ -1411,3 +2033,79 @@ def test_model_package_declares_mit_spdx():
         first = path.read_text(encoding="utf-8").splitlines()[0]
         assert first == "# SPDX-License-Identifier: MIT", (
             f"{path} lost its MIT SPDX header")
+
+
+def test_physical_events_correlate_exact_call_log_and_preserve_transport_shape():
+    class Transport:
+        def __init__(self):
+            self.calls = []
+        def complete(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            return mc.RawCompletion(
+                content=VALID_BATCH, model=MODEL_ID, response_id="r",
+                created=0, finish_reason="stop", prompt_tokens=2,
+                completion_tokens=3, total_tokens=5)
+
+    first_t, second_t = Transport(), Transport()
+    first = make_client(first_t)
+    events = []
+    observed = MistralClient(api_key=CANARY_KEY, transport=second_t,
+                             call_event_callback=events.append)
+    first._complete(messages=[{"role": "user", "content": "x"}], attempt=1,
+                    kind="initial", prompt_hash="p")
+    observed._complete(messages=[{"role": "user", "content": "x"}], attempt=1,
+                        kind="initial", prompt_hash="p")
+    assert first_t.calls == second_t.calls
+    assert [e["event"] for e in events] == [
+        "model_request_started", "model_request_finished"]
+    assert events[0]["call_id"] == observed.call_logs[0].call_id
+    assert events[-1]["call_id"] == observed.call_logs[0].call_id
+
+
+def test_call_lifecycle_finishes_when_log_sink_fails_or_transport_is_cancelled():
+    events = []
+    def bad_sink(_record):
+        raise OSError("durable sink unavailable")
+    client = MistralClient(api_key=CANARY_KEY,
+                           transport=MockTransport(outcomes=[raw_completion(VALID_BATCH)]),
+                           log_sink=bad_sink, call_event_callback=events.append)
+    with pytest.raises(OSError, match="durable sink"):
+        client._complete(messages=[{"role": "user", "content": "x"}],
+                         attempt=1, kind="initial", prompt_hash="p")
+    assert [e["event"] for e in events] == [
+        "model_request_started", "model_request_finished"]
+
+    class CancelTransport(MockTransport):
+        def complete(self, **kwargs):
+            raise KeyboardInterrupt()
+    events.clear()
+    cancelled = MistralClient(api_key=CANARY_KEY,
+                              transport=CancelTransport(),
+                              call_event_callback=events.append)
+    with pytest.raises(KeyboardInterrupt):
+        cancelled._complete(messages=[{"role": "user", "content": "x"}],
+                            attempt=1, kind="initial", prompt_hash="p")
+    assert [e["event"] for e in events] == [
+        "model_request_started", "model_request_finished"]
+
+
+def test_concurrent_physical_calls_get_unique_ids_and_logs():
+    class Transport:
+        def complete(self, **kwargs):
+            return mc.RawCompletion(content=VALID_BATCH, model=MODEL_ID,
+                                    response_id="r", created=0,
+                                    finish_reason="stop", prompt_tokens=1,
+                                    completion_tokens=1, total_tokens=2)
+    client = MistralClient(api_key=CANARY_KEY, transport=Transport())
+    errors = []
+    def run():
+        try:
+            client._complete(messages=[{"role": "user", "content": "x"}],
+                             attempt=1, kind="initial", prompt_hash="p")
+        except Exception as exc:
+            errors.append(exc)
+    threads = [threading.Thread(target=run) for _ in range(12)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert not errors
+    assert len({record.call_id for record in client.call_logs}) == 12

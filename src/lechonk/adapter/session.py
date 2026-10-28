@@ -16,8 +16,10 @@ Operational notes implemented here (plan §7.1, source-verified):
   explicit mapseed/gameseed/agentseed (reset(seed=) only sets mapseed +
   agentseed; gameseed is sent only when debug.gameseed is present,
   client_state.py:118-132).
-- Upstream timers raised to align with §3 deadlines: server_timeout 30 -> 300
-  (ACTING <= 180 s), begin_turn_timeout 30 -> 900 (WAITING <= 720 s + margin),
+- Upstream timers raised to align with §3 deadlines: bounded sessions use a
+  300-second server_timeout (ACTING <= 180 s); long-game sessions derive a
+  server_timeout above the configured acting deadline. begin_turn_timeout is
+  900 (WAITING <= 720 s + margin),
   wait_for_timeout 10000 -> 60 (the upstream wait-unstick bound aligned with
   the §3 per-mutation send+read-back <= 30 s budget; the 10000 s default would
   let a stuck action-response wait hang for ~2.8 h, contradicting §3's
@@ -45,22 +47,32 @@ Operational notes implemented here (plan §7.1, source-verified):
 from __future__ import annotations
 
 import importlib
+import asyncio
+import math
 import os
 import queue
 import threading
 import time
+import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from lechonk.adapter import candidates as candidates_mod
 from lechonk.adapter.obs_extract import RulesetNames
+from lechonk.core.recovery import validate_freeciv_username
 from lechonk.core.schemas import CandidateTable
 
 # --- §3-aligned timeouts and deadlines --------------------------------------
 HTTP_TIMEOUT_S = 15.0        # §3: HTTP <= 15 s (all upstream requests calls)
 SERVER_TIMEOUT_S = 300       # ACTING <= 180 s (upstream default 30 truncates)
+SERVER_TIMEOUT_MARGIN_S = 60.0  # leave room for phase-boundary cleanup
 BEGIN_TURN_TIMEOUT_S = 900   # WAITING <= 720 s + margin (upstream default 30)
 WAIT_FOR_TIMEOUT_S = 60      # 2x the §3 per-mutation <= 30 s bound (default 10000)
+PINGTIMEOUT_S = 1800         # Keep Freeciv alive across long streamed model calls.
+# CivRealm's own controller truncates at fc_args['max_turns']; the runner owns
+# the real horizon, so give an unbounded runner enough headroom here.
+UNBOUNDED_MAX_TURNS = 100_000
 DEFAULT_STARTUP_DEADLINE_S = 150.0  # §3 startup <= 120 s + server-spawn margin
 DEFAULT_STEP_DEADLINE_S = 30.0      # §3 per-mutation send+read-back <= 30 s
 DEFAULT_WAIT_DEADLINE_S = 900.0     # §3 WAITING <= 720 s + margin
@@ -180,6 +192,171 @@ def _collect_ruleset(env: Any) -> RulesetNames:
     )
 
 
+def _collect_ruleset_reference(env: Any) -> tuple[Any, Optional[str], str]:
+    """Best-effort immutable encyclopedia snapshot for the live ruleset.
+
+    The reference builder is deliberately kept in a separate, whitelisted
+    module.  It is optional adapter metadata: old/partial CivRealm packets
+    must not make an otherwise playable session fail during startup.  The
+    builder owns validation, freezing, JSON-safety, and the content hash.
+    """
+    try:
+        rule_ctrl = env.civ_controller.rule_ctrl
+        has_container = False
+        for name in ("techs", "unit_types", "improvements", "terrains",
+                     "governments", "extras"):
+            value = rule_ctrl.get(name) if isinstance(rule_ctrl, Mapping) else getattr(rule_ctrl, name, None)
+            if value:
+                has_container = True
+                break
+        if not has_container:
+            return None, None, "unavailable: ruleset packet containers are absent or empty"
+        reference_mod = importlib.import_module("lechonk.adapter.ruleset_reference")
+        builder = getattr(reference_mod, "build_ruleset_reference", None)
+        if builder is None:
+            builder = getattr(reference_mod, "extract_ruleset_reference")
+        reference = builder(rule_ctrl)
+    except Exception as exc:
+        return None, None, f"unavailable: {exc}"
+    if reference is None:
+        return None, None, "unavailable: builder returned no reference"
+    digest = getattr(reference, "reference_hash", None)
+    if digest is None:
+        digest = getattr(reference, "sha256", None)
+    if digest is None:
+        digest = getattr(reference, "content_hash", None)
+    if digest is not None and not isinstance(digest, str):
+        return None, None, "unavailable: reference hash is not a string"
+    return reference, digest, "complete"
+
+
+def _collect_help_reference() -> tuple[Any, Optional[str], str]:
+    """Load only the provisioned, repository-local Freeciv helpdata file.
+
+    The provision script extracts this optional artifact from the pinned game
+    image.  A fixed path is intentional: startup never follows a model- or
+    environment-supplied arbitrary filesystem path.
+    """
+    try:
+        help_mod = importlib.import_module("lechonk.adapter.help_reference")
+        loader = getattr(help_mod, "load_helpdata")
+        path = Path(__file__).resolve().parents[3] / "artifacts" / "reference" / "freeciv" / "helpdata.txt"
+        reference = loader(path)
+    except Exception as exc:
+        return None, None, f"unavailable: {exc}"
+    status = getattr(reference, "status", "unavailable")
+    digest = getattr(reference, "content_hash", None) if status == "available" else None
+    return reference, digest, str(status)
+
+
+def _classic_ruleset_name(env: Any) -> Optional[str]:
+    """Return the server-reported ruleset identity, when present."""
+    rule_ctrl = getattr(getattr(env, "civ_controller", None), "rule_ctrl", None)
+    control = getattr(rule_ctrl, "ruleset_control", None)
+    if isinstance(control, Mapping):
+        value = control.get("name") or control.get("ruleset")
+    else:
+        value = getattr(control, "name", None) or getattr(control, "ruleset", None)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    # Freeciv's packet uses display names (currently ``Classic ruleset``),
+    # while configuration and the extracted tree use the directory name.
+    # Normalize only the official display suffix; do not accept arbitrary
+    # names containing the word "classic".
+    normalized = " ".join(value.casefold().split())
+    if normalized.endswith(" ruleset"):
+        normalized = normalized[:-len(" ruleset")].rstrip()
+    return normalized
+
+
+def _collect_classic_reference(env: Any) -> tuple[Any, Optional[str], str, Any]:
+    """Load the optional static classic index only for the classic ruleset.
+
+    The live RulesetCtrl snapshot remains authoritative.  This index is only a
+    supplementary, repository-provisioned encyclopedia and must never be
+    reported as classic when the server did not identify itself as classic.
+    """
+    active = _classic_ruleset_name(env)
+    if active is None:
+        return None, None, "unavailable: active ruleset identity was not reported", None
+    if active != "classic":
+        return None, None, f"not_active: active ruleset is {active}", None
+    path = Path(__file__).resolve().parents[3] / "artifacts" / "reference" / "freeciv"
+    try:
+        module = importlib.import_module("lechonk.adapter.classic_reference")
+        loader = getattr(module, "load_classic_reference", None)
+        if loader is None:
+            loader = getattr(module, "load_classic_index")
+        reference = loader(path)
+    except Exception as exc:
+        return None, None, f"unavailable: {exc}", None
+    status = str(getattr(reference, "status", "available"))
+    if status not in ("available", "complete"):
+        return reference, None, status, None
+    digest = (getattr(reference, "content_hash", None)
+              or getattr(reference, "reference_hash", None)
+              or getattr(reference, "sha256", None))
+    if digest is not None and not isinstance(digest, str):
+        return None, None, "unavailable: classic reference hash is not a string", None
+    provenance = getattr(reference, "provenance", None)
+    if provenance is None:
+        # Keep provenance explicit even though the reference object is a
+        # frozen value object.  ``tree_sha256`` is the integrity identity of
+        # the extracted source tree (and is intentionally not the semantic
+        # content hash of the parsed index).
+        provenance = {
+            key: value for key in ("source_path", "image_ref", "image_version",
+                                   "tree_sha256")
+            if (value := getattr(reference, key, None)) not in (None, "")
+        }
+    return reference, digest, status, provenance
+
+
+def _collect_manual_reference(env: Any) -> tuple[Any, Optional[str], str, Any]:
+    """Load the provisioned, read-only Freeciv manual for classic games.
+
+    The generated manual is deliberately optional startup metadata.  It is
+    only eligible when the server identifies the active ruleset as exactly
+    ``classic``; missing, stale, or malformed artifacts must never prevent a
+    playable session from starting.  The loader owns manifest/hash
+    verification, while this boundary keeps its provenance explicit.
+    """
+    active = _classic_ruleset_name(env)
+    if active is None:
+        return None, None, "unavailable: active ruleset identity was not reported", None
+    if active != "classic":
+        return None, None, f"not_active: active ruleset is {active}", None
+    path = Path(__file__).resolve().parents[3] / "artifacts" / "reference" / "freeciv-manual"
+    try:
+        module = importlib.import_module("lechonk.adapter.manual_reference")
+        loader = getattr(module, "load_manual_reference", None)
+        if loader is None:
+            loader = getattr(module, "load_manual_index", None)
+        if loader is None:
+            return None, None, "unavailable: manual reference loader is absent", None
+        reference = loader(path)
+    except Exception as exc:
+        return None, None, f"unavailable: {exc}", None
+    if reference is None:
+        return None, None, "unavailable: loader returned no reference", None
+    status = str(getattr(reference, "status", "available"))
+    if status not in ("available", "complete"):
+        return reference, None, status, None
+    digest = (getattr(reference, "content_hash", None)
+              or getattr(reference, "reference_hash", None)
+              or getattr(reference, "sha256", None))
+    if digest is not None and not isinstance(digest, str):
+        return None, None, "unavailable: manual reference hash is not a string", None
+    provenance = getattr(reference, "provenance", None)
+    if provenance is None:
+        provenance = {
+            key: value for key in ("source_path", "image_ref", "image_version",
+                                   "generated_by", "manifest_sha256")
+            if (value := getattr(reference, key, None)) not in (None, "")
+        }
+    return reference, digest, status, provenance
+
+
 def _collect_action_probs(env: Any) -> dict[int, dict[int, dict[int, dict[str, float]]]]:
     """unit_id -> dir8 -> action_id -> {'min','max'} percent (plan §7.2 line 148).
 
@@ -233,20 +410,94 @@ class AdapterSession:
         step_deadline: float = DEFAULT_STEP_DEADLINE_S,
         wait_deadline: float = DEFAULT_WAIT_DEADLINE_S,
         close_deadline: float = DEFAULT_CLOSE_DEADLINE_S,
+        max_turns: Optional[int] = None,
+        acting_deadline_s: Optional[float] = None,
+        load_game: Optional[str] = None,
     ):
         self._workdir = os.path.abspath(workdir)
         self._seed = int(seed)
-        self._username = username
+        self._username = validate_freeciv_username(username)
         self._aifill = int(aifill)
         self.startup_deadline = float(startup_deadline)
         self.step_deadline = float(step_deadline)
         self.wait_deadline = float(wait_deadline)
         self.close_deadline = float(close_deadline)
+        if max_turns is not None:
+            # Keep the session boundary unambiguous for direct callers too;
+            # silently coercing 0, negatives, floats, or bools would either
+            # disable the intended horizon or produce an invalid controller
+            # guard.
+            if isinstance(max_turns, bool) or not isinstance(max_turns, int):
+                raise ValueError("max_turns must be a positive integer or None")
+            if max_turns <= 0:
+                raise ValueError("max_turns must be a positive integer or None")
+        self.max_turns = max_turns
+        if load_game is not None:
+            if not isinstance(load_game, str) or not load_game.strip():
+                raise ValueError("load_game must be a non-empty save name")
+            if any(part in load_game for part in ("/", "\\", "..")):
+                raise ValueError("load_game must be a save name, not a path")
+            if not load_game.startswith(f"{username}_"):
+                raise ValueError("load_game save name must belong to username")
+        self.load_game = load_game
+        if acting_deadline_s is not None:
+            acting_deadline_s = float(acting_deadline_s)
+            if not math.isfinite(acting_deadline_s) or acting_deadline_s <= 0:
+                raise ValueError("acting_deadline_s must be a finite positive number")
+        self.acting_deadline_s = acting_deadline_s
+        # CivRealm's controller-side server timeout must exceed the runner's
+        # model/action phase deadline.  Keep the historical 300s bounded-run
+        # default when no runner deadline is supplied.
+        self.server_timeout_s = max(
+            float(SERVER_TIMEOUT_S),
+            acting_deadline_s + SERVER_TIMEOUT_MARGIN_S
+            if acting_deadline_s is not None else float(SERVER_TIMEOUT_S),
+        )
+        # CivRealm evaluates its turn guard after advancing the server turn.
+        # Give bounded runs one extra server turn so the runner can own the
+        # exact N-turn completion boundary.
+        self.controller_max_turns = (
+            UNBOUNDED_MAX_TURNS
+            if self.max_turns is None else self.max_turns + 1
+        )
+        # The value is configured before reset(), while CivRealm's setup I/O
+        # loop is active.  After reset, the typed server-settings packet is
+        # inspected to verify that Freeciv accepted the value.
+        # The websocket liveness window must cover the complete model/action
+        # phase whenever a caller supplies an acting deadline.  Keep the
+        # upstream 720-second default for ordinary bounded callers, but leave
+        # a cleanup margin for longer configured phases.
+        default_pingtimeout = PINGTIMEOUT_S if self.max_turns is None else 720.0
+        self.pingtimeout_s = max(
+            default_pingtimeout,
+            acting_deadline_s + SERVER_TIMEOUT_MARGIN_S
+            if acting_deadline_s is not None else 720.0,
+        )
+        self._pingtimeout_status = "configured"
+        self._pingtimeout_actual: Optional[int] = None
+        # Scenario read-back is best-effort.  Older CivRealm builds and test
+        # doubles may not expose either controller, so startup must remain
+        # compatible while clearly marking the requested values as unverified.
+        self._scenario_readback_status = "unavailable"
+        self._aifill_actual: Optional[int] = None
+        self._maxplayers_actual: Optional[int] = None
+        self._actual_total_players: Optional[int] = None
+        # ``actual_ai_players`` is the raw PLRF_AI count.  Keep it separate
+        # from ``actual_ai_opponents``, which deliberately excludes Freeciv's
+        # Barbarian/Pirate nations.
+        self._actual_ai_players: Optional[int] = None
+        self._actual_ai_opponents: Optional[int] = None
+        self._actual_barbarian_ai_opponents: Optional[int] = None
+        self._actual_unknown_ai_opponents: Optional[int] = None
+        self._actual_player_roster: Optional[list[Mapping[str, Any]]] = None
 
         self._commands: "queue.Queue[tuple[str, Any, queue.Queue]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
         self._startup_error: Optional[BaseException] = None
+        self._last_dispatch_failure: Optional[dict[str, Any]] = None
+        self._startup_cleanup_error: Optional[BaseException] = None
+        self._startup_env_closed = False
 
         # env-side handles (set by the worker, read cross-thread after steps)
         self._env: Any = None
@@ -256,6 +507,20 @@ class AdapterSession:
         self._player_id: Optional[int] = None
         self._port: Optional[int] = None
         self._ruleset: Optional[RulesetNames] = None
+        self._ruleset_reference: Any = None
+        self._ruleset_reference_hash: Optional[str] = None
+        self._ruleset_reference_status = "not_collected"
+        self._help_reference: Any = None
+        self._help_reference_hash: Optional[str] = None
+        self._help_reference_status = "not_collected"
+        self._classic_reference: Any = None
+        self._classic_reference_hash: Optional[str] = None
+        self._classic_reference_status = "not_collected"
+        self._classic_reference_provenance: Any = None
+        self._manual_reference: Any = None
+        self._manual_reference_hash: Optional[str] = None
+        self._manual_reference_status = "not_collected"
+        self._manual_reference_provenance: Any = None
         self._action_probs: Mapping[int, Any] = {}
         self._unit_flags: Mapping[int, Any] = {}
         # The latest completed step's game-over flags: terminated/truncated
@@ -268,6 +533,13 @@ class AdapterSession:
         self._failed: Optional[str] = None
         self._closed = False
         self._close_status = "not_attempted"
+
+        # CivRealm's websocket captures the asyncio/Tornado loop created by
+        # connect(). Keep those exact objects so a missing thread-local loop
+        # can be restored without replacing a live websocket's loop.
+        self._adapter_asyncio_loop: Any = None
+        self._adapter_io_loop: Any = None
+        self._adapter_socket_asyncio_loop: Any = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -296,6 +568,8 @@ class AdapterSession:
             raise SessionTimeoutError("startup", self.startup_deadline)
         if self._startup_error is not None:
             self._failed = f"startup failed: {self._startup_error!r}"
+            if isinstance(self._startup_error, SessionStateError):
+                raise self._startup_error
             raise SessionError("startup failed") from self._startup_error
 
     def close(self) -> str:
@@ -369,8 +643,222 @@ class AdapterSession:
         return self._port
 
     @property
+    def pingtimeout_status(self) -> str:
+        """Configuration/read-back status for the long-run pingtimeout."""
+        return self._pingtimeout_status
+
+    @property
+    def pingtimeout_actual(self) -> Optional[int]:
+        """The integer value reported by Freeciv after setup, if confirmed."""
+        return self._pingtimeout_actual
+
+    @property
+    def scenario_readback_status(self) -> str:
+        """Whether authoritative scenario settings/roster were observed."""
+        return self._scenario_readback_status
+
+    @property
+    def aifill_actual(self) -> Optional[int]:
+        return self._aifill_actual
+
+    @property
+    def maxplayers_actual(self) -> Optional[int]:
+        return self._maxplayers_actual
+
+    @property
+    def actual_total_players(self) -> Optional[int]:
+        return self._actual_total_players
+
+    @property
+    def actual_ai_opponents(self) -> Optional[int]:
+        return self._actual_ai_opponents
+
+    @property
+    def actual_ai_players(self) -> Optional[int]:
+        """Raw count of players carrying Freeciv's AI flag."""
+        return self._actual_ai_players
+
+    @property
+    def actual_barbarian_ai_opponents(self) -> Optional[int]:
+        """Count of AI players whose nation is Barbarian or Pirate."""
+        return self._actual_barbarian_ai_opponents
+
+    @property
+    def actual_unknown_ai_opponents(self) -> Optional[int]:
+        """Count of AI players whose nation classification is unavailable."""
+        return self._actual_unknown_ai_opponents
+
+    @property
+    def actual_player_roster(self) -> Optional[list[Mapping[str, Any]]]:
+        return self._actual_player_roster
+
+    @property
     def ruleset(self) -> Optional[RulesetNames]:
         return self._ruleset
+
+    @property
+    def ruleset_reference(self) -> Any:
+        """Immutable ruleset encyclopedia, when available.
+
+        This is separate from ``ruleset``: the latter is the legacy display
+        name snapshot consumed by action validation.  Missing or incomplete
+        reference data is represented by ``None`` and does not prevent a game
+        from starting.
+        """
+        return self._ruleset_reference
+
+    @property
+    def ruleset_reference_json(self) -> Optional[Mapping[str, Any]]:
+        """JSON-native snapshot of the encyclopedia, when available.
+
+        ``RulesetReference`` remains the immutable internal/public reference;
+        this property is the explicit boundary for serializers and prompt
+        code.  ``to_dict`` returns a fresh JSON-native snapshot each access.
+        """
+        reference = self._ruleset_reference
+        if reference is None:
+            return None
+        to_dict = getattr(reference, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+            return value if isinstance(value, Mapping) else None
+        return reference if isinstance(reference, Mapping) else None
+
+    @property
+    def ruleset_reference_hash(self) -> Optional[str]:
+        """SHA-256 content hash of ``ruleset_reference``, if available."""
+        return self._ruleset_reference_hash
+
+    @property
+    def ruleset_reference_status(self) -> str:
+        """Reference extraction status and any unavailable explanation."""
+        return self._ruleset_reference_status
+
+    @property
+    def help_reference(self) -> Any:
+        """Immutable static help index, or an unavailable-status reference."""
+        return self._help_reference
+
+    @property
+    def help_reference_json(self) -> Optional[Mapping[str, Any]]:
+        """JSON-native help index snapshot for serializers and prompts."""
+        reference = self._help_reference
+        if reference is None:
+            return None
+        to_dict = getattr(reference, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        elif hasattr(reference, "entries"):
+            # ClassicReference deliberately keeps its value object minimal;
+            # provide the documented JSON boundary here without exposing the
+            # frozen object's internals or private hash field.
+            value = {
+                key: getattr(reference, key)
+                for key in ("schema_version", "status", "source_path",
+                            "image_ref", "image_version", "tree_sha256")
+                if hasattr(reference, key)
+            }
+            value["content_hash"] = getattr(reference, "content_hash", None)
+            value["entries"] = [
+                entry.to_dict() if callable(getattr(entry, "to_dict", None))
+                else dict(entry) if isinstance(entry, Mapping) else entry
+                for entry in getattr(reference, "entries", ())
+            ]
+        else:
+            value = reference
+        return value if isinstance(value, Mapping) else None
+
+    @property
+    def help_reference_hash(self) -> Optional[str]:
+        """Semantic content hash, only when helpdata was available."""
+        return self._help_reference_hash
+
+    @property
+    def help_reference_status(self) -> str:
+        """Helpdata availability status."""
+        return self._help_reference_status
+
+    @property
+    def classic_reference(self) -> Any:
+        """Optional static classic encyclopedia, never authoritative."""
+        return self._classic_reference
+
+    @property
+    def classic_reference_json(self) -> Optional[Mapping[str, Any]]:
+        reference = self._classic_reference
+        if reference is None:
+            return None
+        to_dict = getattr(reference, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        elif hasattr(reference, "entries"):
+            value = {
+                key: getattr(reference, key)
+                for key in ("schema_version", "status", "source_path",
+                            "image_ref", "image_version", "tree_sha256")
+                if hasattr(reference, key)
+            }
+            value["content_hash"] = getattr(reference, "content_hash", None)
+            value["entries"] = [
+                entry.to_dict() if callable(getattr(entry, "to_dict", None))
+                else dict(entry) if isinstance(entry, Mapping) else entry
+                for entry in getattr(reference, "entries", ())
+            ]
+        else:
+            value = reference
+        return value if isinstance(value, Mapping) else None
+
+    @property
+    def classic_reference_hash(self) -> Optional[str]:
+        return self._classic_reference_hash
+
+    @property
+    def classic_reference_status(self) -> str:
+        return self._classic_reference_status
+
+    @property
+    def classic_reference_provenance(self) -> Any:
+        """JSON-safe provenance metadata, if the static index was loaded."""
+        value = self._classic_reference_provenance
+        if isinstance(value, Mapping):
+            return dict(value)
+        return value
+
+    @property
+    def manual_reference(self) -> Any:
+        """Optional generated Freeciv manual, never authoritative game state."""
+        return self._manual_reference
+
+    @property
+    def manual_reference_json(self) -> Optional[Mapping[str, Any]]:
+        """JSON-native manual index snapshot, when the verified artifact exists."""
+        reference = self._manual_reference
+        if reference is None:
+            return None
+        to_dict = getattr(reference, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+        elif isinstance(reference, Mapping):
+            value = reference
+        else:
+            value = None
+        return value if isinstance(value, Mapping) else None
+
+    @property
+    def manual_reference_hash(self) -> Optional[str]:
+        """Semantic content hash of the verified generated manual."""
+        return self._manual_reference_hash
+
+    @property
+    def manual_reference_status(self) -> str:
+        """Manual availability or non-fatal unavailability explanation."""
+        return self._manual_reference_status
+
+    @property
+    def manual_reference_provenance(self) -> Any:
+        """JSON-safe provenance for the generated manual, if available."""
+        value = self._manual_reference_provenance
+        return dict(value) if isinstance(value, Mapping) else value
 
     @property
     def action_probs(self) -> Mapping[int, Any]:
@@ -391,6 +879,19 @@ class AdapterSession:
     @property
     def close_status(self) -> str:
         return self._close_status
+
+    @property
+    def last_dispatch_failure(self) -> Optional[Mapping[str, Any]]:
+        """Bounded worker-side failure diagnostic, if the last RPC failed.
+
+        This intentionally excludes action arguments and model output.  The
+        runner uses the transport marker to avoid a same-session refresh when
+        a websocket callback failed: that connection's mutation state is not
+        safely reconnectable.
+        """
+        if self._last_dispatch_failure is None:
+            return None
+        return dict(self._last_dispatch_failure)
 
     def production_name_map(self) -> dict[str, tuple[int, int]]:
         """production display name -> (production_kind, production_value) as
@@ -481,6 +982,21 @@ class AdapterSession:
         try:
             self._setup_env()
         except BaseException as exc:  # startup failure, reported to start()
+            # reset() may already have opened a websocket before a startup
+            # verifier (including loop identity checks) failed.  Close that
+            # env on this owning worker thread, preserving the original
+            # startup exception if cleanup itself fails.
+            env = self._env
+            if env is not None and not self._startup_env_closed:
+                try:
+                    # Route cleanup through the sole guarded close dispatch;
+                    # this preserves the package invariant that no caller
+                    # invokes env.close() outside ``_dispatch('close')``.
+                    self._dispatch("close", None)
+                except BaseException as cleanup_exc:
+                    self._startup_cleanup_error = cleanup_exc
+                finally:
+                    self._startup_env_closed = True
             self._startup_error = exc
             self._ready.set()
             return
@@ -493,8 +1009,42 @@ class AdapterSession:
             try:
                 result = self._dispatch(kind, payload)
             except BaseException as exc:
+                # Keep a bounded, non-payload diagnostic for reconciliation
+                # and failure artifacts.  Never include action arguments or
+                # model text; the exception type/message and traceback are
+                # sufficient to locate loop lifecycle failures.
+                self._last_dispatch_failure = {
+                    "stage": kind,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(limit=12),
+                    "worker_thread": threading.current_thread().name,
+                    "owned_loop": (hex(id(self._adapter_asyncio_loop))
+                                    if self._adapter_asyncio_loop is not None
+                                    else None),
+                    "transport_uncertain": bool(
+                        getattr(exc, "diagnostic", None) is not None
+                        or type(exc).__name__ == "WebSocketWriteError"
+                        or "websocket" in str(exc).lower()
+                    ),
+                }
+                transport_diagnostic = getattr(exc, "diagnostic", None)
+                if isinstance(transport_diagnostic, Mapping):
+                    # Keep only bounded scalar provenance/loop fields.  Do not
+                    # persist payloads or arbitrary exception objects.
+                    self._last_dispatch_failure["transport_diagnostic"] = {
+                        str(key): (str(value)[-4096:] if key == "traceback"
+                                   else value)
+                        for key, value in transport_diagnostic.items()
+                        if isinstance(value, (str, int, float, bool, type(None), dict))
+                    }
                 result_q.put(("error", exc))
             else:
+                # A later successful RPC proves that the previous dispatch
+                # diagnostic no longer describes the current operation.  Do
+                # this only after publishing the failure above, so the
+                # runner can inspect it while reconciling that failed step.
+                self._last_dispatch_failure = None
                 result_q.put(("ok", result))
 
     def _setup_env(self) -> None:
@@ -514,9 +1064,18 @@ class AdapterSession:
         fc_args["debug.gameseed"] = self._seed
         fc_args["debug.agentseed"] = self._seed
         # Raised to align with §3 deadlines (plan §7.1; see module docstring).
-        fc_args["server_timeout"] = SERVER_TIMEOUT_S
+        fc_args["server_timeout"] = self.server_timeout_s
         fc_args["begin_turn_timeout"] = BEGIN_TURN_TIMEOUT_S
         fc_args["wait_for_timeout"] = WAIT_FOR_TIMEOUT_S
+        # CivRealm has an independent controller-side turn guard.  Keep it
+        # above the runner's horizon. Bounded runs use one extra server turn
+        # because CivRealm evaluates this guard after advancing the turn.
+        fc_args["max_turns"] = self.controller_max_turns
+        fc_args["pingtimeout"] = math.ceil(self.pingtimeout_s)
+        # CivRealm consumes this before env.reset() and performs the load
+        # while its setup I/O loop is active. The caller must stage and
+        # checksum-validate the save before constructing this session.
+        fc_args["debug.load_game"] = self.load_game or ""
 
         # Wrap every upstream no-timeout HTTP call at <= 15 s BEFORE the env
         # is created (login's create_pbem_user/gamesetting run inside reset).
@@ -524,16 +1083,237 @@ class AdapterSession:
 
         envs = importlib.import_module("civrealm.envs")
         env = envs.FreecivBaseEnv(username=self._username)
-        obs, info = env.reset(seed=self._seed)
+        # Publish immediately: reset and post-reset verification may fail
+        # after the websocket/server has already been created.
         self._env = env
+        obs, info = env.reset(seed=self._seed)
+        self._capture_event_loop_identity(env)
+        self._verify_pingtimeout(env, fc_args["pingtimeout"])
+        self._collect_scenario_readback(env)
         self._obs = _snapshot(obs)
         self._info = _snapshot(info)
         self._turn = int(info.get("turn", 0) or 0)
         self._player_id = int(env.get_playerid())
         self._port = int(env.get_port())
         self._ruleset = _collect_ruleset(env)
+        (self._ruleset_reference, self._ruleset_reference_hash,
+         self._ruleset_reference_status) = _collect_ruleset_reference(env)
+        (self._help_reference, self._help_reference_hash,
+         self._help_reference_status) = _collect_help_reference()
+        (self._classic_reference, self._classic_reference_hash,
+         self._classic_reference_status,
+         self._classic_reference_provenance) = _collect_classic_reference(env)
+        (self._manual_reference, self._manual_reference_hash,
+         self._manual_reference_status,
+         self._manual_reference_provenance) = _collect_manual_reference(env)
+
+    def _verify_pingtimeout(self, env: Any, expected: int) -> None:
+        """Verify Freeciv's typed server-settings read-back after reset.
+
+        Packet 167 updates ``opt_ctrl.server_settings`` in place.  This is
+        the authoritative value available to the adapter; a chat ``/set``
+        line alone is not an acknowledgement.  Older controller schemas may
+        omit ``is_visible``, so enforce it only when present.
+        """
+        controller = getattr(env, "civ_controller", None)
+        options = getattr(getattr(controller, "opt_ctrl", None),
+                          "server_settings", None)
+        setting = options.get("pingtimeout") if isinstance(options, dict) else None
+        if not isinstance(setting, dict) or "val" not in setting:
+            raise SessionStateError(
+                "server did not report pingtimeout in typed server settings"
+            )
+        if "is_visible" in setting and setting["is_visible"] is not True:
+            raise SessionStateError(
+                "server pingtimeout setting is not visible in typed server settings"
+            )
+        actual = setting["val"]
+        if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+            raise SessionStateError(
+                f"server pingtimeout mismatch: expected {expected}, got {actual!r}"
+            )
+        self._pingtimeout_actual = actual
+        self._pingtimeout_status = "confirmed"
+
+    def _capture_event_loop_identity(self, env: Any) -> None:
+        """Capture the loop already owned by the CivRealm websocket."""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError as exc:
+            raise SessionStateError(
+                "Freeciv worker has no current asyncio loop after reset"
+            ) from exc
+        if loop.is_closed() or loop.is_running():
+            raise SessionStateError(
+                "Freeciv worker asyncio loop is closed or running after reset"
+            )
+        controller = getattr(env, "civ_controller", None)
+        socket = getattr(controller, "ws_client", None)
+        io_loop = getattr(socket, "_io_loop", None)
+        self._adapter_asyncio_loop = loop
+        if io_loop is None:
+            # Older controller schemas and test doubles do not expose loop
+            # identity; the asyncio guard remains useful and compatible.
+            return
+        socket_loop = getattr(io_loop, "asyncio_loop", None)
+        if socket_loop is None:
+            socket_loop = getattr(io_loop, "_asyncio_loop", None)
+        if socket_loop is not None and socket_loop is not loop:
+            raise SessionStateError(
+                "Freeciv websocket loop does not match worker asyncio loop"
+            )
+        self._adapter_io_loop = io_loop
+        self._adapter_socket_asyncio_loop = socket_loop
+
+    def _ensure_event_loop_identity(self) -> None:
+        """Ensure the worker uses the websocket's captured loop for an RPC."""
+        loop = self._adapter_asyncio_loop
+        if loop is None:
+            return
+        if loop.is_closed():
+            raise SessionStateError(
+                "Freeciv websocket asyncio loop is closed "
+                f"(owned={hex(id(loop))}, stage=dispatch)")
+        if loop.is_running():
+            raise SessionStateError(
+                "Freeciv websocket asyncio loop is unexpectedly running "
+                f"(owned={hex(id(loop))}, stage=dispatch)"
+            )
+        try:
+            current = asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(loop)
+            current = loop
+        if current is not loop:
+            raise SessionStateError(
+                "Freeciv worker asyncio loop changed while websocket was active "
+                f"(owned={hex(id(loop))}, current={hex(id(current))}, "
+                "stage=dispatch)"
+            )
+        if self._adapter_io_loop is not None:
+            is_closed = getattr(self._adapter_io_loop, "closed", None)
+            if callable(is_closed):
+                is_closed = is_closed()
+            if is_closed is True:
+                raise SessionStateError("Freeciv websocket IOLoop is closed")
+            socket_loop = getattr(self._adapter_io_loop, "asyncio_loop", None)
+            if socket_loop is None:
+                socket_loop = getattr(self._adapter_io_loop, "_asyncio_loop", None)
+            if (self._adapter_socket_asyncio_loop is not None and
+                    socket_loop is not self._adapter_socket_asyncio_loop):
+                raise SessionStateError(
+                    "Freeciv websocket IOLoop changed while connection was active"
+                )
+
+    def _collect_scenario_readback(self, env: Any) -> None:
+        """Collect typed ``aifill``/``maxplayers`` and player roster data.
+
+        This is intentionally non-fatal: these fields were not exposed by
+        some older controller versions.  Values are included only when they
+        are typed and therefore useful; a missing value remains unavailable
+        instead of being mistaken for the requested configuration.
+        """
+        controller = getattr(env, "civ_controller", None)
+        options = getattr(getattr(controller, "opt_ctrl", None),
+                          "server_settings", None)
+        setting_values: dict[str, int] = {}
+        if isinstance(options, dict):
+            for name in ("aifill", "maxplayers"):
+                setting = options.get(name)
+                value = setting.get("val") if isinstance(setting, dict) else None
+                if (isinstance(value, int) and not isinstance(value, bool)
+                        and value >= 0):
+                    setting_values[name] = value
+        self._aifill_actual = setting_values.get("aifill")
+        self._maxplayers_actual = setting_values.get("maxplayers")
+
+        player_ctrl = getattr(controller, "player_ctrl", None)
+        players = getattr(player_ctrl, "players", None)
+        rule_ctrl = getattr(controller, "rule_ctrl", None)
+        nations = getattr(rule_ctrl, "nations", None)
+        if not isinstance(nations, Mapping) and isinstance(rule_ctrl, Mapping):
+            nations = rule_ctrl.get("nations")
+        if not isinstance(nations, Mapping):
+            nations = {}
+        roster: list[Mapping[str, Any]] = []
+        ai_count = 0
+        barbarian_ai_count = 0
+        unknown_ai_count = 0
+
+        def nation_rule_name(nation_id: Any) -> Optional[str]:
+            """Resolve the authoritative ruleset nation name, if present."""
+            candidates = [nation_id]
+            try:
+                candidates.append(int(nation_id))
+            except (TypeError, ValueError):
+                pass
+            for candidate in candidates:
+                try:
+                    nation = nations.get(candidate)
+                except (TypeError, AttributeError):
+                    nation = None
+                if isinstance(nation, Mapping):
+                    value = nation.get("rule_name")
+                    if isinstance(value, str) and value:
+                        return value
+            return None
+
+        if isinstance(players, dict):
+            for playerno, player in sorted(players.items(), key=lambda item: str(item[0])):
+                if not isinstance(player, dict):
+                    continue
+                flags = player.get("flags")
+                is_ai: Optional[bool] = None
+                try:
+                    is_ai = bool(flags[0]) if flags is not None else None
+                except (IndexError, KeyError, TypeError):
+                    is_ai = None
+                if is_ai is True:
+                    ai_count += 1
+                rule_name = nation_rule_name(player.get("nation"))
+                is_barbarian: Optional[bool] = None
+                if rule_name is not None:
+                    is_barbarian = rule_name.lower() in {"barbarian", "pirate"}
+                    if is_ai is True and is_barbarian:
+                        barbarian_ai_count += 1
+                elif is_ai is True:
+                    unknown_ai_count += 1
+                entry: dict[str, Any] = {
+                    "playerno": player.get("playerno", playerno),
+                    "name": player.get("name"),
+                    "username": player.get("username"),
+                    "nation": player.get("nation"),
+                }
+                if is_ai is not None:
+                    entry["is_ai"] = is_ai
+                if rule_name is not None:
+                    entry["nation_rule_name"] = rule_name
+                    entry["is_barbarian"] = is_barbarian
+                roster.append(entry)
+        if roster:
+            self._actual_total_players = len(roster)
+            all_ai_known = all("is_ai" in item for item in roster)
+            self._actual_ai_players = ai_count if all_ai_known else None
+            self._actual_barbarian_ai_opponents = (
+                barbarian_ai_count if all_ai_known else None)
+            self._actual_unknown_ai_opponents = (
+                unknown_ai_count if all_ai_known else None)
+            self._actual_ai_opponents = (
+                ai_count - barbarian_ai_count - unknown_ai_count
+                if all_ai_known and unknown_ai_count == 0 else None)
+            self._actual_player_roster = roster
+        complete_settings = self._aifill_actual is not None and self._maxplayers_actual is not None
+        complete_roster = bool(roster) and self._aifill_actual is not None and len(roster) == self._aifill_actual
+        complete_ai_classification = (
+            bool(roster) and self._actual_unknown_ai_opponents == 0 and
+            self._actual_ai_opponents is not None)
+        if complete_settings and complete_roster and complete_ai_classification:
+            self._scenario_readback_status = "confirmed"
+        elif complete_settings or roster:
+            self._scenario_readback_status = "partial"
 
     def _dispatch(self, kind: str, payload: Any) -> Any:
+        self._ensure_event_loop_identity()
         if kind == "step":
             t0 = time.monotonic()
             obs, reward, terminated, truncated, info = self._env.step(payload)

@@ -77,6 +77,10 @@ sys.path.insert(0, REPO)
 from lechonk.model.mistral_client import MistralClient  # noqa: E402
 
 RUN = "wp2-fault-run"
+# This fixed-name fault-injection fixture is intentionally legacy-exclusive:
+# it is a deterministic acceptance harness, not a concurrent fresh-run CLI.
+# Do not run it alongside another process using the same Freeciv server.
+FREECIV_USERNAME = "myagent"
 RUNDIR = os.path.join(REPO, "artifacts", "runs", RUN)
 WORKDIR = os.path.join(RUNDIR, "workdir")  # dedicated CWD for upstream
 os.makedirs(WORKDIR, exist_ok=True)
@@ -794,7 +798,7 @@ def main():
     ledger = TranscriptLedger(transcript_path)
     config = RunnerConfig(
         max_turns=TURNS, run_id=RUN, workdir=WORKDIR, seed=SEED,
-        username="myagent", aifill=2)
+        username=FREECIV_USERNAME, aifill=2)
     runner = GameRunner(
         config=config, client=adapter, ledger=ledger, manifest=manifest)
 

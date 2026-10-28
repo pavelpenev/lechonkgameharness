@@ -1,0 +1,20 @@
+Your previous output was rejected as STATE-FOG: these refs are absent from the
+current offered candidate table:
+$failed_refs
+
+$error_detail
+
+This classification means only that the refs are not currently offered; it
+does not by itself prove that the game changed, that a unit was destroyed, or
+that a target is visible. A vanished or last-known unit is unknown, not dead.
+Re-emit one complete ActionBatch using only exact refs in the refreshed table;
+drop unavailable actions or choose a currently offered replacement. At most
+20 actions, one state-changing action per actor by default, finish_requested
+true, and no prose. Preserve prior memory when unchanged; update only changed
+durable goals, plans, threats, verified outcomes, or lessons, without
+restating the snapshot or inventing hidden facts. Omit the entire
+memory_update when unchanged. If provided, commitments are upserts, but
+threats and notes replace prior values, so repeat the full current values or
+they clear.
+
+$refreshed_candidates

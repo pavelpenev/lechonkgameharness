@@ -29,11 +29,13 @@ import json
 import re
 import shutil
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from lechonk.core.ledger import TranscriptLedger, load_transcript
+from lechonk.core.metrics import commitment_board
 from lechonk.core.schemas import (
     ActionResultRecord,
     CandidatesRefRecord,
@@ -355,11 +357,15 @@ def test_render_bundle_wp2_transcript(tmp_path):
         title="Le Chonk replay — wp2-model-run (10-turn model run)")
     meta = summary["meta"]
     assert meta["run_id"] == "wp2-model-run"
-    assert meta["outcome"] == "COMPLETED"
-    assert meta["record_count"] == 176
-    assert meta["record_kinds"]["turn_start"] == 10
-    assert meta["record_kinds"]["model_call"] == 17
-    assert meta["record_kinds"]["action_result"] == 61
+    # This is a local run artifact, so its outcome and record inventory can
+    # change when the harness is exercised.  Validate the bundle against the
+    # artifact itself rather than pinning one historical run's counts.
+    assert meta["outcome"] in {"COMPLETED", "TRUNCATED", "VICTORY", "DEFEATED"}
+    records = load_transcript(WP2_TRANSCRIPT)
+    assert meta["record_count"] == len(records.records)
+    expected_record_kinds = dict(Counter(record.kind for record in records.records))
+    assert meta["record_kinds"] == expected_record_kinds
+    assert meta["record_kinds"].get("turn_start", 0) > 0
     assert meta["turns_recorded"] is False  # the WP2 run predates the
     # RecordingClient: the viewer discloses, never fabricates
     html = (out / "index.html").read_text(encoding="utf-8")
@@ -369,9 +375,11 @@ def test_render_bundle_wp2_transcript(tmp_path):
     # phrase is split across a JS string concatenation in the template,
     # so assert the contiguous fragment)
     assert "predates per-turn summary" in html
-    # the commitments board is embedded (10 entries for the WP2 run)
+    # The commitments board is derived from the local artifact and can vary
+    # between runs; assert it matches the canonical metric computation from
+    # those same source records rather than pinning a historical size.
     board = json.loads(_script_block(html, "lechonk-commitments"))
-    assert len(board) == 10
+    assert board == commitment_board(records.records)
     statuses = {c["status"] for c in board}
     assert statuses <= {"fulfilled_model", "fulfilled_other", "missed",
                         "open"}
@@ -386,8 +394,9 @@ def test_render_bundle_wp2_transcript(tmp_path):
 @pytest.mark.skipif(not RECORDED_TRANSCRIPTS,
                     reason="the recorded transcript inventory is not present")
 def test_recorded_transcripts_all_load_read_only():
-    # the 2026-10-25 wave-3 hash pin: exactly 42 recorded transcripts
-    assert len(RECORDED_TRANSCRIPTS) == 42
+    # Live runs add artifacts under artifacts/runs; validate every artifact
+    # present without pinning a historical inventory size.
+    assert RECORDED_TRANSCRIPTS
     for path in RECORDED_TRANSCRIPTS:
         loaded = load_transcript(path)  # read-only: never modifies the file
         assert loaded.records, path
@@ -407,6 +416,90 @@ def test_main_cli(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "[replay]" in captured.out
     assert "test-run" not in captured.out  # the CLI prints counts, not data
+
+
+def test_render_bundle_model_traces_full_output_and_safe_embedding(tmp_path):
+    transcript = _build_transcript(tmp_path)
+    traces = tmp_path / "model_traces.jsonl"
+    trace_rows = [
+        {"event": "model_output", "turn": 1, "attempt": 1,
+         "reasoning": "reason </script> <!-- <script>",
+         "answer": "{\"actions\":[]}",
+         "tool_calls": [{"name": "lookup_freeciv", "arguments": {"x": 1}}],
+         "content_chunks": [{"type": "text", "text": "chunk"}],
+         "complete": True},
+        {"event": "model_output", "turn": 2, "attempt": 1,
+         "reasoning": "partial", "error": "transport timeout",
+         "complete": False},
+        {"event": "model_output", "turn": 3, "attempt": 1,
+         "reasoning": "legacy record without completion marker"},
+    ]
+    traces.write_text("".join(json.dumps(row) + "\n" for row in trace_rows),
+                      encoding="utf-8")
+    out = tmp_path / "replay"
+    summary = replay.render_bundle(transcript, out, traces_path=traces)
+    meta = summary["meta"]
+    assert meta["model_traces_enabled"] is True
+    assert meta["model_traces_count"] == 3
+    assert meta["model_traces_complete_count"] == 1
+    assert meta["model_traces_unknown_status_count"] == 1
+    assert meta["model_traces_discarded_trailing_partial"] is False
+    assert meta["model_traces_snapshot_sha256"] == hashlib.sha256(
+        traces.read_bytes()).hexdigest()
+    assert "integrity metadata, not authenticity" in meta[
+        "model_traces_snapshot_sha256_note"]
+    assert (out / "model_traces.jsonl").read_bytes() == traces.read_bytes()
+    html = (out / "index.html").read_text(encoding="utf-8")
+    block = _script_block(html, "lechonk-model-traces")
+    assert "</script>" not in block
+    assert "Full model output" in html
+    assert "modelTraces" in html
+    embedded = json.loads(block)
+    assert embedded == trace_rows
+    assert "lookup_freeciv" in html
+    assert "transport timeout" in html
+
+
+def test_render_bundle_model_traces_default_is_disabled(tmp_path):
+    transcript = _build_transcript(tmp_path)
+    out = tmp_path / "replay"
+    replay.render_bundle(transcript, out)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    meta = json.loads(_script_block(html, "lechonk-meta"))
+    assert meta["model_traces_enabled"] is False
+    assert meta["model_traces_count"] == 0
+    assert not (out / "model_traces.jsonl").exists()
+    assert "Re-render with --traces" in html
+
+
+def test_render_bundle_model_traces_missing_path_fails(tmp_path):
+    transcript = _build_transcript(tmp_path)
+    with pytest.raises(FileNotFoundError, match="model traces not found"):
+        replay.render_bundle(transcript, tmp_path / "out",
+                             traces_path=tmp_path / "missing.jsonl")
+
+
+def test_render_bundle_model_traces_rejects_middle_malformed_and_keeps_torn_final(
+        tmp_path):
+    transcript = _build_transcript(tmp_path)
+    middle = tmp_path / "middle.jsonl"
+    middle.write_text('{"turn": 1}\nnot-json\n{"turn": 2}\n',
+                      encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed model trace line 2"):
+        replay.render_bundle(transcript, tmp_path / "middle-out",
+                             traces_path=middle)
+
+    final = tmp_path / "final.jsonl"
+    final.write_text('{"turn": 1, "complete": true}\n{"turn": 2',
+                     encoding="utf-8")
+    out = tmp_path / "final-out"
+    summary = replay.render_bundle(transcript, out, traces_path=final)
+    assert summary["meta"]["model_traces_count"] == 1
+    assert summary["meta"]["model_traces_discarded_trailing_partial"] is True
+    embedded = json.loads(_script_block(
+        (out / "index.html").read_text(encoding="utf-8"),
+        "lechonk-model-traces"))
+    assert embedded == [{"turn": 1, "complete": True}]
 
 
 # ---------------------------------------------------------------------------

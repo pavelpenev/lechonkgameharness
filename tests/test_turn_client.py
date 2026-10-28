@@ -15,8 +15,11 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
+import lechonk.model.turn_client as turn_client_module
+import lechonk.model.conversation as conversation_module
 
 from lechonk.core.model_client import (
     REPAIR_TIMEOUT_MARGIN_S,
@@ -29,16 +32,32 @@ from lechonk.model import prompts
 from lechonk.model.prompts import (
     REPAIR_CONVERSATION_TOKEN_BUDGET,
     PromptBudgetExceeded,
+    repair_conversation_budget,
 )
 from lechonk.model.turn_client import (
     MistralTurnClient,
+    COMPACTION_CONTEXT_WINDOW_TOKENS,
+    COMPACTION_OUTPUT_HEADROOM_TOKENS,
+    COMPACTION_INPUT_GUARD_TOKENS,
     _check_repair_conversation_budget,
     _prompt_hash,
     _raw_attempts_from,
     _turn_number,
 )
+from lechonk.model.conversation import ConversationConfig, ConversationManager, ConversationError
 
 CANARY = "sk-CANARY-9f3a91c2-do-not-leak"
+
+
+def test_v3_repair_budget_allows_expanded_candidate_surface():
+    messages = [{"role": "user", "content": "x" * 48_000}]
+    with pytest.raises(PromptBudgetExceeded):
+        _check_repair_conversation_budget(
+            messages, repair_conversation_budget("gameplay_v2",
+                                                 context_policy="legacy"))
+    _check_repair_conversation_budget(
+        messages, repair_conversation_budget("gameplay_v3",
+                                             context_policy="conversation_v1"))
 
 VALID_BATCH = json.dumps({
     "turn_id": "run/t1",
@@ -63,13 +82,18 @@ class MockTransport:
 
     def complete(self, *, messages, model, temperature, reasoning_effort,
                  max_tokens, response_format, random_seed,
-                 timeout_ms=None, disable_transport_retries=False):
+                 timeout_ms=None, disable_transport_retries=False,
+                 prompt_cache_key=None, tools=None, tool_choice=None,
+                 parallel_tool_calls=None):
         self.calls.append({
             "messages": messages, "model": model,
             "temperature": temperature, "max_tokens": max_tokens,
             "response_format": response_format, "random_seed": random_seed,
             "timeout_ms": timeout_ms,
             "disable_transport_retries": disable_transport_retries,
+            "prompt_cache_key": prompt_cache_key,
+            "tools": tools, "tool_choice": tool_choice,
+            "parallel_tool_calls": parallel_tool_calls,
         })
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -86,7 +110,12 @@ def raw(content, **kw):
         completion_tokens=kw.get("completion_tokens", 200),
         total_tokens=(kw.get("prompt_tokens", 1000)
                       + kw.get("completion_tokens", 200)),
-        transport_retries=kw.get("transport_retries", 0))
+        transport_retries=kw.get("transport_retries", 0),
+        reasoning_text=kw.get("reasoning_text", ""),
+        answer_text=kw.get("answer_text", content),
+        content_chunks=kw.get("content_chunks"),
+        tool_calls=kw.get("tool_calls"),
+        assistant_message=kw.get("assistant_message"))
 
 
 def make_client(outcomes, *, enforcement="json_schema"):
@@ -94,6 +123,208 @@ def make_client(outcomes, *, enforcement="json_schema"):
     client = mc.MistralClient(api_key=CANARY, transport=transport,
                               enforcement=enforcement)
     return client, transport
+
+
+def test_compaction_request_has_no_local_output_cap_and_records_early_failure():
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    seen = {}
+
+    def complete(**kwargs):
+        seen.update(kwargs)
+        return raw('{"version":1,"summary":"ok","commitments":[],"uncertainties":[],"facts":[]}')
+
+    client._complete = complete
+    result = adapter._compact_with_model([{"role": "user", "content": "short"}])
+    assert result["version"] == 1
+    assert "max_tokens" not in seen
+
+    huge = "x" * 4_100_000
+    with pytest.raises(ConversationError, match="context headroom"):
+        adapter._compact_with_model([{"role": "user", "content": huge}])
+    assert adapter.call_records[-1]["outcome"] == "error"
+    assert adapter.call_records[-1]["error"]
+
+
+def test_capacity_compaction_fails_closed_without_mutating_history():
+    capacity = mc.ProviderCapacityError("backend capacity", retry_after="9")
+    client, _ = make_client([capacity])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    manager = ConversationManager(system_message={"role": "system", "content": "s"})
+    manager.messages.append({"role": "user", "content": "history"})
+    before = list(manager.messages)
+    adapter._conversation_manager = manager
+
+    with pytest.raises(mc.ProviderCapacityError):
+        adapter._compact_with_model(manager.messages)
+
+    assert manager.messages == before
+    assert adapter.call_records[-1]["error_kind"] == "provider_capacity"
+    assert adapter.call_records[-1]["http_status"] == 429
+    assert adapter.call_records[-1]["provider_code"] == "3505"
+
+
+def test_compaction_carries_triggering_turn_and_logical_call_id():
+    events = []
+    client, transport = make_client([raw(
+        '{"version":1,"summary":"ok","commitments":[],'
+        '"uncertainties":[],"facts":[]}' )])
+    client.call_event_callback = events.append
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    adapter._active_turn_number = 17
+    adapter._active_logical_call_id = "run/t17"
+    assert adapter._compact_with_model([{"role": "user", "content": "history"}])
+    record = adapter.call_records[-1]
+    assert record["turn"] == 17
+    assert record["logical_call_id"] == "run/t17"
+    assert record["call_id"] == client.call_logs[-1].call_id
+    started = next(event for event in events
+                   if event["event"] == "model_request_started")
+    assert started["physical_kind"] == "conversation_compaction"
+    assert started["turn"] == 17
+    assert started["logical_call_id"] == "run/t17"
+
+
+def test_compaction_headroom_constants_leave_summary_margin():
+    assert COMPACTION_CONTEXT_WINDOW_TOKENS > COMPACTION_OUTPUT_HEADROOM_TOKENS
+
+
+def test_compaction_headroom_boundary_is_checked_before_transport(monkeypatch):
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    client._complete = lambda **kwargs: raw(
+        '{"version":1,"summary":"ok","commitments":[],"uncertainties":[],"facts":[]}')
+    # The compaction request contains the historical message plus its final
+    # instruction.  Make that pair land exactly on the available boundary.
+    monkeypatch.setattr(turn_client_module, "estimate_tokens", lambda _: 463_904)
+    adapter._compact_with_model([{"role": "user", "content": "history"}])
+    monkeypatch.setattr(turn_client_module, "estimate_tokens", lambda _: 463_905)
+    with pytest.raises(ConversationError, match="context headroom"):
+        adapter._compact_with_model([{"role": "user", "content": "history"}])
+
+
+def test_compaction_verified_provider_prefix_wires_transport_and_guard(monkeypatch):
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    manager = ConversationManager(system_message={"role": "system", "content": "s"})
+    manager.messages.extend({"role": "user", "content": str(i)} for i in range(143))
+    def shaped(messages):
+        count = len(list(messages))
+        return {144: 1_113_200, 137: 1_053_001, 1: 77}.get(count, count)
+    monkeypatch.setattr(conversation_module, "_message_tokens", shaped)
+    manager.record_usage(
+        500_595, estimated_tokens=1_113_200, message_count=144,
+        request_hash="sha256:" + hashlib.sha256(
+            conversation_module.canonical_json(manager.messages[:144]).encode("utf-8")
+        ).hexdigest())
+    adapter._conversation_manager = manager
+    seen = {}
+    client._complete = lambda **kwargs: (seen.update(kwargs) or raw(
+        '{"version":1,"summary":"ok","commitments":[],"uncertainties":[],"facts":[]}'))
+    adapter._compact_with_model(manager.messages[:137])
+    assert seen["messages"][-1]["role"] == "user"
+    assert "max_tokens" not in seen
+    record = adapter.call_records[-1]
+    assert record["outcome"] == "ok"
+    assert record["preflight"]["method"] == "provider_prefix"
+    assert record["preflight"]["guard"] == COMPACTION_INPUT_GUARD_TOKENS
+
+
+def test_compaction_deadline_and_invalid_json_are_logged_as_errors():
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                clock=lambda: 10.0)
+    adapter._turn_deadline = 10.5
+    with pytest.raises(TimeoutError, match="budget exhausted"):
+        adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert adapter.call_records[-1]["outcome"] == "error"
+    assert "budget exhausted" in adapter.call_records[-1]["error"]
+
+    adapter._turn_deadline = None
+    client._complete = lambda **kwargs: raw("not-json")
+    with pytest.raises(ConversationError, match="invalid JSON"):
+        adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert adapter.call_records[-1]["outcome"] == "error"
+    assert adapter.call_records[-1]["error"] == "compaction returned invalid JSON"
+
+
+def test_compaction_typed_commitment_semantic_error_is_logged(monkeypatch):
+    client, _ = make_client([])
+    events = []
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                output_callback=events.append)
+    client._complete = lambda **kwargs: raw(json.dumps({
+        "version": 1, "summary": "ok",
+        "commitments": [{"domain": "research", "target": "Writing",
+                          "target_kind": "tech", "deadline_turn": 1,
+                          "unexpected": True}],
+        "uncertainties": [], "facts": []}))
+    with pytest.raises(ConversationError, match="invalid typed commitment"):
+        adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert adapter.call_records[-1]["outcome"] == "error"
+    assert events[-1]["reasoning"] == ""
+    assert "unexpected" in events[-1]["answer"]
+
+
+def test_compaction_semantic_repair_is_one_bounded_second_attempt(monkeypatch):
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    responses = iter([raw("not-json", reasoning_text="first-thought"),
+                      raw('{"version":1,"summary":"fixed","commitments":[],'
+                           '"uncertainties":[],"facts":[]}')])
+    seen = []
+    client._complete = lambda **kwargs: (seen.append(kwargs) or next(responses))
+    result = adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert result["summary"] == "fixed"
+    assert [record["kind"] for record in adapter.call_records] == [
+        "conversation_compaction", "conversation_compaction_repair"]
+    assert seen[1]["attempt"] == 2 and seen[1]["disable_transport_retries"] is True
+    assert "not-json" in seen[1]["messages"][-2]["content"]
+    assert seen[1]["messages"][:2] == seen[0]["messages"]
+    assert "max_tokens" not in seen[0] and "max_tokens" not in seen[1]
+    assert adapter.call_records[0]["raw_attempts"][0]["answer"] == "not-json"
+    assert adapter.call_records[1]["raw_attempts"][0]["answer"]
+
+
+def test_compaction_semantic_repair_failure_stays_atomic_and_bounded(monkeypatch):
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    client._complete = lambda **kwargs: raw("still-invalid")
+    with pytest.raises(ConversationError, match="invalid JSON"):
+        adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert len(adapter.call_records) == 2
+    assert adapter.call_records[1]["kind"] == "conversation_compaction_repair"
+
+
+def test_compaction_transport_errors_prefer_partial_physical_call_id():
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    wanted = object()
+    client.call_logs.extend([object(), wanted])
+    client._call_log_for = lambda call_id: wanted if call_id == "physical-2" else None
+    exc = RuntimeError("transport")
+    exc.partial = type("Partial", (), {"call_id": "physical-2"})()
+    assert adapter._compaction_error_call_log(exc, 0) is wanted
+
+
+def test_compaction_repair_result_uses_exact_physical_call_log():
+    client, _ = make_client([])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1")
+    repaired = raw('{"version":1,"summary":"fixed","commitments":[],"uncertainties":[],"facts":[]}')
+    repaired.call_id = "physical-2"
+    log = SimpleNamespace(call_id="physical-2", prompt_hash="p",
+                          model_requested="m", model_responded="m",
+                          enforcement=None, temperature=None, latency_ms=1,
+                          tokens_in=1, tokens_out=1, tokens_total=2,
+                          cached_tokens=0, cost_usd=0, finish_reason="stop",
+                          response_id="r", fingerprint=None, transport_retries=0,
+                          error=None, ts=0)
+    client._call_log_for = lambda call_id: log if call_id == "physical-2" else None
+    responses = iter([raw("bad"), repaired])
+    client._complete = lambda **kwargs: next(responses)
+    adapter._compact_with_model([{"role": "user", "content": "history"}])
+    assert adapter.call_records[-1]["call_id"] == "physical-2"
+    assert adapter.call_records[-1]["kind"] == "conversation_compaction_repair"
 
 
 def turn_prompt(**kw):
@@ -136,7 +367,7 @@ def test_complete_once_ok_schema_error_and_transport_error():
     assert err.batch is None and err.raw is None
     # The failed attempt is logged too (decision 4: every call is logged).
     assert client.call_logs[-1].error is not None
-    assert client.call_logs[-1].tokens_in == 0
+    assert client.call_logs[-1].tokens_in is None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +422,23 @@ def test_complete_turn_maps_malformed_and_transport_error():
     assert resp.error is not None and "timed out" in resp.error
     assert resp.batch is None and resp.malformed is None
     assert resp.raw_attempts == []
+
+
+def test_output_callback_receives_complete_attempt_and_isolation():
+    client, _ = make_client([raw(VALID_BATCH)])
+    events = []
+    adapter = MistralTurnClient(client, output_callback=events.append)
+    adapter.complete_turn(turn_prompt())
+    assert events[0]["event"] == "model_output"
+    assert events[0]["answer"] == VALID_BATCH
+    assert events[0]["reasoning"] == ""
+
+    client, _ = make_client([raw(MALFORMED_BATCH)])
+    def broken(_event):
+        raise RuntimeError("display failed")
+    adapter = MistralTurnClient(client, output_callback=broken)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.malformed is not None
 
 
 # ---------------------------------------------------------------------------
@@ -408,8 +656,8 @@ def test_per_call_api_log_records_and_section_tokens():
         assert record["tokens_out"] == 200
         assert record["tokens_total"] == 1200
         assert isinstance(record["latency_ms"], int)
-        assert record["cost_usd"] == round(
-            (1000 * 0.50 + 200 * 1.50) / 1_000_000, 6)
+        assert record["cost_usd"] is None
+        assert record["cost_status"] == "unknown"
         assert record["model_requested"] == mc.MODEL_ID
         assert record["model_responded"] == mc.MODEL_ID
         assert record["enforcement"] == "json_schema"
@@ -443,7 +691,25 @@ def test_outcome_and_error_fields_in_the_api_log():
     assert records[0]["raw_attempts"] == ["move unit 10 one tile north"]
     assert records[1]["outcome"] == "transport_error"
     assert records[1]["error"] is not None
-    assert records[1]["tokens_in"] == 0
+    assert records[1]["tokens_in"] is None
+
+
+def test_capacity_exception_is_promoted_to_turn_api_log_without_repair():
+    records = []
+    client, _ = make_client([mc.ProviderCapacityError("capacity")])
+    adapter = MistralTurnClient(client, api_log=records.append)
+
+    with pytest.raises(mc.ProviderCapacityError):
+        adapter.complete_turn(turn_prompt())
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["outcome"] == "provider_capacity"
+    assert record["error_kind"] == "provider_capacity"
+    assert record["http_status"] == 429
+    assert record["provider_type"] == "backend_out_of_capacity"
+    assert record["provider_code"] == "3505"
+    assert record["retry_after"] is None
 
 
 def test_no_secret_in_any_serialized_record():
@@ -660,3 +926,459 @@ def test_inverse_divergence_sections_over_initial_but_repair_within_budget(
             refreshed_candidates="TABLE")},
     ]
     _check_repair_conversation_budget(messages)  # must not raise
+
+
+def test_conversation_replays_exact_assistant_chunks_and_execution_report():
+    first = raw(VALID_BATCH)
+    first.content_chunks = [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]},
+        {"type": "text", "text": VALID_BATCH},
+    ]
+    second = raw(VALID_BATCH)
+    transport = MockTransport(outcomes=[first, second])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.batch is not None
+    adapter.commit_turn({"turn": 1, "execution": [{"outcome": "verified"}]})
+    adapter.complete_turn(turn_prompt(turn_id="run/t2", call_id="run/t2/call1"))
+    sent = transport.calls[1]["messages"]
+    assert sent[0] == transport.calls[0]["messages"][0]
+    assert sent[1] == transport.calls[0]["messages"][1]
+    assert sent[2]["role"] == "assistant"
+    assert sent[2]["content"] == first.content_chunks
+    assert sent[3]["role"] == "user"
+    assert sent[3]["content"].startswith("[EXECUTION REPORT]")
+
+
+def test_resumed_manager_cache_generation_is_used_before_first_request():
+    """A restored post-compaction epoch must select its key immediately."""
+    first = raw(VALID_BATCH)
+    transport = MockTransport(outcomes=[first])
+    client = mc.MistralClient(api_key=CANARY, transport=transport,
+                              prompt_cache_key="run:epoch-0")
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()},
+        prompt_cache_key="run:epoch-0:epoch-2")
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+
+    adapter.complete_turn(turn_prompt())
+
+    assert transport.calls[0]["prompt_cache_key"] == "run:epoch-0:epoch-2"
+    assert client.prompt_cache_key == "run:epoch-0:epoch-2"
+
+
+def test_conversation_preserves_fallback_execution_without_assistant_message():
+    """A transport-only turn still leaves an honest engine report for the next turn."""
+    client, transport = make_client([mc.TransportError("offline"), raw(VALID_BATCH)])
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.batch is None
+    adapter.commit_turn({"turn": 1, "execution": [{"outcome": "fallback"}]})
+    adapter.complete_turn(turn_prompt(turn_id="run/t2", call_id="run/t2/call1"))
+    sent = transport.calls[1]["messages"]
+    assert not any(message.get("role") == "assistant" for message in sent[2:])
+    assert any(("[EXECUTION REPORT]" in str(message.get("content"))
+                or "[ENGINE-ONLY REPORT]" in str(message.get("content")))
+               for message in sent if message.get("role") == "user")
+
+
+def test_compaction_and_replay_share_one_monotonic_turn_budget():
+    """Compaction must leave only its remaining deadline for the replay call."""
+    now = [0.0]
+    transport = MockTransport(outcomes=[raw(VALID_BATCH), raw(VALID_BATCH)])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    adapter = MistralTurnClient(client, clock=lambda: now[0])
+    adapter.complete_turn(turn_prompt(budget_s=20.0))
+    adapter._turn_deadline = 20.0
+    adapter._compaction_used = True
+    now[0] = 8.0
+    adapter._attempt(adapter._turn_messages, turn_prompt(budget_s=20.0),
+                     attempt=1, kind="initial")
+    assert transport.calls[1]["timeout_ms"] == 7_000
+
+
+def test_conversation_repair_uses_calibrated_provider_prompt_tokens():
+    transport = MockTransport(outcomes=[raw(MALFORMED_BATCH)])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    adapter.complete_turn(turn_prompt())
+    # The calibrated repair envelope is now the documented 1M context with
+    # 64k headroom; this remains an oversize request near that boundary.
+    manager.record_usage(935_000,
+                         request_hash=turn_client_module._prompt_hash(
+                             adapter._turn_messages))
+    base = turn_prompt()
+    with pytest.raises(PromptBudgetExceeded, match="calibrated"):
+        adapter.complete_repair(RepairPrompt(
+            call_id=base.call_id, turn_id=base.turn_id, memory=base.memory,
+            snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+            budget_s=base.budget_s, error_class="schema_error",
+            refreshed_candidates="candidate table"))
+
+
+def test_conversation_repair_uses_provider_completion_without_overestimating_suffix():
+    transport = MockTransport(outcomes=[raw(MALFORMED_BATCH), raw(VALID_BATCH)])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    base = turn_prompt()
+    adapter.complete_turn(base)
+    manager.record_usage(311_027, estimated_tokens=1_000,
+                         message_count=len(manager.messages),
+                         completion_tokens=40_317)
+    repaired = adapter.complete_repair(RepairPrompt(
+        call_id=base.call_id, turn_id=base.turn_id, memory=base.memory,
+        snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+        budget_s=base.budget_s, error_class="schema_error",
+        refreshed_candidates="candidate table"))
+    assert repaired.batch is not None
+    assert len(transport.calls) == 2
+
+
+def test_repair_calibration_hash_mismatch_falls_back_to_raw_estimate():
+    transport = MockTransport(outcomes=[raw(MALFORMED_BATCH), raw(VALID_BATCH)])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    base = turn_prompt()
+    adapter.complete_turn(base)
+    manager.record_usage(935_000, request_hash="sha256:stale")
+    repaired = adapter.complete_repair(RepairPrompt(
+        call_id=base.call_id, turn_id=base.turn_id, memory=base.memory,
+        snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+        budget_s=base.budget_s, error_class="schema_error",
+        refreshed_candidates="candidate table"))
+    assert repaired.batch is not None
+    assert len(transport.calls) == 2
+
+
+def test_conversation_repair_commits_one_failed_assistant_then_repair_pair():
+    bad = raw(MALFORMED_BATCH)
+    bad.content_chunks = [{"type": "text", "text": MALFORMED_BATCH}]
+    good = raw(VALID_BATCH)
+    transport = MockTransport(outcomes=[bad, good])
+    client = mc.MistralClient(api_key=CANARY, transport=transport)
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                conversation_manager=manager)
+    base = turn_prompt()
+    first = adapter.complete_turn(base)
+    assert first.batch is None
+    repaired = adapter.complete_repair(RepairPrompt(
+        call_id=base.call_id, turn_id=base.turn_id, memory=base.memory,
+        snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+        budget_s=base.budget_s, error_class="schema_error",
+        refreshed_candidates=base.candidates))
+    assert repaired.batch is not None
+    adapter.commit_turn({"turn": 1, "status": "completed"})
+    roles = [message["role"] for message in manager.messages[1:]]
+    assert roles == ["user", "assistant", "user", "assistant", "user"]
+    assert manager.messages[2]["content"] == bad.content_chunks
+
+
+# ---------------------------------------------------------------------------
+# Optional model-initiated ruleset lookup protocol
+# ---------------------------------------------------------------------------
+
+def _tool_raw(*, query="warrior", call_id="call-1"):
+    calls = [{"id": call_id, "type": "function", "function": {
+        "name": "lookup_freeciv",
+        "arguments": json.dumps({"query": query, "limit": 3}),
+    }}]
+    assistant = {"role": "assistant", "content": None, "tool_calls": calls}
+    return raw("", reasoning_text="Need the unit rules first", content_chunks=[],
+                tool_calls=calls, assistant_message=assistant)
+
+
+def test_lookup_direct_response_keeps_single_legacy_call():
+    client, transport = make_client([raw(VALID_BATCH)])
+    adapter = MistralTurnClient(
+        client, ruleset_lookup=lambda request: {"never": "called"},
+        enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.batch is not None
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["tools"] is not None
+    assert transport.calls[0]["tool_choice"] == "auto"
+    assert transport.calls[0]["parallel_tool_calls"] is False
+    # The adapter omits response_format on the tool request; transport owns
+    # translating that tool-mode request to an unstructured API call.
+
+
+def test_set_ruleset_lookup_only_enables_interactive_gameplay_profile():
+    client, transport = make_client([raw(VALID_BATCH), raw(VALID_BATCH)])
+    adapter = MistralTurnClient(client)
+    adapter.set_ruleset_lookup(lambda request: {"entries": []})
+    adapter.complete_turn(turn_prompt())
+    assert transport.calls[0]["tools"] is None
+
+    client, transport = make_client([raw(VALID_BATCH)])
+    adapter = MistralTurnClient(client, context_policy="conversation_v1",
+                                prompt_profile="gameplay_v2")
+    adapter.set_ruleset_lookup(lambda request: {"entries": []})
+    adapter.complete_turn(turn_prompt())
+    assert transport.calls[0]["tools"][0]["function"]["name"] == "lookup_freeciv"
+
+
+def test_lookup_appends_matching_tool_message_and_strict_final_request():
+    client, transport = make_client([_tool_raw(), raw(VALID_BATCH)])
+    looked_up = []
+    adapter = MistralTurnClient(
+        client, ruleset_lookup=lambda request: looked_up.append(request) or {
+            "entries": [{"name": "Warrior", "attack": 1}]},
+        enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.batch is not None
+    assert looked_up == [{"ok": True, "query": "warrior", "categories": [],
+                          "limit": 3}]
+    assert len(transport.calls) == 2
+    first, final = transport.calls
+    assert first["tools"][0]["function"]["name"] == "lookup_freeciv"
+    assert final["tools"] is None
+    assert final["response_format"]["type"] == "json_schema"
+    assistant_tool = next(message for message in final["messages"]
+                          if message.get("tool_calls"))
+    tool_result = next(message for message in final["messages"]
+                       if message.get("role") == "tool")
+    assert assistant_tool["tool_calls"][0]["id"] == "call-1"
+    assert tool_result["tool_call_id"] == "call-1"
+    assert '"attack":1' in tool_result["content"]
+    assert "LOOKUP COMPLETE" in tool_result["content"]
+
+
+def test_lookup_tool_final_normalizes_streamed_assistant_chunks_to_api_valid_content():
+    """Provider thinking/text chunks must not be replayed as assistant content."""
+    calls = [{"id": "chunk-call", "type": "function", "function": {
+        "name": "lookup_freeciv",
+        "arguments": json.dumps({"query": "warrior", "limit": 3}),
+    }}]
+    first = raw("", reasoning_text="think", content_chunks=[
+        {"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]},
+        {"type": "text", "text": ""},
+    ], tool_calls=calls, assistant_message={
+        "role": "assistant", "content": [
+            {"type": "thinking", "thinking": [{"type": "text", "text": "plan"}]},
+            {"type": "text"},
+        ], "tool_calls": calls,
+    })
+    client, transport = make_client([first, raw(VALID_BATCH)])
+    adapter = MistralTurnClient(
+        client, ruleset_lookup=lambda request: {"entries": [{"name": "Warrior"}]},
+        enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.batch is not None
+    final = transport.calls[1]
+    assistant = next(message for message in final["messages"]
+                     if message.get("tool_calls"))
+    assert isinstance(assistant["content"], str)
+    assert assistant["content"] == ""
+    assert assistant["tool_calls"] == calls
+    assert first.content_chunks[0]["type"] == "thinking"
+    assert first.reasoning_text == "think"
+
+
+def test_lookup_invalid_arguments_are_returned_to_model_without_hallucinating():
+    bad_call = [{"id": "bad", "type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": "not json"}}]
+    client, transport = make_client([
+        raw("", tool_calls=bad_call,
+            assistant_message={"role": "assistant", "content": None,
+                               "tool_calls": bad_call}),
+        raw(VALID_BATCH),
+    ])
+    invoked = []
+    adapter = MistralTurnClient(
+        client, ruleset_lookup=lambda request: invoked.append(request),
+        enable_ruleset_lookup=True)
+    assert adapter.complete_turn(turn_prompt()).batch is not None
+    assert invoked == []
+    tool_result = next(message["content"] for message in transport.calls[1]["messages"]
+                       if message.get("role") == "tool")
+    assert "invalid lookup arguments" in tool_result
+    assert "entries" not in tool_result
+
+
+def test_lookup_topics_are_capped_and_deadline_prevents_final_request():
+    calls = []
+    tool_calls = [{"id": str(i), "type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": json.dumps({"query": str(i)})}}
+        for i in range(16)]
+    client, transport = make_client([raw("", tool_calls=tool_calls,
+        assistant_message={"role": "assistant", "content": None,
+                           "tool_calls": tool_calls})])
+    now = [0.0]
+    def lookup(request):
+        calls.append(request)
+        now[0] = 10.0
+        return {"ok": True}
+    adapter = MistralTurnClient(client, clock=lambda: now[0],
+                                ruleset_lookup=lookup,
+                                enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt(budget_s=10.0))
+    assert response.error is not None
+    assert len(calls) == 1
+    assert len(transport.calls) == 1
+
+
+def test_lookup_excess_tool_calls_get_matching_cap_errors():
+    tool_calls = [{"id": str(i), "type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": json.dumps({"query": str(i)})}}
+        for i in range(6)]
+    client, transport = make_client([
+        raw("", tool_calls=tool_calls,
+            assistant_message={"role": "assistant", "content": None,
+                               "tool_calls": tool_calls}),
+        raw(VALID_BATCH),
+    ])
+    invoked = []
+    adapter = MistralTurnClient(
+        client, ruleset_lookup=lambda request: invoked.append(request) or {
+            "entries": []}, enable_ruleset_lookup=True)
+    assert adapter.complete_turn(turn_prompt()).batch is not None
+    assert len(invoked) == 3
+    tool_messages = [message for message in transport.calls[1]["messages"]
+                     if message.get("role") == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == [str(i)
+                                                                        for i in range(6)]
+    assert all("lookup limit reached" in message["content"]
+               for message in tool_messages[3:])
+
+
+def test_lookup_more_than_safe_tool_messages_fails_closed_without_orphans():
+    tool_calls = [{"id": str(i), "type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": json.dumps({"query": str(i)})}}
+        for i in range(17)]
+    client, transport = make_client([raw("", tool_calls=tool_calls,
+        assistant_message={"role": "assistant", "content": None,
+                           "tool_calls": tool_calls})])
+    adapter = MistralTurnClient(client, ruleset_lookup=lambda request: {},
+                                enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.error is not None
+    assert "safe tool-call limit" in response.error
+    assert len(transport.calls) == 1
+
+
+def test_lookup_missing_tool_call_id_fails_closed():
+    calls = [{"type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": '{"query":"road"}'}}]
+    client, transport = make_client([raw("", tool_calls=calls,
+        assistant_message={"role": "assistant", "content": None,
+                           "tool_calls": calls})])
+    adapter = MistralTurnClient(client, ruleset_lookup=lambda request: {},
+                                enable_ruleset_lookup=True)
+    response = adapter.complete_turn(turn_prompt())
+    assert response.error is not None
+    assert "valid id" in response.error
+    assert len(transport.calls) == 1
+
+
+def test_lookup_unknown_category_is_actionable_and_does_not_widen_search():
+    calls = [{"id": "cat", "type": "function", "function": {
+        "name": "lookup_freeciv", "arguments": json.dumps({
+            "query": "road", "categories": ["not-a-category"]})}}]
+    client, transport = make_client([
+        raw("", tool_calls=calls,
+            assistant_message={"role": "assistant", "content": None,
+                               "tool_calls": calls}),
+        raw(VALID_BATCH),
+    ])
+    invoked = []
+    adapter = MistralTurnClient(client,
+                                ruleset_lookup=lambda request: invoked.append(request),
+                                enable_ruleset_lookup=True)
+    assert adapter.complete_turn(turn_prompt()).batch is not None
+    assert invoked == []
+    tool = next(message for message in transport.calls[1]["messages"]
+                if message.get("role") == "tool")
+    assert "unknown alias" in tool["content"]
+
+
+def test_lookup_conversation_commits_assistant_tool_and_tool_result_exactly():
+    client, transport = make_client([_tool_raw(), raw(VALID_BATCH)])
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(
+        client, context_policy="conversation_v1", conversation_manager=manager,
+        ruleset_lookup=lambda request: {"entries": [request["query"]]},
+        enable_ruleset_lookup=True)
+    adapter.complete_turn(turn_prompt())
+    adapter.commit_turn({"turn": 1, "status": "completed"})
+    roles = [message["role"] for message in manager.messages[1:]]
+    assert roles == ["user", "assistant", "tool", "assistant", "user"]
+    assert manager.messages[2]["tool_calls"][0]["id"] == "call-1"
+    assert manager.messages[3]["tool_call_id"] == "call-1"
+
+
+def test_lookup_tool_final_repair_preserves_lookup_exchange_in_request_and_commit():
+    client, transport = make_client([_tool_raw(), raw(MALFORMED_BATCH),
+                                     raw(VALID_BATCH)])
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(
+        client, context_policy="conversation_v1", conversation_manager=manager,
+        ruleset_lookup=lambda request: {"entries": [request["query"]]},
+        enable_ruleset_lookup=True)
+    base = turn_prompt()
+    first = adapter.complete_turn(base)
+    assert first.malformed is not None
+    repaired = adapter.complete_repair(RepairPrompt(
+        call_id="run/t1/call3", turn_id="run/t1", memory=base.memory,
+        snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+        budget_s=50.0, error_class="schema_error",
+        failed_refs=["move unit 10 one tile north"],
+        refreshed_candidates=base.candidates))
+    assert repaired.batch is not None
+    repair_messages = transport.calls[2]["messages"]
+    assistant_index = next(i for i, message in enumerate(repair_messages)
+                           if message.get("tool_calls"))
+    assert repair_messages[assistant_index]["tool_calls"][0]["id"] == "call-1"
+    assert repair_messages[assistant_index + 1]["role"] == "tool"
+    assert repair_messages[assistant_index + 2]["role"] == "assistant"
+    failed_index = next(i for i, message in enumerate(repair_messages)
+                        if message.get("content") == MALFORMED_BATCH)
+    assert repair_messages[failed_index]["role"] == "assistant"
+    assert repair_messages[failed_index + 1]["role"] == "user"
+    assert repair_messages[-1]["role"] == "user"
+    adapter.commit_turn({"turn": 1, "status": "completed"})
+    roles = [message["role"] for message in manager.messages[1:]]
+    assert roles == ["user", "assistant", "tool", "assistant", "user",
+                     "assistant", "user"]
+
+
+def test_failed_lookup_repair_aborts_incomplete_tool_transaction_cleanly():
+    client, transport = make_client([_tool_raw(), raw(MALFORMED_BATCH),
+                                     mc.TransportError("repair timeout")])
+    manager = ConversationManager(
+        system_message={"role": "system", "content": prompts.system_prompt()})
+    adapter = MistralTurnClient(
+        client, context_policy="conversation_v1", conversation_manager=manager,
+        ruleset_lookup=lambda request: {"entries": []},
+        enable_ruleset_lookup=True)
+    base = turn_prompt()
+    adapter.complete_turn(base)
+    failed = adapter.complete_repair(RepairPrompt(
+        call_id="run/t1/call3", turn_id=base.turn_id, memory=base.memory,
+        snapshot=base.snapshot, delta=base.delta, candidates=base.candidates,
+        budget_s=50.0, error_class="schema_error"))
+    assert failed.error is not None
+    # Must not raise ConversationError or commit an orphaned role=tool.
+    adapter.commit_turn({"turn": 1, "status": "degraded"})
+    assert manager.messages[-1]["role"] == "user"
+    assert "degraded" in manager.messages[-1]["content"]

@@ -1,0 +1,5 @@
+HYBRID CONTEXT (stable): the HISTORY section is historical decision data,
+not current game state. It may contain intentions that failed or became
+stale. Treat the current SNAPSHOT, DELTA, and CANDIDATE TABLE as the sole
+authority for what is visible and legal now. Fold durable lessons into the
+existing memory_update when useful; do not copy the history verbatim.

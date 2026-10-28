@@ -1,0 +1,1081 @@
+{
+  "description": "Descriptive run comparison; no causal or ranking claim is made.",
+  "flags": [
+    "different profile/settings are present",
+    "night-v3-3opp-20261031b: API records lack checksums",
+    "night-v4-mid-20261031o: API records lack checksums",
+    "one or more runs declare a fork/parent lineage"
+  ],
+  "runs": [
+    {
+      "aggregate": {
+        "actions": {
+          "executed": 25,
+          "rejected": 2
+        },
+        "final_state": {
+          "cities": [
+            {
+              "id": 123,
+              "name": "Banjul",
+              "production": "Settlers",
+              "size": 2
+            },
+            {
+              "id": 128,
+              "name": "Brikama",
+              "production": "Warriors",
+              "size": 1
+            }
+          ],
+          "cities_own": 2,
+          "compaction_epoch": 0,
+          "gold": 56,
+          "production": [
+            "Settlers",
+            "Warriors"
+          ],
+          "research_target": "Ceremonial Burial",
+          "research_turns_left": 2,
+          "score": 3,
+          "techs_researched": 1,
+          "units_own": 7
+        },
+        "provider": {
+          "cached_tokens": 537932,
+          "calls": 9,
+          "input_tokens": 624960,
+          "latency_ms": 340054,
+          "output_tokens": 25512
+        },
+        "state_available": true
+      },
+      "compaction_epochs": [
+        0
+      ],
+      "integrity": {
+        "api_calls": {
+          "checksum_invalid": 0,
+          "checksum_unavailable": 21,
+          "parse_invalid": 0,
+          "present": true,
+          "seq_invalid": false,
+          "valid": true
+        },
+        "fully_verified": false,
+        "recovery": {
+          "epoch": 0,
+          "error": null,
+          "parent_run_id": null,
+          "present": true,
+          "state_wal_relationship": "not_proven",
+          "turn": 19,
+          "valid": true,
+          "wal_present": true,
+          "wal_source": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v3-3opp-20261031b/conversation.jsonl",
+          "wal_valid": true
+        },
+        "snapshots": {
+          "checksum_invalid": 0,
+          "conflicts": [],
+          "current_state_available": true,
+          "duplicate_turns": [],
+          "epochs": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "files": 20,
+          "invalid_files": 0,
+          "source": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v3-3opp-20261031b/state.json",
+          "state_available": true,
+          "unsafe_paths": [],
+          "valid_files": 20
+        },
+        "transcript": {
+          "checksum_invalid": 0,
+          "checksum_unavailable": 0,
+          "parse_invalid": 0,
+          "present": true,
+          "seq_invalid": false,
+          "valid": true
+        },
+        "verification_note": "not fully verified: state/WAL binding is not proven or an allowed checksum is unavailable"
+      },
+      "outcome": null,
+      "run": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v3-3opp-20261031b",
+      "settings": {
+        "acting_deadline_s": 1200.0,
+        "aifill": 4,
+        "api_timeout_s": 900.0,
+        "configured_ai_opponents": 3,
+        "context_policy": "conversation_v1",
+        "conversation_compaction_limit_tokens": 500000,
+        "conversation_tail_target_tokens": 100000,
+        "parent_run_id": null,
+        "pingtimeout": 1260,
+        "prompt_profile": "gameplay_v3",
+        "ruleset": "classic",
+        "run_id": "night-v3-3opp-20261031b",
+        "seeds": {
+          "agentseed": 20261031,
+          "gameseed": 20261031,
+          "mapseed": 20261031
+        },
+        "self_play": false,
+        "timeout": 0,
+        "victories": "SPACERACE|ALLIED (CivRealm default)"
+      },
+      "turns": [
+        {
+          "actions": {
+            "executed": 5
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 24556,
+            "calls": 1,
+            "input_tokens": 34895,
+            "latency_ms": 65067,
+            "output_tokens": 5845
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 1,
+            "compaction_epoch": 0,
+            "gold": 53,
+            "production": [
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 25,
+            "score": 1,
+            "techs_researched": 1,
+            "units_own": 4
+          },
+          "state_available": true,
+          "turn": 5
+        },
+        {
+          "actions": {
+            "executed": 2
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 34284,
+            "calls": 1,
+            "input_tokens": 46072,
+            "latency_ms": 30501,
+            "output_tokens": 2433
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 1
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 54,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 12,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 3
+          },
+          "state_available": true,
+          "turn": 6
+        },
+        {
+          "actions": {
+            "executed": 1
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 45548,
+            "calls": 1,
+            "input_tokens": 53604,
+            "latency_ms": 28145,
+            "output_tokens": 1891
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 1
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 55,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 11,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 3
+          },
+          "state_available": true,
+          "turn": 7
+        },
+        {
+          "actions": {
+            "executed": 2
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 52716,
+            "calls": 1,
+            "input_tokens": 60464,
+            "latency_ms": 22156,
+            "output_tokens": 1373
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 1
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 56,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 10,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 3
+          },
+          "state_available": true,
+          "turn": 8
+        },
+        {
+          "actions": {
+            "executed": 3
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 59884,
+            "calls": 1,
+            "input_tokens": 67316,
+            "latency_ms": 35451,
+            "output_tokens": 2073
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 2
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 56,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 6,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 4
+          },
+          "state_available": true,
+          "turn": 9
+        },
+        {
+          "actions": {
+            "executed": 3,
+            "rejected": 1,
+            "rejections_by_class": {
+              "state_fog_error": 1
+            }
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 66540,
+            "calls": 1,
+            "input_tokens": 75397,
+            "latency_ms": 36783,
+            "output_tokens": 3088
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 2
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 52,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 5,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 5
+          },
+          "state_available": true,
+          "turn": 10
+        },
+        {
+          "actions": {
+            "executed": 5,
+            "rejected": 1,
+            "rejections_by_class": {
+              "state_fog_error": 1
+            }
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 74732,
+            "calls": 1,
+            "input_tokens": 84831,
+            "latency_ms": 61246,
+            "output_tokens": 5027
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Warriors",
+                "size": 2
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 54,
+            "production": [
+              "Warriors",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 4,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 6
+          },
+          "state_available": true,
+          "turn": 11
+        },
+        {
+          "actions": {
+            "executed": 3
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 83948,
+            "calls": 1,
+            "input_tokens": 96677,
+            "latency_ms": 40355,
+            "output_tokens": 2422
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Settlers",
+                "size": 2
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 54,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 3,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 7
+          },
+          "state_available": true,
+          "turn": 12
+        },
+        {
+          "actions": {
+            "executed": 1
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 95724,
+            "calls": 1,
+            "input_tokens": 105704,
+            "latency_ms": 20350,
+            "output_tokens": 1360
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 123,
+                "name": "Banjul",
+                "production": "Settlers",
+                "size": 2
+              },
+              {
+                "id": 128,
+                "name": "Brikama",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 56,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 2,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 7
+          },
+          "state_available": true,
+          "turn": 13
+        }
+      ]
+    },
+    {
+      "aggregate": {
+        "actions": {
+          "executed": 44,
+          "rejected": 3
+        },
+        "final_state": {
+          "cities": [
+            {
+              "id": 121,
+              "name": "Mistissini",
+              "production": "Settlers",
+              "size": 1
+            },
+            {
+              "id": 127,
+              "name": "Chisasibi",
+              "production": "Warriors",
+              "size": 2
+            }
+          ],
+          "cities_own": 2,
+          "compaction_epoch": 0,
+          "gold": 8,
+          "production": [
+            "Settlers",
+            "Warriors"
+          ],
+          "research_target": "Ceremonial Burial",
+          "research_turns_left": 2,
+          "score": 3,
+          "techs_researched": 1,
+          "units_own": 6
+        },
+        "provider": {
+          "cached_tokens": 697184,
+          "calls": 9,
+          "input_tokens": 912698,
+          "latency_ms": 746667,
+          "output_tokens": 38810
+        },
+        "state_available": true
+      },
+      "compaction_epochs": [
+        0
+      ],
+      "integrity": {
+        "api_calls": {
+          "checksum_invalid": 0,
+          "checksum_unavailable": 20,
+          "parse_invalid": 0,
+          "present": true,
+          "seq_invalid": false,
+          "valid": true
+        },
+        "fully_verified": false,
+        "recovery": {
+          "epoch": 0,
+          "error": null,
+          "parent_run_id": "night-v4-smoke-20261031n",
+          "present": true,
+          "state_wal_relationship": "not_proven",
+          "turn": 24,
+          "valid": true,
+          "wal_present": true,
+          "wal_source": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v4-mid-20261031o/conversation.jsonl",
+          "wal_valid": true
+        },
+        "snapshots": {
+          "checksum_invalid": 0,
+          "conflicts": [],
+          "current_state_available": true,
+          "duplicate_turns": [],
+          "epochs": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "files": 21,
+          "invalid_files": 0,
+          "source": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v4-mid-20261031o/state.json",
+          "state_available": true,
+          "unsafe_paths": [],
+          "valid_files": 21
+        },
+        "transcript": {
+          "checksum_invalid": 0,
+          "checksum_unavailable": 0,
+          "parse_invalid": 0,
+          "present": true,
+          "seq_invalid": false,
+          "valid": true
+        },
+        "verification_note": "not fully verified: state/WAL binding is not proven or an allowed checksum is unavailable"
+      },
+      "outcome": null,
+      "run": "/home/pav/code/lechonkgameharness/artifacts/runs/night-v4-mid-20261031o",
+      "settings": {
+        "acting_deadline_s": 1200.0,
+        "aifill": 4,
+        "api_timeout_s": 900.0,
+        "configured_ai_opponents": 3,
+        "context_policy": "conversation_v1",
+        "conversation_compaction_limit_tokens": 500000,
+        "conversation_tail_target_tokens": 100000,
+        "parent_run_id": null,
+        "pingtimeout": 1260,
+        "prompt_profile": "gameplay_v4",
+        "ruleset": "classic",
+        "run_id": "night-v4-mid-20261031o",
+        "seeds": {
+          "agentseed": 20261031,
+          "gameseed": 20261031,
+          "mapseed": 20261031
+        },
+        "self_play": false,
+        "timeout": 0,
+        "victories": "SPACERACE|ALLIED (CivRealm default)"
+      },
+      "turns": [
+        {
+          "actions": {
+            "executed": 3,
+            "rejected": 1,
+            "rejections_by_class": {
+              "state_fog_error": 1
+            }
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 0,
+            "calls": 1,
+            "input_tokens": 59342,
+            "latency_ms": 80723,
+            "output_tokens": 5599
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 48,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 11,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 4
+          },
+          "state_available": true,
+          "turn": 5
+        },
+        {
+          "actions": {
+            "executed": 3,
+            "rejected": 1,
+            "rejections_by_class": {
+              "state_fog_error": 1
+            }
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 58348,
+            "calls": 1,
+            "input_tokens": 71013,
+            "latency_ms": 90243,
+            "output_tokens": 3306
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 50,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 10,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 4
+          },
+          "state_available": true,
+          "turn": 6
+        },
+        {
+          "actions": {
+            "executed": 5
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 70124,
+            "calls": 1,
+            "input_tokens": 80387,
+            "latency_ms": 122478,
+            "output_tokens": 6105
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 52,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 9,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 4
+          },
+          "state_available": true,
+          "turn": 7
+        },
+        {
+          "actions": {
+            "executed": 5
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 53228,
+            "calls": 1,
+            "input_tokens": 93086,
+            "latency_ms": 60564,
+            "output_tokens": 2926
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 41,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 8,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 5
+          },
+          "state_available": true,
+          "turn": 8
+        },
+        {
+          "actions": {
+            "executed": 5
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 92140,
+            "calls": 1,
+            "input_tokens": 102618,
+            "latency_ms": 36211,
+            "output_tokens": 2062
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 43,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 7,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 5
+          },
+          "state_available": true,
+          "turn": 9
+        },
+        {
+          "actions": {
+            "executed": 5
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 101868,
+            "calls": 1,
+            "input_tokens": 111220,
+            "latency_ms": 20307,
+            "output_tokens": 1286
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 45,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 6,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 5
+          },
+          "state_available": true,
+          "turn": 10
+        },
+        {
+          "actions": {
+            "executed": 6
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 79852,
+            "calls": 1,
+            "input_tokens": 119097,
+            "latency_ms": 168663,
+            "output_tokens": 5450
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 2
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 48,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 3,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 5
+          },
+          "state_available": true,
+          "turn": 11
+        },
+        {
+          "actions": {
+            "executed": 6
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 110572,
+            "calls": 1,
+            "input_tokens": 131625,
+            "latency_ms": 72576,
+            "output_tokens": 5593
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 1
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 6,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 4,
+            "score": 2,
+            "techs_researched": 1,
+            "units_own": 6
+          },
+          "state_available": true,
+          "turn": 12
+        },
+        {
+          "actions": {
+            "executed": 6,
+            "rejected": 1,
+            "rejections_by_class": {
+              "state_fog_error": 1
+            }
+          },
+          "compaction_epoch": 0,
+          "provider": {
+            "cached_tokens": 131052,
+            "calls": 1,
+            "input_tokens": 144310,
+            "latency_ms": 94902,
+            "output_tokens": 6483
+          },
+          "state": {
+            "cities": [
+              {
+                "id": 121,
+                "name": "Mistissini",
+                "production": "Settlers",
+                "size": 1
+              },
+              {
+                "id": 127,
+                "name": "Chisasibi",
+                "production": "Warriors",
+                "size": 2
+              }
+            ],
+            "cities_own": 2,
+            "compaction_epoch": 0,
+            "gold": 8,
+            "production": [
+              "Settlers",
+              "Warriors"
+            ],
+            "research_target": "Ceremonial Burial",
+            "research_turns_left": 2,
+            "score": 3,
+            "techs_researched": 1,
+            "units_own": 6
+          },
+          "state_available": true,
+          "turn": 13
+        }
+      ]
+    }
+  ],
+  "turn_range": {
+    "end": 13,
+    "start": 5
+  }
+}

@@ -12,6 +12,7 @@ from lechonk.adapter.obs_extract import (
     ACTION_ATTACK,
     ExtractOutcome,
     MAX_PRODUCTION_CANDIDATES,
+    _apply_token_budget,
     RulesetNames,
     extract_snapshot,
 )
@@ -295,6 +296,54 @@ def test_token_budget_elision_order_is_deterministic():
 def test_default_budget_is_8000():
     snap = _extract(base_world()).snapshot
     assert snap.estimated_tokens() <= SNAPSHOT_TOKEN_BUDGET
+
+
+def test_protected_units_can_drop_low_priority_region_notes():
+    """Protected units remain visible when aggregate prose must be dropped."""
+    snap = _extract(_crowded_world(n_idle=0), token_budget=10**9).snapshot
+    protected_ids = {
+        u.id for u in snap.units if (not u.is_own) or u.in_contact
+    }
+    # Remove the one own idle unit from this synthetic protected-only case;
+    # the remaining units are exactly the foreign/contact units the policy
+    # must never elide.
+    snap.units = [u for u in snap.units if u.id in protected_ids]
+    snap.map_view.region_notes.extend(["aggregate region prose " * 20] * 80)
+
+    _apply_token_budget(snap, SNAPSHOT_TOKEN_BUDGET)
+
+    assert snap.estimated_tokens() <= SNAPSHOT_TOKEN_BUDGET
+    assert {u.id for u in snap.units} == protected_ids
+    assert "region note" in snap.omitted.summary
+
+
+def test_disclosure_is_included_in_final_snapshot_budget():
+    """The omission disclosure itself cannot push the final render over cap."""
+    snap = _extract(_crowded_world(n_idle=40), token_budget=10**9).snapshot
+    _apply_token_budget(snap, 2100)
+    assert snap.estimated_tokens() <= 2100
+    assert snap.omitted.summary != "nothing omitted"
+
+
+def test_region_note_disclosure_survives_repeated_budget_passes():
+    snap = _extract(_crowded_world(n_idle=0), token_budget=10**9).snapshot
+    protected_ids = {
+        u.id for u in snap.units if (not u.is_own) or u.in_contact
+    }
+    snap.units = [u for u in snap.units if u.id in protected_ids]
+    snap.map_view.region_notes.extend(["aggregate region prose " * 20] * 80)
+
+    _apply_token_budget(snap, SNAPSHOT_TOKEN_BUDGET)
+    first_count = snap.omitted.region_notes_elided
+    first_summary = snap.omitted.summary
+    _apply_token_budget(snap, SNAPSHOT_TOKEN_BUDGET)
+
+    assert first_count > 0
+    assert snap.omitted.region_notes_elided == first_count
+    assert snap.omitted.summary == first_summary
+    assert "some region summaries elided" in snap.omitted.summary
+    assert snap.estimated_tokens() <= SNAPSHOT_TOKEN_BUDGET
+    assert {u.id for u in snap.units} == protected_ids
 
 
 # ---------------------------------------------------------------------------

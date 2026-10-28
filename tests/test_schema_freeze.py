@@ -197,6 +197,13 @@ def test_illegal_action_taxonomy_inputs_are_schema_covered():
                            cost_usd=0.0, fingerprint="fp",
                            error="timeout")
     assert call.attempt == 2 and call.error == "timeout"
+    unknown = ModelCallRecord(call_id="c3", attempt=1, prompt_hash="ph",
+                              latency_ms=1, tokens_in=None, tokens_out=None,
+                              cost_usd=None, fingerprint="fp",
+                              usage_status="unavailable", cost_status="unknown")
+    assert unknown.tokens_in is None and unknown.cost_usd is None
+    assert unknown.usage_status == "unavailable"
+    assert unknown.cost_status == "unknown"
     # No attempt cap in the schema: the RUNNER enforces ≤2 total API
     # attempts per turn (no third API attempt, §3 line 33).
 

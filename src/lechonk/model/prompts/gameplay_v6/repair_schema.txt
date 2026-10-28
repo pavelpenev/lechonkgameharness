@@ -1,0 +1,14 @@
+Your previous output was rejected as a SCHEMA ERROR: $error_detail
+
+Re-emit exactly one JSON ActionBatch, with no prose or markdown. `turn_id`
+must be a JSON string, never a number; copy the current turn id exactly.
+Required shape: {"turn_id":"run-id/t3","actions":[{"ref":"<candidate id>"}],
+"commitments":array,"finish_requested":true,"notes":string,
+"memory_update":optional object}. Use only exact opaque refs copied from the
+refreshed candidate table, at most 20; never coordinates or invented actions.
+Keep notes <=2 sentences. Omit memory_update when unchanged; if present,
+commitments upsert and threats/notes replace prior values. Do not add fields,
+restate the snapshot, or emit hidden reasoning.
+
+The current candidate table and state below are authoritative:
+$refreshed_candidates

@@ -245,6 +245,10 @@ class OmittedDisclosure(BaseModel):
     production_candidates_capped: bool = False
     messages_elided: int = 0
     map_grid_omitted: bool = False
+    # Aggregate region prose may be dropped after protected units/landmarks
+    # and the ASCII grid.  Keep this count in the snapshot so a second budget
+    # pass preserves truthful disclosure instead of resetting local state.
+    region_notes_elided: int = 0
 
 
 class Snapshot(BaseModel):
@@ -588,6 +592,20 @@ class CandidatesRefRecord(TranscriptRecordBase):
     candidate_count: int
     by_domain: dict[str, int] = Field(default_factory=dict)
     opportunity_domains: list[str] = Field(default_factory=list)
+    # Additive candidate-surface provenance.  Legacy records leave these
+    # unavailable (None) rather than pretending that the old table was
+    # admitted by the versioned surface policy.
+    candidate_surface_policy: str = "legacy_v1"
+    candidate_cap_tokens: Optional[int] = None
+    total_candidate_count: Optional[int] = None
+    offered_candidate_count: Optional[int] = None
+    omitted_candidate_count: Optional[int] = None
+    total_by_domain: dict[str, int] = Field(default_factory=dict)
+    offered_by_domain: dict[str, int] = Field(default_factory=dict)
+    omitted_by_domain: dict[str, int] = Field(default_factory=dict)
+    total_tokens: Optional[int] = None
+    offered_tokens: Optional[int] = None
+    omitted_tokens: Optional[int] = None
 
 
 class ModelCallRecord(TranscriptRecordBase):
@@ -601,9 +619,11 @@ class ModelCallRecord(TranscriptRecordBase):
     attempt: int = 1
     prompt_hash: str
     latency_ms: int
-    tokens_in: int
-    tokens_out: int
-    cost_usd: float
+    tokens_in: Optional[int] = None
+    tokens_out: Optional[int] = None
+    cost_usd: Optional[float] = None
+    usage_status: Optional[Literal["reported", "partial", "unavailable"]] = None
+    cost_status: Optional[Literal["reported", "unknown"]] = None
     fingerprint: str
     error: Optional[str] = None
 

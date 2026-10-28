@@ -1,0 +1,20 @@
+Your previous output was rejected as ILLEGAL-IN-RULE. This repair is invoked
+when validation classifies a submitted ref as illegal before execution; the ref
+was present in the offered table but is not legal under the rule check:
+$failed_refs
+
+$error_detail
+
+Re-emit one complete ActionBatch using only refs currently offered below.
+Earlier actions in the submitted batch may have made dependent actions stale;
+do not repeat a dependent city/unit action in the same batch. If an action
+became invalid after execution, it is reported in the next turn rather than
+repaired here. Pick a legal replacement or omit it; do not infer unseen state.
+Keep the exact schema, at most 20 actions, finish_requested true, and concise
+notes. Update memory_update only for changed durable goals, plans, threats,
+verified outcomes, or lessons; omit the entire field when unchanged so prior
+memory persists. If provided, commitments are upserts, while threats and notes
+replace prior values, so repeat the full current values or they clear. Output
+JSON only.
+
+$refreshed_candidates

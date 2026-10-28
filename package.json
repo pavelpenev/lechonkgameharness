@@ -1,16 +1,16 @@
 {
   "name": "lechonkgameharness",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Freeciv gameplay harness and screenshot capture tooling",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node scripts/capture_presenter.js --self-test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "playwright": "^1.49.0"
+    "playwright": "1.64.1"
   }
 }

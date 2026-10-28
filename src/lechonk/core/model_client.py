@@ -23,7 +23,7 @@ transport level (timeout etc.).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
 from lechonk.core.schemas import ActionBatch
 
@@ -68,6 +68,9 @@ class TurnPrompt:
     snapshot: str
     delta: str
     candidates: str
+    # Optional bounded historical decision journal.  Empty preserves the
+    # legacy prompt byte-for-byte; hybrid interactive runs populate it.
+    history: str = ""
     # The runner's remaining ACTING-phase budget (seconds); the client uses
     # it for its own call timeout — on the repair attempt it is the per-call
     # hard request timeout's base (budget minus REPAIR_TIMEOUT_MARGIN_S).
@@ -83,6 +86,13 @@ class RepairPrompt(TurnPrompt):
     error_class: str = REPAIR_CLASS_UNRESPONSIVE  # one of REPAIR_CLASSES
     failed_refs: list[str] = field(default_factory=list)
     refreshed_candidates: str = ""
+
+
+# A deliberately small, model-facing extension point.  The callable receives
+# one bounded request object and returns JSON-serialisable, read-only reference
+# material.  Keeping this type in core avoids importing the Freeciv adapter in
+# the model protocol.
+RulesetLookup = Callable[[Mapping[str, Any]], Any]
 
 
 @dataclass
@@ -103,9 +113,11 @@ class ModelResponse:
     # Set when the call failed at transport level (timeout, API error).
     error: Optional[str] = None
     latency_ms: int = 0
-    tokens_in: int = 0
-    tokens_out: int = 0
-    cost_usd: float = 0.0
+    tokens_in: Optional[int] = None
+    tokens_out: Optional[int] = None
+    cost_usd: Optional[float] = None
+    usage_status: Optional[str] = None
+    cost_status: Optional[str] = None
     fingerprint: str = ""
 
 

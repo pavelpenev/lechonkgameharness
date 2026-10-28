@@ -352,7 +352,7 @@ def advancing_response(factory: Callable[[], ModelResponse], clock: FakeClock,
 
 
 def make_runner(tmp_path, *, client, session, max_turns=2, clock=None,
-                config_overrides: Optional[dict] = None):
+                config_overrides: Optional[dict] = None, progress=None):
     """Assemble a GameRunner over the fake session + fake client."""
     from lechonk.core.ledger import TranscriptLedger
     from lechonk.core.runner import GameRunner, RunnerConfig
@@ -367,5 +367,5 @@ def make_runner(tmp_path, *, client, session, max_turns=2, clock=None,
     runner = GameRunner(
         config=config, client=client, ledger=ledger,
         manifest=RunManifest(run_id="test-run"),
-        session_factory=lambda: session, clock=clock)
+        session_factory=lambda: session, clock=clock, progress=progress)
     return runner

@@ -957,6 +957,38 @@ def _apply_token_budget(snapshot: Snapshot, budget: int) -> None:
     Foreign units are never elided (visible enemies are policy-salient).
     """
     omitted = snapshot.omitted
+    def refresh_disclosure() -> None:
+        """Render the disclosure before measuring the final snapshot.
+
+        The disclosure is part of ``Snapshot.render()`` and therefore part of
+        the token budget.  Keeping it up to date while eliding avoids the old
+        bug where adding the summary after the final check could push a
+        snapshot over budget.
+        """
+        parts: list[str] = []
+        if omitted.elided_unit_ids:
+            parts.append(f"elided {len(omitted.elided_unit_ids)} own unit(s) "
+                         f"(idle/distant first): {omitted.elided_unit_ids}")
+        if omitted.research_candidates_capped:
+            parts.append("research candidate list capped")
+        if omitted.production_candidates_capped:
+            parts.append("production candidate list capped")
+        if omitted.messages_elided:
+            parts.append(f"elided {omitted.messages_elided} message(s)")
+        if omitted.map_grid_omitted:
+            if omitted.region_notes_elided:
+                parts.append("map grid omitted (some region summaries elided; "
+                             "landmarks retained)")
+            else:
+                parts.append("map grid omitted (region summaries + landmarks retained)")
+        if omitted.region_notes_elided:
+            parts.append(f"elided {omitted.region_notes_elided} low-priority "
+                         "region note(s)")
+        omitted.summary = "; ".join(parts) if parts else "nothing omitted"
+
+    # The disclosure itself consumes budget, even when no truncation has yet
+    # happened.  Establish it before the first measurement.
+    refresh_disclosure()
 
     if snapshot.estimated_tokens() > budget:
         # 1) Elide own units: idle first, then farthest from the capital. Never
@@ -984,47 +1016,59 @@ def _apply_token_budget(snapshot: Snapshot, budget: int) -> None:
             victim = elidable[0]
             snapshot.units.remove(victim)
             omitted.elided_unit_ids.append(victim.id)
+            refresh_disclosure()
 
         # 2) Cap research candidates.
         if snapshot.estimated_tokens() > budget \
                 and len(snapshot.research_candidates) > 6:
             snapshot.research_candidates = snapshot.research_candidates[:6]
             omitted.research_candidates_capped = True
+            refresh_disclosure()
         if snapshot.estimated_tokens() > budget \
                 and len(snapshot.research_candidates) > 3:
             snapshot.research_candidates = snapshot.research_candidates[:3]
             omitted.research_candidates_capped = True
+            refresh_disclosure()
 
         # 3) Cap messages.
         if snapshot.estimated_tokens() > budget and len(snapshot.messages) > 10:
             omitted.messages_elided += len(snapshot.messages) - 10
             snapshot.messages = snapshot.messages[:10]
+            refresh_disclosure()
         if snapshot.estimated_tokens() > budget and len(snapshot.messages) > 5:
             omitted.messages_elided += len(snapshot.messages) - 5
             snapshot.messages = snapshot.messages[:5]
+            refresh_disclosure()
 
         # 4) Drop the ASCII map grid.
         if snapshot.estimated_tokens() > budget \
                 and snapshot.map_view.grid is not None:
             snapshot.map_view.grid = None
             omitted.map_grid_omitted = True
+            refresh_disclosure()
 
-        # 5) Final check: fail loudly rather than ship an over-budget snapshot.
+        # 5) Region summaries are aggregate prose; dropping them is safer
+        # than hiding protected foreign/contact units, landmarks, candidates,
+        # or city/action fields.  Remove the least-specific notes first while
+        # retaining tile_counts and landmarks in MapView.
+        while snapshot.estimated_tokens() > budget \
+                and snapshot.map_view.region_notes:
+            snapshot.map_view.region_notes.pop()
+            omitted.region_notes_elided += 1
+            refresh_disclosure()
+
+        # 6) Final check: fail loudly rather than ship an over-budget snapshot.
         if snapshot.estimated_tokens() > budget:
             raise ValueError(
                 f"snapshot exceeds token budget {budget} even after truncation "
                 f"({snapshot.estimated_tokens()} tokens; protected units remain)")
 
-    # Disclosure summary (§3 line 32) — always computed, also when only the
-    # initial deterministic caps (research/messages) fired.
-    parts = []
-    if omitted.elided_unit_ids:
-        parts.append(f"elided {len(omitted.elided_unit_ids)} own unit(s) "
-                     f"(idle/distant first): {omitted.elided_unit_ids}")
-    if omitted.research_candidates_capped:
-        parts.append("research candidate list capped")
-    if omitted.messages_elided:
-        parts.append(f"elided {omitted.messages_elided} message(s)")
-    if omitted.map_grid_omitted:
-        parts.append("map grid omitted (region summaries + landmarks retained)")
-    omitted.summary = "; ".join(parts) if parts else "nothing omitted"
+    # Keep the final value canonical even when the initial render was already
+    # under budget or only deterministic caps fired.
+    refresh_disclosure()
+    if snapshot.estimated_tokens() > budget:
+        # This can only happen if the disclosure itself exposed an
+        # impossible-to-fit protected surface; never silently ship it.
+        raise ValueError(
+            f"snapshot exceeds token budget {budget} after disclosure "
+            f"({snapshot.estimated_tokens()} tokens)")

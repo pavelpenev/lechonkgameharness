@@ -1,0 +1,33 @@
+Use the current SNAPSHOT and CANDIDATE TABLE as authority. Historical messages,
+old snapshots, compaction, and execution reports cannot override them; DELTA
+only describes the latest transition. Unknown or fogged data is unknown, and
+absence from the offered table means unavailable now, not necessarily changed.
+
+You may call the optional read-only `lookup_freeciv` tool for a small batch of
+encyclopedia/rules searches or named rules entries when an unfamiliar rule
+would affect the decision. Normally no lookup is needed each turn. Limit this
+decision to at most 3 lookups; never ask it for map state, visibility, current
+candidates, or hidden information. Reference text is background only and the
+current snapshot/table remain authoritative. It does not change game state.
+
+Choose at most 20 actions, each exactly {"ref":"<opaque candidate id>"}, copied
+exactly from the table. Order matters; default to one state-changing action per
+actor (no city buy+produce/work or unit move+attack/order chain). Existing
+standing orders may continue automatically; inspect the next snapshot. Use
+conditional priorities: when shown by the snapshot, survival/food/disorder
+and exposed-city defense, defensible expansion, safe scouting, worker food/
+production/roads, legal objective-driven research, favorable-but-uncertain
+attacks, and continuity of sensible production. Never invent costs,
+prerequisites, odds, or abilities.
+
+Return exactly one JSON ActionBatch and no prose. The `turn_id` value must be
+a JSON string, never a number; copy the current turn id exactly (for example,
+`"turn_id":"run-id/t3"`). Set finish_requested true;
+the engine owns phase completion. Notes <=2 sentences. Keep commitments
+falsifiable. Update memory_update when a durable goal, plan, threat, verified
+outcome, or lesson changes; omit the entire field when unchanged so prior
+memory persists. If provided, commitments upsert, while threats and notes
+replace prior values: repeat the full current threats and notes or they clear.
+Do not restate the snapshot or expose hidden reasoning.
+
+Sections: MEMORY, SNAPSHOT, DELTA, CANDIDATE TABLE. Emit the batch now.

@@ -19,6 +19,7 @@ import json
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,7 @@ from lechonk.core.schemas import (
     UnitView,
 )
 from lechonk.model.prompts import PromptBudgetExceeded
+from lechonk.model.mistral_client import ProviderCapacityError
 
 from tests.lifecycle_fixtures import LifecycleSession
 from tests.fog_fixtures import (
@@ -110,6 +112,41 @@ def _actions(records):
 
 def _by_kind(records, cls):
     return [r for r in records if isinstance(r, cls)]
+
+
+def test_provider_capacity_fails_closed_before_repair_or_dispatch(tmp_path):
+    """A backend-capacity 429 truncates at the start checkpoint.
+
+    It must not be converted into a semantic repair or a degraded default
+    action batch, and the durable turn-start record remains the recovery
+    boundary.
+    """
+    class CapacityClient(FakeModelClient):
+        def complete_turn(self, prompt):
+            self.turn_prompts.append(prompt)
+            self.calls += 1
+            raise ProviderCapacityError("backend capacity", retry_after="5")
+
+        def complete_repair(self, prompt):
+            self.repair_prompts.append(prompt)
+            raise AssertionError("capacity failure must not trigger repair")
+
+    session = FakeSession([turn_world(1)], final_terminated=False,
+                          final_truncated=False)
+    client = CapacityClient()
+    runner = make_runner(tmp_path, client=client, session=session, max_turns=1,
+                         config_overrides={"context_policy": "conversation_v1"})
+
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert client.calls == 1
+    assert client.repair_prompts == []
+    assert [action for action, _deadline in session.calls if action is not None] == []
+    records = _records(runner.ledger.path)
+    assert len(_by_kind(records, TurnStartRecord)) == 1
+    assert _actions(records) == []
+    assert "capacity" in result.reason.lower()
 
 
 class _GameOverMidBatchSession(FakeSession):
@@ -208,6 +245,660 @@ def test_runner_happy_path_model_driven_run(tmp_path):
     assert result.metrics.participation.numerator == 2
 
 
+def test_runner_gameplay_profile_renders_typed_commitments(tmp_path):
+    """Gameplay prompts expose typed commitment metadata, while the
+    default/legacy profile remains byte-compatible with an explicit legacy
+    selection."""
+    def typed_response(_prompt):
+        response = ok_response(["unit:10:goto_e"], turn_id="t1",
+                               commitments=[("research", "Alphabet", 5)])
+        for commitment in response.batch.commitments:
+            commitment.target_kind = "tech"
+            commitment.verb = "research"
+        for commitment in response.batch.memory_update.commitments:
+            commitment.target_kind = "tech"
+            commitment.verb = "research"
+        return response
+
+    def run(profile, path):
+        path.mkdir()
+        client = FakeModelClient([typed_response,
+                                  ok_response(["unit:11:sentry"],
+                                              turn_id="t2", with_memory=False)])
+        overrides = {} if profile is None else {"prompt_profile": profile}
+        runner = make_runner(
+            path, client=client,
+            session=FakeSession([turn_world(1), turn_world(2), turn_world(3)]),
+            max_turns=2,
+            config_overrides=overrides)
+        assert runner.run().outcome == "COMPLETED"
+        return client.turn_prompts[1].memory
+
+    legacy_default = run(None, tmp_path / "default")
+    legacy_explicit = run("legacy_eval", tmp_path / "explicit")
+    gameplay = run("gameplay_v1", tmp_path / "gameplay")
+
+    assert legacy_default == legacy_explicit
+    assert "target_kind=" not in legacy_default
+    assert " verb=" not in legacy_default
+    assert "target_kind=tech" in gameplay
+    assert "verb=research" in gameplay
+
+
+def test_runner_installs_bounded_ruleset_lookup_only_for_gameplay_conversation(
+        tmp_path, monkeypatch):
+    """The session reference is exposed as a read-only local tool only for
+    the interactive gameplay conversation profile."""
+    reference = object()
+
+    class LookupSession(FakeSession):
+        ruleset_reference = reference
+
+    class LookupClient(FakeModelClient):
+        def __init__(self, script):
+            super().__init__(script)
+            self.lookup = None
+
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    seen = []
+
+    def fake_render(ref, query, *, categories=None, limit=10, max_chars=8000):
+        seen.append((ref, query, categories, limit, max_chars))
+        return {"status": "ok", "query": query, "entries": [{"name": "road"}]}
+
+    monkeypatch.setattr(
+        "lechonk.adapter.ruleset_reference.render_search", fake_render)
+    worlds = [turn_world(1), turn_world(2)]
+    client = LookupClient([ok_response([], turn_id="t1")])
+    progress = []
+    runner = make_runner(
+        tmp_path, client=client, session=LookupSession(worlds), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"},
+        progress=progress.append)
+    runner.run()
+
+    assert client.lookup is not None
+    result = client.lookup("road", categories=["terrain"], limit=100)
+    assert result["status"] == "ok"
+    assert seen == [(reference, "road", ["terrain"], 8, 4000)]
+    result = client.lookup("road")
+    assert result["status"] == "ok"
+    assert seen[-1] == (reference, "road", None, 8, 4000)
+    assert [event["event"] for event in progress
+            if event["event"].startswith("ruleset_lookup_")] == [
+                "ruleset_lookup_started", "ruleset_lookup_finished",
+                "ruleset_lookup_started", "ruleset_lookup_finished"]
+
+    legacy_client = LookupClient([ok_response([], turn_id="t1")])
+    legacy_path = tmp_path / "legacy"
+    legacy_path.mkdir()
+    runner = make_runner(legacy_path, client=legacy_client,
+                         session=LookupSession(worlds), max_turns=1)
+    runner.run()
+    assert legacy_client.lookup is None
+
+
+def test_runner_installs_ruleset_lookup_for_gameplay_v3(tmp_path):
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client, session=FakeSession([turn_world(1), turn_world(2)]),
+        max_turns=1, config_overrides={
+            "context_policy": "conversation_v1", "prompt_profile": "gameplay_v3",
+            "recovery_config_digest_schema": "interactive-config-v3",
+            "prompt_bundle_id": "gameplay_v3",
+            "candidate_surface_policy": "candidate_surface_v2",
+            "candidate_surface_cap": 8000,
+            "candidate_admission_version": "candidate_surface_v2-r1",
+            "compaction_schema": "conversation-compaction-v1",
+            "prompt_budget_schema": "gameplay-v3-budget-v1"})
+    runner.run()
+    assert callable(client.lookup)
+
+
+def test_runner_installs_ruleset_lookup_for_gameplay_v4(tmp_path):
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client, session=FakeSession([turn_world(1), turn_world(2)]),
+        max_turns=1, config_overrides={
+            "context_policy": "conversation_v1", "prompt_profile": "gameplay_v4",
+            "recovery_config_digest_schema": "interactive-config-v3",
+            "prompt_bundle_id": "gameplay_v4",
+            "candidate_surface_policy": "candidate_surface_v2",
+            "candidate_surface_cap": 8000,
+            "candidate_admission_version": "candidate_surface_v2-r1",
+            "compaction_schema": "conversation-compaction-v1",
+            "prompt_budget_schema": "gameplay-v4-budget-v1"})
+    runner.run()
+    assert callable(client.lookup)
+
+
+def test_runner_ledgers_tool_final_and_repair_as_three_physical_calls(tmp_path):
+    class PhysicalClient(FakeModelClient):
+        def __init__(self):
+            super().__init__([malformed_response(["bad"]),
+                              ok_response([], turn_id="t1")])
+            self.call_records = []
+
+        def complete_turn(self, prompt):
+            response = super().complete_turn(prompt)
+            self.call_records.extend([
+                {"call_id": prompt.call_id, "kind": "initial",
+                 "prompt_hash": "initial", "latency_ms": 1,
+                 "tokens_in": 10, "tokens_out": 10, "cost_usd": 0,
+                 "fingerprint": "fp"},
+                {"call_id": prompt.call_id, "kind": "tool_final",
+                 "prompt_hash": "final", "latency_ms": 2,
+                 "tokens_in": 20, "tokens_out": 10, "cost_usd": 0,
+                 "fingerprint": "fp"},
+            ])
+            return response
+
+        def complete_repair(self, prompt):
+            response = super().complete_repair(prompt)
+            self.call_records.append(
+                {"call_id": prompt.call_id, "kind": "repair",
+                 "prompt_hash": "repair", "latency_ms": 3,
+                 "tokens_in": 30, "tokens_out": 10, "cost_usd": 0,
+                 "fingerprint": "fp"})
+            return response
+
+    client = PhysicalClient()
+    runner = make_runner(
+        tmp_path, client=client,
+        session=FakeSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner.run()
+    records = _by_kind(load_transcript(runner.ledger.path).records,
+                       ModelCallRecord)
+    assert len(records) == 3
+    assert [record.attempt for record in records] == [1, 2, 3]
+
+
+def test_runner_lookup_labels_static_help_non_authoritative(tmp_path, monkeypatch):
+    class LookupSession(FakeSession):
+        ruleset_reference = None
+        ruleset_reference_status = "unavailable: no packet"
+        help_reference = object()
+
+    class LookupClient(FakeModelClient):
+        def __init__(self, script):
+            super().__init__(script)
+            self.lookup = None
+
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    monkeypatch.setattr(
+        "lechonk.adapter.help_reference.render_search",
+        lambda ref, query, *, categories=None, limit=10, max_chars=8000: {
+            "status": "available",
+            "entries": ([] if categories else [{"name": "static road"}]),
+        })
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client,
+        session=LookupSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner.run()
+    result = client.lookup("road")
+    assert result["sources"] == {
+        "active_ruleset": "unavailable", "static_help": "available",
+        "static_classic": "unavailable"}
+    assert result["entries"][0]["authority"] == "static_help_non_authoritative"
+    assert client.lookup("road", categories=["terrain"])["entries"] == []
+
+
+def test_runner_lookup_includes_classic_reference_with_active_precedence(tmp_path):
+    from lechonk.adapter.classic_reference import ClassicEntry, ClassicReference
+
+    class LookupSession(FakeSession):
+        ruleset_reference = None
+        help_reference = None
+        classic_reference = ClassicReference(entries=(
+            ClassicEntry("unit_archer", "Archer", category="unit"),
+            ClassicEntry("road", "Road", category="terrain"),
+        ), source_path="classic", tree_sha256="a" * 64)
+        classic_reference_status = "available"
+
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client,
+        session=LookupSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner.run()
+    result = client.lookup("what is archer", categories=["unit"], limit=8)
+    assert result["status"] == "ok"
+    assert result["sources"]["static_classic"] == "available"
+    assert result["provenance"]["static_classic"]["content_hash"]
+    assert result["entries"][0]["authority"] == (
+        "static_classic_non_authoritative")
+    assert result["entries"][0]["category"] == "unit"
+
+
+def test_runner_lookup_includes_generated_manual_as_non_authoritative(
+        tmp_path, monkeypatch):
+    """The generated manual is static prose and ranks below live rules."""
+    from types import ModuleType, SimpleNamespace
+
+    manual = SimpleNamespace(
+        status="available", schema_version="freeciv-manual-reference-v1",
+        source="generated_freeciv_manual", source_path="manual/reference.json",
+        source_sha256="b" * 64, content_hash="c" * 64)
+
+    module = ModuleType("lechonk.adapter.manual_reference")
+    def render_search(ref, query, *, categories=None, limit=10, max_chars=8000):
+        return {"status": "available", "entries": [
+            {"name": "road", "category": "terrain", "text": "manual"},
+        ], "source": ref.source, "source_path": ref.source_path,
+                "source_sha256": ref.source_sha256,
+                "content_hash": ref.content_hash,
+                "schema_version": ref.schema_version}
+    module.render_search = render_search
+    monkeypatch.setitem(__import__("sys").modules,
+                        "lechonk.adapter.manual_reference", module)
+
+    class LookupSession(FakeSession):
+        ruleset_reference = None
+        help_reference = None
+        classic_reference = None
+        manual_reference = manual
+        manual_reference_status = "available"
+
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client,
+        session=LookupSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner.run()
+    result = client.lookup("road", categories=["terrain"], limit=8)
+    assert result["sources"]["static_manual"] == "available"
+    assert result["entries"][0]["authority"] == (
+        "static_manual_non_authoritative")
+    assert result["provenance"]["static_manual"]["source_sha256"] == "b" * 64
+
+
+def test_runner_lookup_keeps_active_and_manual_records_with_same_name(
+        tmp_path, monkeypatch):
+    """Different sources retain useful same-name records; exact source
+    duplicates do not consume additional result slots."""
+    from types import ModuleType, SimpleNamespace
+    import sys
+
+    manual = SimpleNamespace(status="available", schema_version="manual-v1",
+                             source="generated_manual", source_path="manual",
+                             source_sha256="d" * 64, content_hash="e" * 64)
+    manual_module = ModuleType("lechonk.adapter.manual_reference")
+    manual_module.render_search = lambda *args, **kwargs: {
+        "status": "available", "entries": [
+            {"name": "road", "category": "terrain", "text": "manual detail"},
+            {"name": "road", "category": "terrain", "text": "manual detail"},
+            {"name": "bridge", "category": "terrain", "text": "other"},
+        ]}
+    monkeypatch.setitem(sys.modules, "lechonk.adapter.manual_reference",
+                        manual_module)
+
+    active = SimpleNamespace(content_hash="f" * 64)
+    monkeypatch.setattr(
+        "lechonk.adapter.ruleset_reference.render_search",
+        lambda *args, **kwargs: {
+            "status": "available", "entries": [
+                {"name": "road", "category": "terrain", "text": "live"},
+            ]})
+
+    class LookupSession(FakeSession):
+        ruleset_reference = active
+        ruleset_reference_status = "available"
+        help_reference = None
+        classic_reference = None
+        manual_reference = manual
+        manual_reference_status = "available"
+
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    client = LookupClient([ok_response([], turn_id="t1")])
+    runner = make_runner(
+        tmp_path, client=client,
+        session=LookupSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner.run()
+    result = client.lookup("road", categories=["terrain"], limit=2)
+    assert [entry["authority"] for entry in result["entries"]] == [
+        "active_ruleset", "static_manual_non_authoritative"]
+    assert result["entries"][0]["text"] == "live"
+
+
+def test_runner_checkpoint_normalizes_unavailable_classic_reference(
+        tmp_path, monkeypatch):
+    from lechonk.adapter.classic_reference import ClassicReference
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    state_path = tmp_path / "conversation.json"
+    state_path.write_text("{}\n", encoding="utf-8")
+    save_path = checkpoint_dir / "save-1.sav"
+    save_path.write_bytes(b"save")
+    save_sha = hashlib.sha256(save_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        "lechonk.eval.checkpoint.export_turn_save",
+        lambda **kwargs: SimpleNamespace(path=str(save_path), sha256=save_sha))
+
+    class CheckpointSession(FakeSession):
+        classic_reference = ClassicReference(status="unavailable")
+        classic_reference_status = "unavailable: absent"
+
+    runner = make_runner(
+        tmp_path, client=FakeModelClient(),
+        session=CheckpointSession([turn_world(1), turn_world(2)]), max_turns=1,
+        config_overrides={"checkpoint_dir": str(checkpoint_dir),
+                          "recovery_manifest_path": str(tmp_path / "recovery.json"),
+                          "conversation_state_path": str(state_path)})
+    runner._session = CheckpointSession([turn_world(1), turn_world(2)])
+    runner._write_start_checkpoint(1)
+    manifest = json.loads((tmp_path / "recovery.json").read_text())
+    assert manifest["classic_reference_present"] is False
+    assert manifest["classic_reference_schema_version"] is None
+    assert manifest["classic_ruleset_tree_sha256"] is None
+
+
+def test_ruleset_lookup_configuration_does_not_close_live_session(tmp_path):
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    session = FakeSession([turn_world(1), turn_world(2)])
+    client = LookupClient()
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2"})
+    runner._session = session
+    runner._configure_ruleset_lookup()
+    assert not session.closed
+    runner._request_abort("test watchdog abort")
+    assert session.closed
+
+
+def test_resume_provenance_accepts_explicitly_unavailable_help(tmp_path):
+    class MissingHelp:
+        status = "unavailable"
+        content_hash = "0" * 64
+        source_sha256 = ""
+
+    class LookupSession(FakeSession):
+        ruleset_reference = None
+        ruleset_reference_status = "unavailable"
+        help_reference = MissingHelp()
+
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    session = LookupSession([turn_world(1), turn_world(2)])
+    runner = make_runner(
+        tmp_path, client=LookupClient(), session=session, max_turns=1,
+        config_overrides={"context_policy": "conversation_v1",
+                          "prompt_profile": "gameplay_v2",
+                          "validate_reference_provenance": True,
+                          "expected_ruleset_reference_hash": None,
+                          "expected_help_reference_hash": None,
+                          "expected_help_reference_source_sha256": None})
+    runner._session = session
+    runner._configure_ruleset_lookup()
+
+
+@pytest.mark.parametrize("profile", ["gameplay_v3", "gameplay_v4"])
+def test_resume_provenance_binds_active_and_help_references_for_interactive_profiles(
+        tmp_path, profile):
+    from types import SimpleNamespace
+    from lechonk.core.runner import SessionError
+
+    active = SimpleNamespace(content_hash="a" * 64)
+    help_ref = SimpleNamespace(status="available", content_hash="b" * 64,
+                               source_sha256="c" * 64)
+
+    class LookupSession(FakeSession):
+        ruleset_reference = active
+        ruleset_reference_status = "available"
+        help_reference = help_ref
+        classic_reference = None
+        manual_reference = None
+
+    class LookupClient(FakeModelClient):
+        def set_ruleset_lookup(self, lookup):
+            self.lookup = lookup
+
+    overrides = {
+        "context_policy": "conversation_v1", "prompt_profile": profile,
+        "validate_reference_provenance": True,
+        "prompt_bundle_id": profile,
+        "candidate_surface_policy": "candidate_surface_v2",
+        "candidate_surface_cap": 8000,
+        "candidate_admission_version": "candidate_surface_v2-r1",
+        "compaction_schema": "conversation-compaction-v1",
+        "prompt_budget_schema": f"{profile.replace('_', '-')}-budget-v1",
+        "recovery_config_digest_schema": "interactive-config-v3",
+        "expected_ruleset_reference_hash": "a" * 64,
+        "expected_help_reference_hash": "b" * 64,
+        "expected_help_reference_source_sha256": "c" * 64,
+    }
+    (tmp_path / "same").mkdir()
+    runner = make_runner(
+        tmp_path / "same", client=LookupClient(),
+        session=LookupSession([turn_world(1), turn_world(2)]),
+        max_turns=1, config_overrides=overrides)
+    runner._session = runner._session_factory()
+    runner._configure_ruleset_lookup()
+
+    active.content_hash = "d" * 64
+    with pytest.raises(SessionError, match="provenance changed"):
+        runner._configure_ruleset_lookup()
+    active.content_hash = "a" * 64
+    help_ref.content_hash = "e" * 64
+    with pytest.raises(SessionError, match="provenance changed"):
+        runner._configure_ruleset_lookup()
+    help_ref.content_hash = "b" * 64
+    LookupSession.ruleset_reference = None
+    with pytest.raises(SessionError, match="provenance changed"):
+        runner._configure_ruleset_lookup()
+    LookupSession.ruleset_reference = active
+    LookupSession.help_reference = None
+    with pytest.raises(SessionError, match="provenance changed"):
+        runner._configure_ruleset_lookup()
+
+
+def test_runner_rejects_unknown_prompt_profile():
+    with pytest.raises(ValueError, match="prompt_profile"):
+        RunnerConfig(prompt_profile="unknown")
+
+
+def test_runner_rejects_unknown_candidate_surface_policy():
+    with pytest.raises(ValueError, match="candidate_surface_policy"):
+        RunnerConfig(candidate_surface_policy="unknown")
+
+
+def test_hybrid_context_carries_only_completed_turns(tmp_path):
+    worlds = [turn_world(1), turn_world(2), turn_world(3)]
+    session = FakeSession(worlds)
+    first = ok_response(["unit:10:goto_e"], turn_id="t1", notes="scout east")
+    first.batch.notes = "scout east"
+    second = ok_response(["unit:11:sentry"], turn_id="t2", notes="hold position")
+    second.batch.notes = "hold position"
+    client = FakeModelClient([first, second])
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=2,
+        config_overrides={
+            "context_policy": "hybrid_v1",
+            "context_journal_path": str(tmp_path / "context.jsonl"),
+        })
+    result = runner.run()
+
+    assert result.outcome == "COMPLETED"
+    assert "RECENT VERIFIED HISTORY" in client.turn_prompts[0].history
+    assert '"episodes":[]' in client.turn_prompts[0].history
+    assert '"turn":1' in client.turn_prompts[1].history
+    assert "scout east" in client.turn_prompts[1].history
+    # The history is updated only after turn 1 reaches its finish boundary.
+    assert '"outcome":"executed"' in client.turn_prompts[1].history
+    from lechonk.core.context_journal import load_context_journal
+    journal = load_context_journal(tmp_path / "context.jsonl")
+    assert [record.turn for record in journal.records] == [1, 2]
+    assert all(record.transcript_seq is not None for record in journal.records)
+
+
+def test_conversation_context_aborts_staged_turn_on_truncated_finish(tmp_path):
+    """Infrastructure truncation must never commit a phantom conversation turn."""
+    session = FakeSession(
+        [turn_world(1)], final_terminated=False, final_truncated=True)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", notes="scout east")
+    ])
+    commits: list[dict] = []
+    aborts: list[bool] = []
+    client.commit_turn = lambda report: commits.append(report)
+    client.abort_turn = lambda: aborts.append(True)
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={"context_policy": "conversation_v1"})
+
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert commits == []
+    assert aborts == [True]
+
+
+def test_hybrid_context_does_not_publish_truncated_finish(tmp_path):
+    """An infrastructure-truncated phase cannot enter the legacy journal."""
+    session = FakeSession(
+        [turn_world(1)], final_terminated=False, final_truncated=True)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", notes="scout east")
+    ])
+    journal_path = tmp_path / "context.jsonl"
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={
+            "context_policy": "hybrid_v1",
+            "context_journal_path": str(journal_path),
+        })
+
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    from lechonk.core.context_journal import load_context_journal
+    assert load_context_journal(journal_path).records == []
+
+
+def test_conversation_context_commits_each_completed_phase(tmp_path):
+    """Nonterminal phase boundaries commit before the following turn."""
+    session = FakeSession([turn_world(1), turn_world(2), turn_world(3)])
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", notes="scout east"),
+        ok_response(["unit:11:sentry"], turn_id="t2", notes="hold position"),
+    ])
+    commits: list[dict] = []
+    aborts: list[bool] = []
+    client.commit_turn = lambda report: commits.append(report)
+    client.abort_turn = lambda: aborts.append(True)
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=2,
+        config_overrides={"context_policy": "conversation_v1"})
+
+    result = runner.run()
+
+    assert result.outcome == "COMPLETED"
+    assert [item["historical_turn"] for item in commits] == [1, 2]
+    # Teardown may call the client's idempotent abort hook after the final
+    # commit; it must not remove either committed turn.
+    assert len(aborts) <= 1
+
+
+def test_conversation_report_carries_rejections_into_next_request(tmp_path):
+    """Initial-ingest rejection feedback is committed exactly once.
+
+    The next request still receives the live candidate surface, so a stale
+    ref cannot silently become an instruction to substitute another action.
+    """
+    session = FakeSession([turn_world(1), turn_world(2), turn_world(3)])
+    client = FakeModelClient([
+        ok_response(["unit:999:goto_w", "unit:10:goto_e"], turn_id="t1"),
+        ok_response(["unit:11:sentry"], turn_id="t2", with_memory=False),
+    ])
+    commits: list[dict] = []
+    client.commit_turn = lambda report: commits.append(report)
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=2,
+        config_overrides={"context_policy": "conversation_v1"})
+
+    result = runner.run()
+
+    assert result.outcome == "COMPLETED"
+    assert len(commits) == 2
+    rejected = commits[0]["rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["ref"] == "unit:999:goto_w"
+    assert rejected[0]["rejection_class"] == "state_fog_error"
+    assert rejected[0]["provenance_class"] == "model"
+    assert "offered candidate table" in rejected[0]["reason"]
+    assert "unit:999:goto_w" not in client.turn_prompts[1].candidates
+    assert "unit:11:sentry" in client.turn_prompts[1].candidates
+    assert commits[0]["rejected"] == rejected
+
+
+def test_conversation_report_carries_mid_batch_stale_rejection_once(tmp_path):
+    """A refreshed-table rejection is reported without hidden state."""
+    session = FakeSession([turn_world(1), turn_world(2), turn_world(3)])
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e", "unit:10:goto_nw",
+                     "unit:11:sentry"], turn_id="t1", with_memory=False),
+        ok_response([], turn_id="t2", with_memory=False),
+    ])
+    commits: list[dict] = []
+    client.commit_turn = lambda report: commits.append(report)
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=2,
+        config_overrides={"context_policy": "conversation_v1"})
+
+    result = runner.run()
+
+    assert result.outcome == "COMPLETED"
+    stale = [item for item in commits[0]["rejected"]
+             if item["ref"] == "unit:10:goto_nw"]
+    assert len(stale) == 1
+    assert stale[0]["rejection_class"] == "illegal_in_rule"
+    assert stale[0]["provenance_class"] == "model"
+    assert "refreshed candidate table" in stale[0]["reason"]
+    assert set(stale[0]) == {
+        "ref", "rejection_class", "provenance_class", "reason"}
+    assert "unit:11:sentry" in client.turn_prompts[1].candidates
+
+
 # ---------------------------------------------------------------------------
 # fault injection: timeout → repair (unresponsive) → executed
 # ---------------------------------------------------------------------------
@@ -254,8 +945,9 @@ def test_runner_malformed_output_triggers_schema_error_repair(tmp_path):
         ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
         ok_response([], turn_id="t2", with_memory=False),
     ])
+    progress = []
     runner = make_runner(tmp_path, client=client, session=session,
-                         max_turns=2)
+                         max_turns=2, progress=progress.append)
     result = runner.run()
     assert result.outcome == "COMPLETED"
     records = _records(runner.ledger.path)
@@ -271,6 +963,10 @@ def test_runner_malformed_output_triggers_schema_error_repair(tmp_path):
     # The taxonomy counted the attempts (2 schema_error + 1 executed).
     assert result.metrics.illegal_attempts_total == 3
     assert result.metrics.illegal_action_shares["schema_error"].numerator == 2
+    decisions = [event for event in progress if event.get("event") == "turn_decision"]
+    assert decisions[0]["repair_used"] is True
+    assert decisions[0]["degraded"] is False
+    assert "repair cap" not in decisions[0]["why"]
 
 
 # ---------------------------------------------------------------------------
@@ -1628,6 +2324,98 @@ def test_runner_transition_publishes_phase_deadlines(tmp_path):
         assert published(terminal) is None
 
 
+def test_runner_progress_callback_is_live_and_failure_isolated(tmp_path):
+    events = []
+
+    def progress(event):
+        events.append(event)
+        if event["event"] == "state":
+            raise RuntimeError("observer disconnected")
+
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=FakeSession([turn_world(1)]), max_turns=1,
+                         progress=progress)
+    runner._transition(RunState.ACTING)
+    runner._progress("turn_started", turn=1)
+
+    assert events[0]["event"] == "state"
+    assert events[0]["state"] == "ACTING"
+    # The callback exception above must not prevent later events.
+    assert events[1] == {"event": "turn_started", "turn": 1}
+
+
+def test_action_result_progress_exposes_json_native_focus_descriptors(tmp_path):
+    """Capture observers receive the same structured location evidence as
+    the durable action record, with tuples normalized for JSON consumers."""
+    events = []
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=FakeSession([turn_world(1)]), max_turns=1,
+                         progress=events.append)
+
+    runner._emit_action_result(
+        turn=1, ref="unit:7:goto_e", domain="unit", verb="goto_e",
+        target="tile:3,2", affected="tile:3,2", actor_tile=(2, 2),
+        outcome="executed", readback="verified")
+
+    assert events == [{
+        "event": "action_result", "turn": 1, "ref": "unit:7:goto_e",
+        "domain": "unit", "verb": "goto_e", "target": "tile:3,2",
+        "affected": "tile:3,2", "actor_tile": [2, 2],
+        "outcome": "executed", "provenance_class": "model",
+        "readback": "verified",
+    }]
+
+
+def test_action_result_progress_preserves_engine_automatic_provenance(tmp_path):
+    events = []
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=FakeSession([turn_world(1)]), max_turns=1,
+                         progress=events.append)
+
+    runner._emit_action_result(
+        turn=1, ref="city:7:produce", domain="city", verb="produce",
+        target="city:7", outcome="executed",
+        provenance_class="engine_automatic", readback="verified")
+
+    assert events[-1]["event"] == "action_result"
+    assert events[-1]["provenance_class"] == "engine_automatic"
+
+
+def test_runner_session_ready_publishes_pingtimeout_readback(tmp_path):
+    """Expose AdapterSession's verified timeout without breaking duck types."""
+    session = FakeSession([turn_world(1)])
+    session.pingtimeout_status = "confirmed"
+    session.pingtimeout_actual = 731
+    events = []
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=session, max_turns=1, progress=events.append)
+
+    runner.run()
+
+    ready = next(event for event in events
+                 if event.get("event") == "session_ready")
+    assert ready["pingtimeout_status"] == "confirmed"
+    assert ready["pingtimeout_actual"] == 731
+    assert ready["aifill"] == 2
+    assert ready["configured_ai_opponents"] == 1
+
+
+def test_runner_session_ready_keeps_legacy_session_compatible(tmp_path):
+    """A pre-readback fake session still receives the ordinary event shape."""
+    events = []
+    runner = make_runner(tmp_path, client=FakeModelClient(),
+                         session=FakeSession([turn_world(1)]), max_turns=1,
+                         progress=events.append)
+
+    runner.run()
+
+    ready = next(event for event in events
+                 if event.get("event") == "session_ready")
+    assert ready["event"] == "session_ready"
+    assert "pingtimeout_status" not in ready
+    assert "pingtimeout_actual" not in ready
+
+
 # ---------------------------------------------------------------------------
 # outcome taxonomy: DEFEATED / VICTORY at the phase boundary
 # ---------------------------------------------------------------------------
@@ -1657,6 +2445,24 @@ def test_runner_victory_at_phase_boundary(tmp_path):
                          max_turns=5)
     result = runner.run()
     assert result.outcome == "VICTORY"
+
+
+def test_runner_unbounded_horizon_runs_until_game_over(tmp_path):
+    """An interactive/unbounded run must not stop at an artificial turn cap."""
+    session = FakeSession([turn_world(1), turn_world(2)],
+                          final_terminated=True)
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+        ok_response(["unit:10:goto_e"], turn_id="t2", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session,
+                         max_turns=None)
+
+    result = runner.run()
+
+    assert result.outcome == "VICTORY"
+    assert result.turns_completed == 2
+    assert "horizon" not in result.reason
 
 
 # ---------------------------------------------------------------------------
@@ -2613,9 +3419,86 @@ def test_runner_candidates_ref_hashes_the_offered_capped_text(tmp_path):
     assert ref.candidate_count == len(offered.candidates)
     assert ref.by_domain == {"unit": len(offered.candidates)}
     assert ref.table_hash == hashlib.sha256(
-        offered.render().encode("utf-8")).hexdigest()
+        table.render().encode("utf-8")).hexdigest()
+    assert ref.table_hash == hashlib.sha256(
+        client.turn_prompts[0].candidates.encode("utf-8")).hexdigest()
     # The model-facing prompt carries the capped table + omission line.
     assert "candidates omitted" in client.turn_prompts[0].candidates
+
+
+def test_runner_candidate_surface_v2_records_additive_admission(tmp_path):
+    table = CandidateTable(turn=1, candidates=[
+        Candidate(id=f"unit:{i}:wait", domain="unit", actor_id=str(i),
+                  verb="wait", summary="u" * 300)
+        for i in range(8)
+    ] + [
+        Candidate(id="tech:cur_player:research_tech_alphabet_0",
+                  domain="tech", actor_id="cur_player", verb="research",
+                  summary="research alphabet")
+    ])
+    session = _SyntheticTableSession([turn_world(1), turn_world(2)], table)
+    client = FakeModelClient([ok_response([], turn_id="t1", with_memory=False)])
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={
+            "prompt_profile": "gameplay_v3",
+            "candidate_surface_policy": "candidate_surface_v2",
+            "prompt_bundle_id": "gameplay_v3",
+            "recovery_config_digest_schema": "interactive-config-v3",
+            "candidate_surface_cap": 8000,
+            "candidate_admission_version": "candidate_surface_v2-r1",
+            "compaction_schema": "conversation-compaction-v1",
+            "prompt_budget_schema": "gameplay-v3-budget-v1",
+        })
+    assert runner.run().outcome == "COMPLETED"
+    ref = _by_kind(_records(runner.ledger.path), CandidatesRefRecord)[0]
+    assert ref.candidate_surface_policy == "candidate_surface_v2"
+    assert ref.candidate_cap_tokens == 8000
+    assert ref.total_candidate_count == 9
+    assert ref.offered_candidate_count == ref.candidate_count
+    assert ref.omitted_candidate_count == 0
+    assert ref.total_by_domain["unit"] == 8
+    assert ref.offered_by_domain["tech"] == 1
+    assert ref.omitted_by_domain["unit"] == 0
+    assert ref.total_tokens is not None
+    assert ref.offered_tokens is not None
+    assert "research alphabet" in client.turn_prompts[0].candidates
+
+
+def test_runner_v2_uses_admission_render_for_large_protected_surface(tmp_path):
+    """A protected surface between the legacy and v2 caps reaches the model.
+
+    The ledger hash must pin the exact expanded text sent in the prompt; it
+    must never re-render the admitted table through CandidateTable's legacy
+    1,200-token cap.
+    """
+    from lechonk.core.candidate_surface_v2 import admit_candidate_surface
+
+    candidate = Candidate(
+        id="unit:10:sentry", domain="unit", actor_id="10", verb="sentry",
+        summary="p" * 6200, in_contact=True)
+    table = CandidateTable(turn=1, candidates=[candidate])
+    admission = admit_candidate_surface(table)
+    assert 1200 < admission.offered_tokens < 8000
+    session = _SyntheticTableSession([turn_world(1), turn_world(2)], table)
+    client = FakeModelClient([ok_response([], turn_id="t1", with_memory=False)])
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={
+            "prompt_profile": "gameplay_v3",
+            "candidate_surface_policy": "candidate_surface_v2",
+            "prompt_bundle_id": "gameplay_v3",
+            "recovery_config_digest_schema": "interactive-config-v3",
+            "candidate_surface_cap": 8000,
+            "candidate_admission_version": "candidate_surface_v2-r1",
+            "compaction_schema": "conversation-compaction-v1",
+            "prompt_budget_schema": "gameplay-v3-budget-v1",
+        })
+    assert runner.run().outcome == "COMPLETED"
+    ref = _by_kind(_records(runner.ledger.path), CandidatesRefRecord)[0]
+    expected = admission.render()
+    assert ref.table_hash == hashlib.sha256(expected.encode()).hexdigest()
+    assert client.turn_prompts[0].candidates == expected
 
 
 def test_runner_prompt_budget_exceeded_bounded_fail_stop(tmp_path):

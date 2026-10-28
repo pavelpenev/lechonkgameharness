@@ -1,0 +1,15 @@
+Your previous output was rejected as ILLEGAL-IN-RULE. The ref was present in
+the offered table but failed the rule check:
+$failed_refs
+
+$error_detail
+
+Re-emit one complete ActionBatch using only refs currently offered below. A
+prior action may have made a dependent action stale; do not chain dependent
+city/unit actions in one batch. Pick a legal replacement or omit it; do not
+infer unseen state. Keep the exact schema, at most 20 actions,
+finish_requested true, concise notes, and JSON only. Omit memory_update when
+unchanged; if provided, commitments upsert while threats and notes replace
+prior values, so repeat the full current values.
+
+$refreshed_candidates

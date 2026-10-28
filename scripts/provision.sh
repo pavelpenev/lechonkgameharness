@@ -51,8 +51,17 @@ CIVREALM_HEAD="36ae456"
 # pointing at the parent's module gitdir). A vendor/civrealm present
 # without any .git is stray content, not a checkout.
 if [ -e vendor/civrealm ] && [ ! -e vendor/civrealm/.git ]; then
-  echo "vendor/civrealm exists but is not a git checkout; refusing to touch it" >&2
-  exit 1
+  # A non-recursive clone creates the empty mountpoint for an uninitialized
+  # gitlink.  Let git submodule initialize that directory; reject only real
+  # content that is not owned by the gitlink.
+  gitlink_mode="$(git ls-files -s -- vendor/civrealm | awk '{print $1}')"
+  stray="$(find vendor/civrealm -mindepth 1 -print -quit 2>/dev/null || true)"
+  if [ "$gitlink_mode" = "160000" ] && [ -z "$stray" ]; then
+    : # safe empty gitlink mountpoint; initialize below
+  else
+    echo "vendor/civrealm exists but is not an empty gitlink checkout; refusing to touch it" >&2
+    exit 1
+  fi
 fi
 if [ ! -e vendor/civrealm/.git ]; then
   git submodule update --init --recursive vendor/civrealm
@@ -70,6 +79,22 @@ git -C vendor/civrealm merge-base --is-ancestor "$CIVREALM_HEAD" HEAD \
   || { echo "civgov-fixes head $CIVREALM_HEAD is not an ancestor of the vendored HEAD" >&2; exit 1; }
 echo "vendor/civrealm is checked out at $CIVREALM_HEAD_SHA (gitlink $CIVREALM_GITLINK)"
 
+# The gitlink intentionally remains pristine in the top-level repository, but
+# Long model calls need a configurable Freeciv ping timeout, and the websocket
+# client needs queued cross-thread writes and deferred transport diagnostics.
+# Apply the tracked compatibility patch idempotently so a clean checkout gets
+# the same behavior as the development workspace.
+CIVREALM_PATCH="../../patches/civrealm-long-pingtimeout.patch"
+if git -C vendor/civrealm apply --reverse --check "$CIVREALM_PATCH" >/dev/null 2>&1; then
+  echo "civrealm compatibility patch already applied"
+elif git -C vendor/civrealm apply --check "$CIVREALM_PATCH" >/dev/null 2>&1; then
+  git -C vendor/civrealm apply "$CIVREALM_PATCH"
+  echo "applied civrealm compatibility patch"
+else
+  echo "civrealm checkout is incompatible with $CIVREALM_PATCH" >&2
+  exit 1
+fi
+
 echo "==> Host architecture"
 arch="$(uname -m)"
 if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; then
@@ -85,6 +110,13 @@ dock tag "$IMAGE_DIGEST" "$IMAGE_TAG"
 
 echo "==> Container"
 if dock ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  expected_image_id="$(dock image inspect -f '{{.Id}}' "$IMAGE_DIGEST")"
+  actual_image_id="$(dock inspect -f '{{.Image}}' "$CONTAINER")"
+  if [ "$actual_image_id" != "$expected_image_id" ]; then
+    echo "container '$CONTAINER' uses image $actual_image_id, expected $expected_image_id" >&2
+    echo "refusing to reuse a container that does not match the pinned image" >&2
+    exit 1
+  fi
   if [ "$(dock inspect -f '{{.State.Running}}' "$CONTAINER")" = "true" ]; then
     echo "container '$CONTAINER' already running; leaving it as is"
   else
@@ -123,6 +155,40 @@ if [ "$up" -ne 1 ]; then
 fi
 echo "stack is up"
 
+echo "==> Optional local Freeciv reference"
+# Missing reference data must not prevent the game from starting.
+if [ "${LECHONK_EXTRACT_FREECIV_REFERENCE:-1}" = 1 ]; then
+  FREECIV_CONTAINER="$CONTAINER" FREECIV_IMAGE_REF="$IMAGE_DIGEST" \
+    scripts/extract_freeciv_reference.sh || {
+      if [ "${FREECIV_REFERENCE_REQUIRED:-0}" = 1 ]; then
+        exit 1
+      fi
+      echo "warning: continuing without local Freeciv reference" >&2
+    }
+else
+  echo "local Freeciv reference extraction disabled"
+fi
+
+echo "==> Optional local Freeciv manual"
+# The generated MediaWiki manual is supplemental to the live ruleset and is
+# deliberately optional.  Keep the required switch independent from the
+# encyclopedia extractor: operators can require this source even when the
+# generic helpdata file is unavailable in the image.
+if [ "${LECHONK_EXTRACT_FREECIV_MANUAL:-1}" = 1 ]; then
+  FREECIV_CONTAINER="$CONTAINER" FREECIV_IMAGE_REF="$IMAGE_DIGEST" \
+    scripts/extract_freeciv_manual.sh || {
+      if [ "${FREECIV_MANUAL_REQUIRED:-0}" = 1 ]; then
+        exit 1
+      fi
+      echo "warning: continuing without local Freeciv manual" >&2
+    }
+elif [ "${FREECIV_MANUAL_REQUIRED:-0}" = 1 ]; then
+  echo "required local Freeciv manual extraction is disabled (set LECHONK_EXTRACT_FREECIV_MANUAL=1)" >&2
+  exit 1
+else
+  echo "local Freeciv manual extraction disabled"
+fi
+
 echo "==> In-container save-path writability"
 SAVEGAMES_DIR="/var/lib/tomcat10/webapps/data/savegames/"
 dock exec "$CONTAINER" mkdir -p "$SAVEGAMES_DIR" 2>/dev/null || true
@@ -138,7 +204,8 @@ echo "==> Python venv (uv, 3.12)"
 if [ ! -x .venv/bin/python ]; then
   uv venv --python 3.12 .venv
 fi
-uv pip install --python .venv/bin/python -e vendor/civrealm pytest
+uv pip install --python .venv/bin/python -e vendor/civrealm -e . pytest
+.venv/bin/python -c 'import lechonk; import lechonk.core.runner'
 
 echo "==> Node (playwright@1.49.0 pinned by package.json)"
 npm install

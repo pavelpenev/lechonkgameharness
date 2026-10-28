@@ -83,13 +83,13 @@ def probe_request_plan():
         'p10a_model_id_check': {
             'messages': [{'role': 'user', 'content': 'Reply with exactly: OK'}],
             'temperature': 0.0,
-            'max_tokens': 16,
+            'max_tokens': None,
             'response_format': None,
         },
         'p10b_json_schema_check': {
             'prompt': P10_PROBE_PROMPT,
             'temperature': 0.0,
-            'max_tokens': 1024,
+            'max_tokens': None,
             'response_format': {
                 'type': 'json_schema',
                 'json_schema': {
@@ -496,10 +496,10 @@ def respike_main() -> int:
         'probe_call_logs': probe_call_logs,
         'max_tokens_recheck': {
             'scope_note': (
-                'probe-scale only: these are individual probe calls '
-                '(max_tokens 16 / 1024 / 1024), not full turns; a full '
-                'turn-scale finish_reason re-check requires a future live '
-                'run under the same arm sampling'),
+                'probe-scale only: these are individual provider-managed '
+                'probe calls, not full turns; a full turn-scale '
+                'finish_reason re-check requires a future live run under '
+                'the same arm sampling'),
             'p10a_model_id': {
                 'finish_reason': p10a.finish_reason,
                 'tokens_in': None, 'tokens_out': None,

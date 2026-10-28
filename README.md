@@ -51,9 +51,9 @@ hosts, no cloud). Machine used for development: 24 threads, 78 GB RAM.
 | Requirement | Version / notes |
 |---|---|
 | Docker Engine | local daemon; tested with 29.7.2. If the session user lacks socket access: `sudo usermod -aG docker <user>` + re-login, or use `sg docker -c "..."` per command. |
-| Image | `civrealm/freeciv-web`, pinned **by digest**: `sha256:4923253876a76d3c5f55c6007e530f6c3cd3120b9e2f37a8e943faf920cb373a` (amd64, ~4.36 GB). Pulled and retagged locally as `freeciv/freeciv-web:latest`. Tags are not trustworthy pins (`latest` = `1.4.6`, pushed 2024-04-03, which predates `1.3.2`). |
+| Image | `civrealm/freeciv-web`, pinned **by digest**: `sha256:4923253876a76d3c5f55c6007e530f6c3cd3120b9e2f37a8e943faf920cb373a` (Freeciv `3.2.91-dev`, amd64, ~4.36 GB). This image lacks `helpdata.txt` but includes `freeciv-manual`; see [reference data](docs/freeciv-reference.md). Pulled and retagged locally as `freeciv/freeciv-web:latest`. Tags are not trustworthy pins (`latest` = `1.4.6`, pushed 2024-04-03, which predates `1.3.2`). |
 | Python | 3.12 via [uv](https://docs.astral.sh/uv/) (uv-managed venv; CivRealm's pins predate Python 3.14, and 3.12 is the PR-#7-validated version). `uv venv`, then `uv pip install -e vendor/civrealm -e . pytest`. Ray is deliberately **not** installed (PR-#7-validated config; see below). |
-| Node | playwright 1.49.0 (`npm install`; chromium headless shell at `~/.cache/ms-playwright`) — used only for the zero-perturbation observer and video capture. The harness itself never needs a browser. |
+| Node | playwright 1.64.1 (`npm install`; matching Chromium at `~/.cache/ms-playwright`) — used only for the zero-perturbation observer and video capture. The harness itself never needs a browser. |
 | Model access | `mistral-large-4` via the Mistral Studio API. Key in the `MISTRAL_API_KEY` environment variable (the loader reads the process env first, else parses **only** the `MISTRAL_API_KEY` line from a repo-root `.env` at runtime; the value is never printed, logged, or written to artifacts). |
 
 ### Provisioning
@@ -70,6 +70,359 @@ published-port collision checks, and a hardened first start with a retried pubst
 health probe. Re-run end-to-end on the working host on 2026-10-25 after the submodule
 rework (exit 0; gitlink guard verified, every other guard skipped/verified):
 `artifacts/runs/wp5-freshenv/provision_run_submodule.log`.
+
+On subsequent launches, the fast path checks the running container's pinned
+image identity, vendor gitlink/head, and tracked CivRealm patch before reusing
+it. A clean checkout can therefore be launched directly after provisioning;
+non-empty uninitialized vendor directories are rejected rather than silently
+reused.
+
+### Quick start
+
+From a fresh checkout, provide your Mistral key and start a run with the single
+launcher. It provisions the local stack and Python environment when they are not
+already healthy, then streams turn/model/action progress in the terminal. Complete
+reasoning and final responses are retained in
+`artifacts/runs/<run-id>/model_traces.jsonl`. The actual observer URL
+(including the dynamically selected game port) is printed when the game session
+starts:
+
+```sh
+export MISTRAL_API_KEY="your-key-here"
+./scripts/launch.sh --seed 20261028
+```
+
+The launcher always prints the read-only observer URL after Freeciv reports its
+actual session port. To open it automatically once, opt in explicitly:
+
+```sh
+./scripts/launch.sh --open-observer --turns 10
+```
+
+`--open-observer` is forwarded unchanged to the model runner and is disabled by
+default. Browser integration is non-fatal: on a headless host, or if the
+system browser refuses the request, the run continues and the printed URL can
+be opened manually. The Freeciv webclient may still require clicking
+**Observe Game**; this option never grants player controls.
+
+With no horizon flag, the launcher continues until Freeciv reports game over. Pass
+`--turns 10` for a short smoke test. The direct `wp2_model_run.py` command remains
+the bounded 10-turn WP2 acceptance driver unless you pass `--until-game-over`.
+
+#### Screenshot-first capture prototype (short test)
+
+This is an experimental, local capture path, not a production-ready recorder. It
+records the model trace and event ledger as append-only artifacts when writes succeed,
+while a separate read-only observer takes event-triggered screenshots of the game
+plus the injected reasoning / actions sidebar. Check the manifest's dropped-event and
+write-error fields: a crash can leave the underlying model trace incomplete. Reasoning
+and model output can contain sensitive local data; keep the capture directory private.
+The observer never plays the game.
+
+This is intentionally a manual two-process workflow: the presenter must be running
+while the game is producing events; attaching it after the run cannot reconstruct
+the missing screenshots.
+
+Use a fresh run ID and a capture directory that does not already exist. Do not create
+the run directory yourself: the runner creates `artifacts/runs/<run-id>/`, and the
+capture directory is its `capture/` child. Start the runner first, then immediately
+start the presenter in a second terminal. Capture requires `--stream` explicitly:
+
+```sh
+RUN_ID=capture-smoke-$(date -u +%Y%m%dT%H%M%SZ)
+CAPTURE_DIR="$PWD/artifacts/runs/$RUN_ID/capture"
+
+# Terminal 1: start the 2-AI-opponent, 2-turn game first.
+uv run python scripts/wp2_model_run.py \
+  --run-id "$RUN_ID" --seed 20261028 --opponents 2 --turns 2 \
+  --stream --capture --capture-dir "$CAPTURE_DIR" \
+  --capture-sync --capture-sync-timeout-ms 2000 \
+  --capture-sync-budget-ms 6000 \
+  --api-timeout-s 120 --acting-deadline-s 180
+
+# Terminal 1 also prints this exact command; copy/paste that printed command into
+# Terminal 2 immediately after Terminal 1 has started (its variables are local).
+printf 'node scripts/capture_presenter.js --capture-dir %q\n' "$CAPTURE_DIR"
+```
+
+For example, Terminal 2 must receive a literal path such as
+`node scripts/capture_presenter.js --capture-dir /home/pav/code/lechonkgameharness/artifacts/runs/capture-smoke-20261028T125900Z-final/capture`,
+not an uninitialised `$CAPTURE_DIR` from Terminal 1. Keep Terminal 1 running while
+the presenter runs.
+
+The headed presenter needs `DISPLAY` or `WAYLAND_DISPLAY`. On a headless machine,
+append `--headless` to the literal presenter command printed by Terminal 1.
+The actual Freeciv port is selected at runtime; read `session_port` and the roster
+from `artifacts/runs/<run-id>/capture/manifest.json`, rather than assuming a fixed
+port. The manifest is also the completion/quality record. `--stream` is independent
+of capture and may be used without it.
+
+After the run, make an offline scene list, preview, and short highlight (no model API
+call; keep this local command bounded to 120 seconds):
+
+```sh
+timeout 120s uv run python scripts/capture_export.py \
+  --capture-dir "$CAPTURE_DIR" --edit-id smoke-preview --mode both
+```
+
+The exporter also publishes the user-facing deliverables to the shallow
+`artifacts/highlights/<run-id>--<edit-id>/` directory. It contains whichever
+deliverables the selected export mode generated (`highlight.mp4`, `preview.png`,
+`edl.json`, `scene_list.json`, and provenance metadata); scene-list-only exports
+will not contain a video. The original derived output remains under
+`artifacts/runs/<run-id>/capture/derived/<edit-id>/`, while
+`capture-events.jsonl`, `presenter-events.jsonl`, `images.jsonl`, PNGs, and the
+manifest remain in the capture directory as the raw audit record. The presenter
+prioritizes meaningful events and coalesces routine bursts; skipped or late
+screenshots are recorded explicitly. Camera focus and observer freshness are
+still best-effort and remain marked unverified unless the capture metadata says
+otherwise. A manually inspected prototype run,
+`capture-smoke-20261028T125900Z-final`, completed two turns with two AI opponents:
+it recorded 12 PNGs, two `failed_coalesced` screenshot gaps, and nine verified
+actions. Its manifest reports provisional username-witness identity only (nonce not
+provided, `production_ready: false`), so these artifacts demonstrate the mechanics,
+not a competition-ready capture or identity proof. The live screenshot showed the
+Freeciv map with the model reasoning/actions sidebar; the exported edit should still
+be treated as a prototype and reviewed for gaps. For this exact run, inspect
+`artifacts/runs/capture-smoke-20261028T125900Z-final/capture/manifest.json`, the PNGs
+under `.../capture/images/`, and the rendered files under
+`.../capture/derived/unique-final/`.
+
+The optional `--capture-sync` flags make a recording run wait briefly after
+selected milestone actions (and at most one routine movement per turn) for the
+presenter to durably write that screenshot. `--capture-sync-timeout-ms` bounds
+one checkpoint (default 2000 ms), while `--capture-sync-budget-ms` bounds all
+checkpoint waits in a turn (default 6000 ms). These waits count against the
+acting deadline, so the example reserves the required headroom with
+`--acting-deadline-s 180`. A checkpoint acknowledgement proves that the PNG and
+image metadata were written; it does not prove that the requested action or
+camera position is visible in the pixels. If the presenter is absent, full, or
+late, the run continues and records the timeout or failure in the capture log.
+
+The observer uses the browser's Amplio2 web tileset by default. For a
+presentation-only renderer experiment, pass `--renderer webgl`; this selects
+the web client's WebGL renderer but does not change the game or server.
+WebGL output is experimental and should be visually checked before use in a
+recording. Its 3D initialization can exceed the default two-second checkpoint
+timeout, so an experiment may need a larger timeout and per-turn budget:
+
+```sh
+node scripts/capture_presenter.js \
+  --capture-dir "$CAPTURE_DIR" --headless --renderer webgl
+```
+
+Set the runner flags explicitly when testing it, for example
+`--capture-sync-timeout-ms 5000 --capture-sync-budget-ms 20000`. This improves
+capture timing but does not qualify the renderer's visual correctness.
+
+The installed Freeciv-web image also contains native Isotrident and Trident
+sprite sheets, but those are separate from the native Freeciv `--tiles`
+setting. The browser client needs matching web configuration and terrain
+mappings. Isotrident is therefore gated behind an explicit experimental flag
+and is currently marked `experimental_unverified`; a live test showed missing
+terrain cells and camera errors, so do not use it for competition footage:
+
+```sh
+node scripts/capture_presenter.js \
+  --capture-dir "$CAPTURE_DIR" --headless \
+  --tileset isotrident --allow-experimental-tileset
+```
+
+Amplio2 remains the supported default. The presenter records the requested
+renderer, tileset, asset hashes, and qualification result in capture metadata;
+an asset-load check does not prove that every terrain, city, unit, fog, or
+camera view renders correctly.
+
+The interactive launcher streams responses by default. It allows up to 900 seconds
+without an API stream event and 1200 seconds for the model/action phase of a turn.
+These are upper bounds for slow reasoning calls, not an expected wait; override
+them with `--api-timeout-s` and `--acting-deadline-s` when needed. A response can
+still end at the model's output-token ceiling, in which case the normal repair or
+degraded fallback applies. Pass `--no-stream` to use complete responses. The direct
+`wp2_model_run.py` command keeps streaming disabled and the shorter 120/180 second
+defaults used by the evaluation harness.
+
+Interactive runs use the `conversation_v1` context policy. Each turn appends the
+complete ordered model conversation, including reasoning chunks and execution
+results, so the unchanged prefix can benefit from Mistral prompt caching. Before
+the projected context reaches 500,000 estimated tokens, the conversation is
+compacted at a completed-turn boundary into a versioned state summary plus a
+recent exact tail. The current fog-safe snapshot and candidate table remain the
+authority for each new turn. Use `--context-policy legacy` to run the original
+fresh-prompt policy. Conversation state and a checksummed start-of-turn recovery
+manifest are persisted. To continue from a verified checkpoint, pass the parent
+manifest and a new run ID:
+
+```sh
+./scripts/launch.sh --resume artifacts/runs/parent/recovery.json \
+  --run-id parent-continuation --until-game-over
+```
+
+Freeciv's `aifill` setting is the total number of filled player slots,
+including the model's human slot. The direct runner accepts `--opponents N`
+as the clearer interface (one AI opponent by default), or raw `--aifill N`
+(default `2`, equivalent to one opponent). The bundled server permits up to
+10 total slots. Both the requested opponent count and raw setting are recorded
+in the manifest, run metadata, and recovery digest, so resuming with a
+different scenario is rejected rather than silently changing the game.
+
+The launcher selects the `gameplay_v2` prompt profile. It retains the
+gameplay-oriented strategy and lets the model request bounded, read-only
+lookups against the active Freeciv ruleset snapshot. A lookup is model
+initiated, but it cannot mutate the game: the query is capped at 256
+characters, at most 8 entries and 4,000 rendered characters are returned, and
+the snapshot is captured once at session startup. The current fog-safe state
+and legal candidate table remain authoritative; the lookup is only supporting
+reference material. Provisioning attempts the optional static references: the
+pinned image's classic ruleset is copied when available, and its
+`freeciv-manual` generator produces an eight-file classic manual under
+`artifacts/reference/freeciv-manual`. If a reference is unavailable, the run
+records that status and continues without hidden or network-fetched state. The
+direct `scripts/wp2_model_run.py` command defaults
+to `legacy_eval` for reproducible evaluation runs; choose `--prompt-profile
+gameplay_v2` explicitly with `conversation_v1`. The active profile and
+template hashes are recorded in the manifest and recovery digest, so resume
+cannot silently switch prompts.
+
+For interactive experiments, `gameplay_v3` and `gameplay_v4` are versioned
+candidate-surface bundles. `gameplay_v5` is an opt-in experimental variant of
+v4 that adds one bounded decision-pass instruction to the turn prefix. It is
+not established to be faster or strategically better, and should be compared
+with isolated runs using the same seed and scenario. Select it with
+`--prompt-profile gameplay_v5` and `--context-policy conversation_v1`.
+The harness does not impose a model output-token cap for any of these profiles;
+the provider and the acting deadline remain the relevant limits.
+
+Interactive runs persist `ruleset_reference.json` and
+`ruleset_reference_meta.json` beside the run metadata when the startup
+snapshot is available. The metadata includes its content hash and explicitly
+records whether the reference was unavailable. These files are an audit copy;
+the full reference is not injected into every turn or silently appended to
+the conversation.
+
+#### Optional local Freeciv reference data and generated manual
+
+The lookup tool can use a local copy of Freeciv's bundled data. Extract it from
+the same pinned Docker image used by the stack:
+
+```sh
+./scripts/extract_freeciv_reference.sh
+```
+
+Docker (CLI, daemon, and access to the `freeciv-web` container) is required for
+this command. The extractor checks the container image identity against
+`FREECIV_IMAGE_REF` before copying anything. It first checks the usual image
+locations, then performs a bounded search under `/home/docker/freeciv`,
+`/usr/share/freeciv`, and `/usr/local/share/freeciv`. To see the image ID and
+the paths discovered in the current container without copying files, run:
+
+```sh
+./scripts/extract_freeciv_reference.sh --diagnose
+```
+
+The extractor writes to `artifacts/reference/freeciv` by default:
+
+```text
+artifacts/reference/freeciv/reference.json  # image/path/hash provenance
+artifacts/reference/freeciv/classic/         # copied classic ruleset files
+artifacts/reference/freeciv/helpdata.txt     # optional general help prose
+artifacts/reference/freeciv/LICENSE.txt
+```
+
+`helpdata.txt` is optional. If the image does not contain it in a supported
+prefix, extraction continues with the classic ruleset and records
+`helpdata_status: "unavailable"` in `reference.json`; this is the expected
+interpretation of the informational note printed by the extractor. The
+currently pinned `3.2.91-dev` image used by this repository does not contain
+`helpdata.txt`, but it does include `freeciv-manual`; this is a fact about that
+pinned image, not a claim about every Freeciv image. The normal provisioner
+therefore runs both extractors. Require the classic ruleset (or
+fail rather than warn when Docker or the image is unavailable) with
+`FREECIV_REFERENCE_REQUIRED=1`. Require the general help file as well with
+`FREECIV_REFERENCE_REQUIRE_HELP=1`. Override the defaults with
+`FREECIV_CONTAINER`, `FREECIV_IMAGE_REF`, and `FREECIV_REFERENCE_DIR` when the
+container name, pinned image, or output directory differs. The output is
+checksum- and image-verified on subsequent runs; do not manually edit it.
+The normal launcher attempts this extraction during provisioning/startup;
+set `LECHONK_EXTRACT_FREECIV_REFERENCE=0` to skip that attempt. A skipped or
+failed optional extraction does not prevent the game from starting.
+
+The generated manual has its own extractor and provenance manifest:
+
+```sh
+./scripts/extract_freeciv_manual.sh
+```
+
+It runs `/home/docker/freeciv/bin/freeciv-manual --ruleset classic --wiki`
+inside the verified pinned container and writes `classic1.mediawiki` through
+`classic8.mediawiki`, `reference.json`, and `LICENSE.txt` to
+`artifacts/reference/freeciv-manual/`. Set
+`LECHONK_EXTRACT_FREECIV_MANUAL=0` to skip the automatic startup step, or
+`FREECIV_MANUAL_REQUIRED=1` to fail provisioning if generation is unavailable.
+The extractor is optional because it depends on the container exposing the
+generator; it is not a replacement for the live ruleset snapshot.
+
+If an existing reference directory has a stale image identity or ruleset tree
+checksum, the extractor refuses to overwrite it. Preserve it for inspection
+and move it aside, then rerun the relevant extractor (for example,
+`mv artifacts/reference/freeciv artifacts/reference/freeciv.stale`); never
+edit a manifest hash by hand. A checksum change after an image update is a
+new provenance record, not a reason to weaken verification.
+
+Reference authority is deliberately split. Live `RulesetCtrl` packets from the
+current Freeciv session are authoritative for the active rules and mechanics.
+The copied `classic/` files are static, non-authoritative source material for
+the classic ruleset, and the generated manual is static, non-authoritative
+orientation material derived from that ruleset. `helpdata.txt`, when present,
+is static, general explanatory prose and is also non-authoritative. Neither
+static source can provide current map, visibility, player, diplomacy, or
+legal-action state. The turn's fog-safe snapshot and legal candidate table
+remain authoritative for those questions. Lookup results label their source
+and explicitly report unavailable data. The manual index is a bounded subset
+of the generated classic manual (currently 449 indexed entries across options,
+technologies, commands, units, buildings, terrain, wonders, and governments),
+not an exhaustive parser of all MediaWiki markup or a substitute for the
+server's live ruleset. See [Freeciv reference details](docs/freeciv-reference.md)
+for source precedence, limitations, and provenance.
+
+The repository's development environment cannot assume that a particular image
+contains either `helpdata.txt` or `freeciv-manual`; use `--diagnose` on the
+target Docker container and run the corresponding extractor rather than relying
+on a path copied from another image.
+
+To compare profiles on a bounded run, pass `--prompt-profile legacy_eval`,
+`--prompt-profile gameplay_v1`, or `--prompt-profile gameplay_v2`; an explicit
+option overrides the launcher default.
+
+Resume requires `conversation_v1`, matching model/prompt/schema/ruleset/seed
+configuration, and a distinct child run ID. It restores the Freeciv save,
+conversation state, and committed strategy memory from a rollback point captured
+before model/action work; parent artifacts remain unchanged. Startup applies the
+configured ping timeout and verifies the typed Freeciv server-setting readback;
+the confirmed value and status are persisted in runtime metadata (1260 seconds
+with the default 1200-second acting deadline). While a model call is in flight,
+the driver emits a metadata-only `model_call_heartbeat` progress record every
+10 seconds with elapsed time and either `no_delta_yet` or the age of the last
+stream delta. The heartbeat stops on the first physical completion record
+(including lookup calls) and in the runner's exception path; it never records
+model content.
+
+The launcher generates a timestamped run ID by default. Pass `--run-id my-first-run`
+to choose one explicitly; a normal run rewrites artifacts already in that directory,
+so use a fresh ID when you want to keep an earlier run. The model run can start
+without the optional evaluation evidence, but its feasibility metadata will then be
+incomplete. To generate that evidence first, run the spike fingerprint probe and the
+scripted comparator:
+
+```sh
+./.venv/bin/python scripts/wp2_spike.py
+./.venv/bin/python scripts/wp1_comparator_run_amended.py
+```
+
+These commands create `artifacts/runs/wp2-spike/fingerprint_probe.json` and
+`artifacts/runs/wp1-comparator-amended/run_meta.json`, respectively. The spike needs
+`MISTRAL_API_KEY` for its live probe; the comparator needs the running local Freeciv
+stack.
 
 Local Docker topology (single container, `freeciv-web`, host-persistent):
 
@@ -363,7 +716,8 @@ Upstream quirks with fog implications, disclosed:
   untrustworthy); the digest is recorded in every run manifest, together with the
   embedded server commit, capstring, vendored base + patch head SHAs, harness revision,
   Python lockfile, all seeds, ruleset (`classic`, CivRealm default), server settings
-  (`phasemode player`, `timeout 0`, `pingtimeout 720`, `autotoggle disabled`,
+  (`phasemode player`, `timeout 0`, effective `pingtimeout` derived from the
+  acting deadline and recorded with typed startup readback, `autotoggle disabled`,
   `victories` SPACERACE|ALLIED, `aifill` pinned), model ID + sampling + prompt/schema
   hashes, effective post-load config, and checkpoint checksums.
 - **Seeds:** `randomly_generate_seeds=False` with explicit `mapseed`/`gameseed`/
@@ -391,12 +745,59 @@ Upstream quirks with fog implications, disclosed:
   self-contained static HTML bundle (per-turn timeline, provenance chips, commitments
   board, metrics timeline, manifest) — judges can verify method without the game.
   Render with `scripts/wp3_replay_render.py <run_dir>`.
+  To include the complete saved model output, pass the trace file explicitly:
+  `uv run python scripts/wp3_replay_render.py <run_dir> --traces model_traces.jsonl`.
+  The bundle then exposes each turn/attempt's reasoning, answer, tool calls, and
+  content chunks without truncation. This can make the HTML large and includes
+  potentially sensitive model output, so traces are omitted unless `--traces` is
+  supplied. A verified trace-enabled example is
+  `artifacts/runs/night-2opponents-20261029/replay-traces-test/index.html`.
 - **Known limitation (honest):** the two arms of a pair are **not
   counterfactual-identical**. They start from the same checkpoint and share the
   scenario/map parameters, but the classic-AI opponents are not proven deterministic
   given fixed seeds, and the two policies' different actions diverge the game state.
   AI-state divergence over turns is therefore reported as a descriptive per-pair
   diagnostic (score, city count, units, known tiles) — not as a causal estimate.
+
+### Offline comparison of game runs
+
+`scripts/compare_game_runs.py` compares already-recorded run artifacts without
+contacting the game server or model API. Its CLI is:
+
+```text
+usage: compare_game_runs.py [-h] [--turn-start TURN_START]
+                            [--turn-end TURN_END] [--json-out JSON_OUT]
+                            [--markdown-out MARKDOWN_OUT] [--overwrite]
+                            runs [runs ...]
+```
+
+For example, this compares two recorded arms over turns 5–13 and writes both
+machine-readable and human-readable reports:
+
+```bash
+./.venv/bin/python scripts/compare_game_runs.py \
+  --turn-start 5 --turn-end 13 \
+  --json-out reports/overnight-v3-v4-turns5-13.json \
+  --markdown-out reports/overnight-v3-v4-turns5-13.md \
+  artifacts/runs/night-v3-3opp-20261031b \
+  artifacts/runs/night-v4-mid-20261031o
+```
+
+With neither output option, the report is printed as JSON to stdout. Use
+`--json-out PATH` and/or `--markdown-out PATH` to write files; existing files
+require `--overwrite`. The comparator reads only the checksummed transcript,
+API-call log, and checksum-verified standalone conversation-state files. It
+does not copy assistant messages, model traces, or reasoning output into the
+comparison.
+
+The result is descriptive, not causal. Matching seeds, map settings, and
+opponent counts do not prove that a difference was caused by the policy:
+opponents may be nondeterministic, and different actions can legitimately
+diverge later game state. Treat the report's integrity flags as part of the
+result. In particular, missing snapshot/state turns, unavailable API-record
+checksums, invalid recovery/WAL data, or an unproven state/WAL binding prevent
+`fully_verified` from being true; a report with such flags is useful for
+diagnosis but is not a fully verified comparison.
 
 ### Sampling recorded in run manifests (old vs new semantics)
 

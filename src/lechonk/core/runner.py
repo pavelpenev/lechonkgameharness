@@ -160,6 +160,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+from pathlib import Path
 import re
 import threading
 import time
@@ -171,6 +174,8 @@ from lechonk.core.activities import ACTIVITY_NAMES
 from lechonk.comparator import defaults as defaults_mod
 from lechonk.core.ledger import TranscriptLedger
 from lechonk.core.memory import StrategyMemory
+from lechonk.core.history import DecisionEpisode, DecisionHistory
+from lechonk.core.context_journal import ContextJournal
 from lechonk.core.metrics import compute_metrics, opportunity_domains
 from lechonk.core.model_client import (
     REPAIR_CLASS_SCHEMA,
@@ -184,6 +189,7 @@ from lechonk.core.model_client import (
 )
 from lechonk.core.delta import compute_delta, enforce_delta_budget
 from lechonk.core.jsonutil import canonical_json
+from lechonk.core.recovery import validate_freeciv_username
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
@@ -204,6 +210,10 @@ from lechonk.core.schemas import (
     is_candidate_id,
 )
 
+
+class SessionError(RuntimeError):
+    """Session lifecycle or resume provenance failed closed."""
+
 # --- §3 supervision deadlines ------------------------------------------------
 ACTING_DEADLINE_S = 180.0        # the model phase (§3 line 34)
 PINGTIMEOUT_S = 720.0            # server pingtimeout (decision 8)
@@ -223,6 +233,8 @@ PERSISTENT_VERBS = frozenset(
 # Below any observed successful repair latency (min ~18 s in wp4-eval), so
 # an attempted repair could only time out.
 REPAIR_BUDGET_FLOOR_S = 20.0
+_MAX_CONVERSATION_REJECTIONS = 32
+_MAX_CONVERSATION_REJECTION_REASON = 240
 
 # The activity the snapshot reports while the order is in effect (used for
 # the read-back proof of non-execution; obs_extract ACTIVITY_NAMES).
@@ -429,7 +441,47 @@ class _QuarantineFailStop(RuntimeError):
 class RunnerConfig:
     """§3 supervision deadlines and run parameters."""
 
-    max_turns: int = 50
+    # None means continue until the session reports victory or defeat.
+    # Numeric values retain the bounded evaluation/smoke-run behavior.
+    max_turns: Optional[int] = 50
+    # ``legacy`` preserves the frozen evaluation prompt. ``hybrid_v1`` adds
+    # bounded, completed-turn decision history for interactive runs.
+    context_policy: str = "legacy"
+    # Prompt presentation profile.  ``legacy_eval`` preserves the frozen
+    # evaluation rendering; ``gameplay_v2`` opts into the richer gameplay
+    # instructions and typed strategy-memory fields.
+    prompt_profile: str = "legacy_eval"
+    context_journal_path: Optional[str] = None
+    # Optional continuation inputs.  These are validated before a session is
+    # allowed to act; the CLI is responsible for checksum-validating the
+    # parent checkpoint and staging its save.
+    load_game: Optional[str] = None
+    resume_turn: Optional[int] = None
+    resume_player_id: Optional[int] = None
+    initial_memory_state: Optional[Mapping[str, Any]] = None
+    # Optional durable start-of-turn checkpointing.  A callback is not used
+    # here so the runner can keep the export and manifest atomic from the
+    # same turn boundary.
+    checkpoint_dir: Optional[str] = None
+    recovery_manifest_path: Optional[str] = None
+    conversation_state_path: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    recovery_config_digest: Optional[str] = None
+    recovery_config_digest_schema: Optional[str] = None
+    prompt_bundle_id: Optional[str] = None
+    # Immutable lookup provenance expected on resume; checked after startup
+    # and before any model call.
+    expected_ruleset_reference_hash: Optional[str] = None
+    expected_help_reference_hash: Optional[str] = None
+    expected_help_reference_source_sha256: Optional[str] = None
+    expected_classic_reference_schema_version: Optional[str] = None
+    expected_classic_ruleset_tree_sha256: Optional[str] = None
+    expected_classic_reference_present: Optional[bool] = None
+    expected_manual_reference_schema_version: Optional[str] = None
+    expected_manual_reference_hash: Optional[str] = None
+    expected_manual_reference_source_sha256: Optional[str] = None
+    expected_manual_reference_present: Optional[bool] = None
+    validate_reference_provenance: bool = False
     run_id: str = "run"
     acting_deadline_s: float = ACTING_DEADLINE_S
     # FINISH_SENT/WAITING ≤ pingtimeout-derived bound (720 s + margin).
@@ -444,6 +496,49 @@ class RunnerConfig:
     seed: int = 42
     username: str = "myagent"
     aifill: int = 2
+    # Candidate admission is deliberately independent from the prompt
+    # profile.  The legacy policy remains the default so existing runs and
+    # cache/recovery lineages are byte-for-byte unchanged.
+    candidate_surface_policy: str = "legacy_v1"
+    candidate_surface_cap: Optional[int] = None
+    candidate_admission_version: Optional[str] = None
+    compaction_schema: Optional[str] = None
+    prompt_budget_schema: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        validate_freeciv_username(self.username)
+        # CivRealm's bundled server uses maxplayers=10.  The controlled
+        # human occupies one slot, so aifill is the total number of filled
+        # player slots (the Freeciv server's semantics), and may not exceed
+        # maxplayers=10. Fail before Docker/session startup rather
+        # than allowing Freeciv to silently clamp the scenario.
+        if not 1 <= int(self.aifill) <= 10:
+            raise ValueError(
+                "aifill must be between 1 and 10 (maxplayers=10, "
+                "including the human slot)")
+        self.aifill = int(self.aifill)
+        if self.prompt_profile not in {"legacy_eval", "gameplay_v1", "gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"}:
+            raise ValueError(
+                "prompt_profile must be legacy_eval, gameplay_v1, gameplay_v2, gameplay_v3, gameplay_v4, gameplay_v5, or gameplay_v6")
+        if self.candidate_surface_policy not in {"legacy_v1", "candidate_surface_v2", "candidate_surface_v3"}:
+            raise ValueError(
+                "candidate_surface_policy must be legacy_v1, candidate_surface_v2, or candidate_surface_v3")
+        if self.prompt_profile in {"gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"}:
+            policy = "candidate_surface_v3" if self.prompt_profile == "gameplay_v6" else "candidate_surface_v2"
+            cap = 12000 if self.prompt_profile == "gameplay_v6" else 8000
+            admission = "candidate_surface_v3-r1" if self.prompt_profile == "gameplay_v6" else "candidate_surface_v2-r1"
+            expected = (self.prompt_profile, policy, cap,
+                        admission, "conversation-compaction-v1",
+                        f"{self.prompt_profile.replace('_', '-')}-budget-v1")
+            actual = (self.prompt_bundle_id, self.candidate_surface_policy,
+                      self.candidate_surface_cap, self.candidate_admission_version,
+                      self.compaction_schema, self.prompt_budget_schema)
+            if actual != expected:
+                raise ValueError(f"{self.prompt_profile} requires its versioned prompt/policy/budget identity")
+            if self.recovery_config_digest_schema != "interactive-config-v3":
+                raise ValueError(f"{self.prompt_profile} requires interactive-config-v3 recovery schema")
+        elif self.candidate_surface_policy != "legacy_v1":
+            raise ValueError("candidate surface policy requires a versioned gameplay profile")
 
 
 @dataclass
@@ -523,6 +618,9 @@ def _default_session_factory(config: RunnerConfig) -> Any:
         step_deadline=config.mutation_deadline_s,
         wait_deadline=config.waiting_deadline_s,
         close_deadline=config.teardown_deadline_s,
+        max_turns=config.max_turns,
+        acting_deadline_s=config.acting_deadline_s,
+        load_game=config.load_game,
     )
 
 
@@ -606,7 +704,8 @@ class GameRunner:
     def __init__(self, *, config: RunnerConfig, client: ModelClient,
                  ledger: TranscriptLedger, manifest: RunManifest,
                  session_factory: Optional[Callable[[], Any]] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 progress: Optional[Callable[[dict[str, Any]], None]] = None):
         self.config = config
         self.client = client
         self.ledger = ledger
@@ -614,7 +713,23 @@ class GameRunner:
         self._session_factory = session_factory or (
             lambda: _default_session_factory(config))
         self._clock = clock
-        self.memory = StrategyMemory()
+        # Human-facing observability is deliberately best-effort: a broken
+        # progress consumer must never change game behavior or ledger output.
+        self._progress_callback = progress
+        if config.initial_memory_state is None:
+            self.memory = StrategyMemory()
+        else:
+            self.memory = StrategyMemory.from_state(config.initial_memory_state)
+        self.history = DecisionHistory()
+        self._context_journal: Optional[ContextJournal] = None
+        if self.config.context_policy == "hybrid_v1" and self.config.context_journal_path:
+            journal_path = Path(self.config.context_journal_path)
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self._context_journal = ContextJournal.attach(
+                journal_path, policy_version="hybrid_v1")
+        self._history_results: list[dict[str, Any]] = []
+        self._history_rejections: list[dict[str, Any]] = []
+        self._history_collecting = False
         self._adapter: Optional[_AdapterModules] = None
         self._state = RunState.STARTUP
         self._state_entered: float = clock()
@@ -665,6 +780,38 @@ class GameRunner:
         # so the run result never reports a stale 0 (WP4 fix).
         self._turns_completed = 0
 
+    def _progress(self, event: str, **fields: Any) -> None:
+        """Publish a sanitized, non-sensitive live progress event."""
+        if self._progress_callback is None:
+            return
+        payload = {"event": event}
+        payload.update(fields)
+        try:
+            self._progress_callback(payload)
+        except Exception:
+            # Observability is never allowed to interrupt a run.
+            return
+
+    def _admit_candidates(self, table: CandidateTable):
+        """Return the offered table and optional versioned admission result.
+
+        Keeping this switch in the runner makes the legacy path use the exact
+        pre-policy ``CandidateTable`` behavior.  The v2 module is imported
+        only when explicitly selected, and is intentionally not coupled to a
+        prompt profile or recovery digest yet.
+        """
+        if self.config.candidate_surface_policy == "candidate_surface_v3":
+            from lechonk.core.candidate_surface_v3 import admit_candidate_surface
+            admission = admit_candidate_surface(table, cap_tokens=self.config.candidate_surface_cap or 12000)
+            return admission.offered, admission
+        if self.config.candidate_surface_policy == "candidate_surface_v2":
+            from lechonk.core.candidate_surface_v2 import (  # noqa: PLC0415
+                admit_candidate_surface,
+            )
+            admission = admit_candidate_surface(table)
+            return admission.offered, admission
+        return table.offered(), None
+
     # ------------------------------------------------------------------
     # adapter (lazy, §7.1)
     # ------------------------------------------------------------------
@@ -688,6 +835,7 @@ class GameRunner:
 
     def _transition(self, state: RunState) -> None:
         prev = self._state
+        previous_entered = self._state_entered
         self._state = state
         self._state_entered = self._clock()
         # D7/D14: publish the phase's absolute deadline for the stall
@@ -710,12 +858,147 @@ class GameRunner:
         self._state_generation += 1
         self.ledger.append(MetricEventRecord(
             name="state_transition", value=f"{prev.value}->{state.value}"))
+        self._progress(
+            "state",
+            from_state=prev.value,
+            state=state.value,
+            elapsed_s=round(self._state_entered - previous_entered, 3),
+        )
 
     def _emit(self, record: Any, *, durable: bool = False) -> int:
         return self.ledger.append(record, durable=durable)
 
     def _emit_action_result(self, *, durable: bool = False, **fields: Any) -> int:
-        return self._emit(ActionResultRecord(**fields), durable=durable)
+        # Construct once so the live progress event reflects schema defaults
+        # (including provenance_class), rather than only fields explicitly
+        # supplied by the caller.
+        record = ActionResultRecord(**fields)
+        seq = self._emit(record, durable=durable)
+        # Rejections are feedback, rather than executable history. Keep a
+        # bounded copy for the durable conversation report even when this
+        # result was emitted during initial ingest (before the legacy
+        # history-collection window opens), or during revalidation.
+        if (fields.get("outcome") == "rejected"
+                and len(self._history_rejections)
+                < _MAX_CONVERSATION_REJECTIONS):
+            reason = str(fields.get("detail") or fields.get("reason") or "")
+            self._history_rejections.append({
+                "ref": fields.get("ref"),
+                "rejection_class": fields.get("rejection_class"),
+                "provenance_class": fields.get("provenance_class"),
+                "reason": reason[:_MAX_CONVERSATION_REJECTION_REASON],
+            })
+        if self._history_collecting:
+            # Keep only normalized, non-executable evidence for the next
+            # prompt.  The raw ActionResultRecord remains the provenance
+            # source in the transcript.
+            self._history_results.append({
+                key: fields.get(key)
+                for key in ("domain", "verb", "target", "affected",
+                            "outcome", "rejection_class",
+                            "provenance_class", "readback")
+                if fields.get(key) is not None
+            })
+        self._progress(
+            "action_result",
+            turn=fields.get("turn"), ref=fields.get("ref"),
+            domain=fields.get("domain"), verb=fields.get("verb"),
+            # Preserve the structured location descriptors in the live
+            # capture stream.  ``actor_tile`` is a tuple in the frozen
+            # ledger schema; publish it as a JSON-native list so observers
+            # can safely use it for camera focus without parsing repr().
+            target=fields.get("target"),
+            affected=fields.get("affected"),
+            actor_tile=(list(fields["actor_tile"])
+                        if fields.get("actor_tile") is not None else None),
+            outcome=fields.get("outcome"),
+            provenance_class=record.provenance_class,
+            readback=fields.get("readback"),
+        )
+        return seq
+
+    def _commit_history_episode(self, *, turn: int, result: _IngestResult,
+                                repair_used: bool, status: str = "completed") -> None:
+        """Publish one completed turn to the optional hybrid journal."""
+        if self.config.context_policy != "hybrid_v1":
+            return
+        planned = []
+        for item in result.planned:
+            candidate = item.candidate
+            planned.append({
+                "domain": candidate.domain,
+                "verb": candidate.verb,
+                "target": candidate.actor_id,
+            })
+        notes = result.batch.notes if result.batch is not None else ""
+        self.history.add(DecisionEpisode.from_parts(
+            turn=turn, notes=notes, planned=planned,
+            results=self._history_results, degraded=result.degraded,
+            repair_used=repair_used,
+            status=("completed_degraded" if result.degraded and status == "completed"
+                    else status)))
+        if self._context_journal is not None:
+            rendered = self.history.render()
+            rendered_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+            # This append is a durability boundary.  If it fails, surface the
+            # error before another model turn can observe an unjournaled
+            # episode; the run's normal infrastructure-failure path records
+            # the failure and preserves the transcript.
+            self._context_journal.append(
+                turn=turn, episode=self.history.episodes[-1].as_dict(),
+                transcript_seq=self.ledger.last_seq,
+                rendered_history_hash=rendered_hash, durable=True)
+
+    def _commit_conversation_turn(self, *, turn: int,
+                                  result: _IngestResult,
+                                  repair_used: bool) -> None:
+        """Commit a completed conversation turn after execution is known.
+
+        ``MistralTurnClient`` owns the exact message/chunk history.  The
+        runner supplies only normalized execution evidence, and does so after
+        ``memory.advance`` and the finish phase.  This keeps a planned action
+        from being replayed as if it succeeded.  The duck-typed call keeps
+        scripted/fake clients and the legacy policy model-agnostic.
+        """
+        if self.config.context_policy != "conversation_v1":
+            return
+        commit = getattr(self.client, "commit_turn", None)
+        if not callable(commit):
+            raise RuntimeError(
+                "conversation_v1 requires a client with commit_turn()")
+        planned = []
+        for item in result.planned:
+            candidate = item.candidate
+            planned.append({
+                "domain": candidate.domain,
+                "verb": candidate.verb,
+                "target": candidate.actor_id,
+            })
+        report = {
+            "historical_turn": turn,
+            "status": "completed_degraded" if result.degraded else "completed",
+            "repair_used": repair_used,
+            "intent": {
+                "notes": result.batch.notes if result.batch is not None else "",
+                "planned": planned,
+            },
+            "execution": list(self._history_results),
+            "rejected": list(self._history_rejections),
+            "authority": "CURRENT_SNAPSHOT_AND_CANDIDATES_OVERRIDE_HISTORY",
+            "rejection_guidance": (
+                "Rejected refs are unavailable unless explicitly re-offered "
+                "in the current candidate table; choose exact refs from "
+                "CURRENT_SNAPSHOT_AND_CANDIDATES."),
+        }
+        commit(report)
+
+    def _abort_conversation_turn(self) -> None:
+        """Discard a staged conversation turn on any incomplete run path."""
+        if self.config.context_policy != "conversation_v1":
+            return
+        abort = getattr(self.client, "abort_turn", None)
+        if callable(abort):
+            abort()
 
     # ------------------------------------------------------------------
     # the W3-1 dispatch-intent boundary (D5)
@@ -812,9 +1095,461 @@ class GameRunner:
             except Exception:
                 pass  # the unwind path reports the abort reason
 
+    def _configure_ruleset_lookup(self) -> None:
+        """Install the bounded local encyclopedia callable for gameplay.
+
+        The core runner remains model-agnostic: the concrete turn client may
+        opt into this hook (the legacy/fake clients simply do not implement
+        it).  The callable closes over the immutable reference collected by
+        ``AdapterSession`` and never reaches into the live game, so a model
+        tool call cannot mutate state.  It is deliberately enabled only for
+        the interactive conversation profile; legacy requests retain their
+        exact request shape and attempt accounting.
+        """
+        if (self.config.context_policy != "conversation_v1" or
+                self.config.prompt_profile not in {"gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"}):
+            return
+        setter = getattr(self.client, "set_ruleset_lookup", None)
+        if not callable(setter):
+            # Keep a small compatibility seam while the model adapter rolls
+            # out the named hook; no dynamic attribute assignment is used.
+            setter = getattr(self.client, "configure_ruleset_lookup", None)
+        reference = getattr(self._session, "ruleset_reference", None)
+        # AdapterSession may expose the provisioned static help index under
+        # either name while that lifecycle seam is rolled out.  It is a
+        # separate, non-authoritative source: only the live ruleset reference
+        # may describe the current game.
+        generic_help = getattr(self._session, "help_reference", None)
+        if generic_help is None:
+            generic_help = getattr(self._session, "generic_help_reference", None)
+        if generic_help is None:
+            generic_help = getattr(self._session, "freeciv_help_reference", None)
+        # The extracted classic ruleset index is optional and deliberately
+        # separate from helpdata: it is useful historical/reference prose,
+        # but is never authoritative for the live game's ruleset.
+        classic = getattr(self._session, "classic_reference", None)
+        if classic is None:
+            classic = getattr(self._session, "classic_ruleset_reference", None)
+        manual = getattr(self._session, "manual_reference", None)
+        if manual is None:
+            manual = getattr(self._session, "freeciv_manual_reference", None)
+        if manual is None:
+            manual = getattr(self._session, "manual_help_reference", None)
+        if self.config.validate_reference_provenance:
+            help_source_sha = getattr(generic_help, "source_sha256", None)
+            help_status = getattr(generic_help, "status", None)
+            session_help_hash = getattr(self._session, "help_reference_hash", None)
+            actual_help_hash = (session_help_hash if session_help_hash is not None
+                                else getattr(generic_help, "content_hash", None))
+            if help_status not in (None, "available"):
+                actual_help_hash = None
+                help_source_sha = None
+            classic_status = getattr(self._session, "classic_reference_status", None)
+            if callable(classic_status):
+                classic_status = classic_status()
+            classic_status = (getattr(classic, "status", classic_status)
+                              if classic is not None else classic_status)
+            classic_schema = getattr(classic, "schema_version", None)
+            classic_tree = getattr(classic, "tree_sha256", None)
+            classic_present = (None if classic is None and
+                               classic_status is None else
+                               classic_status in ("available", "complete"))
+            manual_status = getattr(self._session, "manual_reference_status", None)
+            if callable(manual_status):
+                manual_status = manual_status()
+            manual_status = (getattr(manual, "status", manual_status)
+                             if manual is not None else manual_status)
+            manual_schema = getattr(manual, "schema_version", None)
+            manual_source_sha = getattr(manual, "source_sha256", None)
+            manual_hash = getattr(manual, "content_hash", None)
+            manual_present = (None if manual is None and manual_status is None
+                              else manual_status in ("available", "complete"))
+            if not manual_present:
+                manual_schema = None
+                manual_hash = None
+                manual_source_sha = None
+            if (getattr(reference, "content_hash", None)
+                    != self.config.expected_ruleset_reference_hash
+                    or actual_help_hash
+                    != self.config.expected_help_reference_hash
+                    or help_source_sha !=
+                    self.config.expected_help_reference_source_sha256
+                    or classic_schema != self.config.expected_classic_reference_schema_version
+                    or classic_tree != self.config.expected_classic_ruleset_tree_sha256
+                    or classic_present != self.config.expected_classic_reference_present
+                    or manual_schema != self.config.expected_manual_reference_schema_version
+                    or manual_hash != self.config.expected_manual_reference_hash
+                    or manual_source_sha != self.config.expected_manual_reference_source_sha256
+                    or manual_present != self.config.expected_manual_reference_present):
+                raise SessionError(
+                    "encyclopedia reference provenance changed on resume")
+        if not callable(setter):
+            return
+        reference_status = getattr(
+            self._session, "ruleset_reference_status", None)
+        if callable(reference_status):
+            reference_status = reference_status()
+        if reference_status is None:
+            reference_status = "available" if reference is not None else "unavailable"
+        self._progress("ruleset_reference_status", status=str(reference_status),
+                       content_hash=getattr(reference, "content_hash", None))
+
+        def lookup(query: str, categories=None, limit: int = 8):
+            """Read-only, bounded lookup against the startup snapshot."""
+            safe_query = query if isinstance(query, str) else str(query or "")
+            safe_query = safe_query[:256]
+            try:
+                safe_limit = max(1, min(int(limit), 8))
+            except (TypeError, ValueError):
+                safe_limit = 8
+            self._progress("ruleset_lookup_started", query=safe_query,
+                           limit=safe_limit)
+            manual_exposed = (manual is not None or
+                              hasattr(self._session, "manual_reference_status"))
+            if (reference is None and generic_help is None and classic is None
+                    and manual is None):
+                result = {"status": "unavailable", "query": safe_query,
+                          "entries": [], "reason": str(reference_status),
+                          "sources": {"active_ruleset": "unavailable",
+                                      "static_help": "unavailable",
+                                      "static_classic": "unavailable",
+                                      **({"static_manual": "unavailable"}
+                                         if manual_exposed else {})},
+                          "provenance": {}}
+            else:
+                # Lazy import preserves the core module's no-network-at-
+                # import invariant and keeps the reference implementation in
+                # the adapter package.
+                from lechonk.adapter.ruleset_reference import render_search
+                from lechonk.adapter.help_reference import (
+                    render_search as render_help_search)
+                # Keep this import lazy: classic_index is an optional
+                # provisioned artifact and must not affect core imports.
+                classic_render = None
+                if classic is not None:
+                    try:
+                        from lechonk.adapter.classic_reference import (
+                            render_search as classic_render)
+                    except (ImportError, AttributeError):
+                        classic_render = None
+                manual_render = None
+                if manual is not None:
+                    try:
+                        from lechonk.adapter.manual_reference import (
+                            render_search as manual_render)
+                    except (ImportError, AttributeError):
+                        manual_render = None
+                try:
+                    active = ({"status": "unavailable", "entries": []}
+                              if reference is None else render_search(
+                                  reference, safe_query,
+                                  categories=(categories or None),
+                                  limit=safe_limit, max_chars=4000))
+                    if reference is not None and "status" not in active:
+                        active["status"] = "available"
+                    static = ({"status": "unavailable", "entries": []}
+                              if generic_help is None else render_help_search(
+                                  generic_help, safe_query,
+                                  categories=(categories or None),
+                                  limit=safe_limit,
+                                  max_chars=4000))
+                    classic_result = ({"status": "unavailable", "entries": []}
+                                      if classic is None or classic_render is None
+                                      else classic_render(
+                                          classic, safe_query,
+                                          categories=(categories or None),
+                                          limit=safe_limit, max_chars=4000))
+                    manual_result = ({"status": "unavailable", "entries": []}
+                                     if manual is None or manual_render is None
+                                     else manual_render(
+                                         manual, safe_query,
+                                         categories=(categories or None),
+                                         limit=safe_limit, max_chars=4000))
+                    # Renderers may return only entries/status; always expose
+                    # immutable source provenance in the tool result.
+                    for key, attr in (("content_hash", "content_hash"),
+                                      ("source_sha256", "source_sha256"),
+                                      ("source", "source"),
+                                      ("source_path", "source_path"),
+                                      ("tree_sha256", "tree_sha256"),
+                                      ("schema_version", "schema_version")):
+                        if key not in classic_result:
+                            value = getattr(classic, attr, None)
+                            if value is not None:
+                                classic_result[key] = value
+                    for key, attr in (("content_hash", "content_hash"),
+                                      ("source_sha256", "source_sha256"),
+                                      ("source", "source"),
+                                      ("source_path", "source_path"),
+                                      ("schema_version", "schema_version")):
+                        if key not in manual_result:
+                            value = getattr(manual, attr, None)
+                            if value is not None:
+                                manual_result[key] = value
+                    entries = []
+                    for entry in active.get("entries", []):
+                        item = dict(entry)
+                        item["authority"] = "active_ruleset"
+                        entries.append(item)
+                    for entry in manual_result.get("entries", []):
+                        item = dict(entry)
+                        item["authority"] = "static_manual_non_authoritative"
+                        entries.append(item)
+                    for entry in static.get("entries", []):
+                        item = dict(entry)
+                        item["authority"] = "static_help_non_authoritative"
+                        entries.append(item)
+                    for entry in classic_result.get("entries", []):
+                        item = dict(entry)
+                        item["authority"] = "static_classic_non_authoritative"
+                        entries.append(item)
+                    # Live data wins, followed by the generated manual and
+                    # then other static indexes. Only records from the same
+                    # source/category/name are deduplicated.
+                    unique = {}
+                    authority_rank = {"active_ruleset": 0,
+                                      "static_manual_non_authoritative": 1,
+                                      "static_help_non_authoritative": 2,
+                                      "static_classic_non_authoritative": 3}
+                    for item in entries:
+                        identity = (
+                            item.get("authority", ""),
+                            str(item.get("category", "")).casefold(),
+                            (str(item.get("name", "")).casefold()
+                             or str(item.get("key", "")).casefold()),
+                        )
+                        old = unique.get(identity)
+                        if (old is None or authority_rank.get(
+                                item.get("authority"), 99) < authority_rank.get(
+                                old.get("authority"), 99)):
+                            unique[identity] = item
+                    entries = list(unique.values())
+                    query_folded = safe_query.casefold()
+                    entries.sort(key=lambda item: (
+                        0 if str(item.get("name", "")).casefold() == query_folded
+                        or str(item.get("key", "")).casefold() == query_folded
+                        else 1,
+                        authority_rank.get(item.get("authority"), 99),
+                        str(item.get("name", "")).casefold(),
+                        str(item.get("key", ""))))
+                    active_status = active.get("status", "unavailable")
+                    static_status = static.get("status", "unavailable")
+                    result = {
+                        "status": ("ok" if active.get("entries") or
+                                   static.get("entries") or
+                                   classic_result.get("entries") or
+                                   manual_result.get("entries") or
+                                   active_status == "available" or
+                                   static_status == "available" or
+                                   classic_result.get("status") == "available" or
+                                   manual_result.get("status") == "available"
+                                   else "unavailable"),
+                        "query": safe_query,
+                        "entries": entries[:safe_limit],
+                        "sources": {
+                            "active_ruleset": active_status,
+                            "static_help": static_status,
+                            "static_classic": classic_result.get(
+                                "status", "unavailable"),
+                            **({"static_manual": manual_result.get(
+                                "status", "unavailable")} if manual_exposed else {}),
+                        },
+                        "provenance": {
+                            "active_ruleset": {
+                                key: active.get(key)
+                                for key in ("source", "source_path", "source_sha256",
+                                            "content_hash")
+                                if active.get(key) is not None
+                            },
+                            "static_help": {
+                                key: static.get(key)
+                                for key in ("source", "source_path", "source_sha256",
+                                            "content_hash")
+                                if static.get(key) is not None
+                            },
+                            "static_classic": {
+                                key: classic_result.get(key)
+                                for key in ("source", "source_path",
+                                            "source_sha256", "content_hash",
+                                            "tree_sha256",
+                                            "schema_version")
+                                if classic_result.get(key) is not None
+                            },
+                            "static_manual": {
+                                key: manual_result.get(key)
+                                for key in ("source", "source_path",
+                                             "source_sha256", "content_hash",
+                                             "schema_version")
+                                if manual_result.get(key) is not None
+                            },
+                        },
+                    }
+                    # Bound the complete callable result, not merely each
+                    # source independently.  Keep it valid JSON because the
+                    # turn client wraps this result in a role=tool message.
+                    while (len(json.dumps(result, ensure_ascii=False,
+                                          separators=(",", ":"))) > 4000
+                           and result["entries"]):
+                        result["entries"].pop()
+                except Exception as exc:
+                    # A malformed tool argument or unavailable reference is a
+                    # normal lookup miss, never a reason to fail the turn.
+                    result = {"status": "error", "query": safe_query,
+                              "entries": [], "error": str(exc)[:240]}
+            self._progress("ruleset_lookup_finished", query=safe_query,
+                           status=result.get("status", "ok"),
+                           entry_count=len(result.get("entries", [])),
+                           result_preview=json.dumps(
+                               result, ensure_ascii=False,
+                               separators=(",", ":"))[:1200])
+            return result
+
+        try:
+            setter(lookup)
+        except TypeError:
+            # A transitional adapter may accept the reference and build the
+            # callable itself.  Keep this fallback bounded and explicit.
+            setter(reference)
     def _check_abort(self) -> None:
         if self._abort.is_set():
             raise _AbortRun(self._abort_reason or "abort requested")
+
+    def _write_start_checkpoint(self, turn: int) -> None:
+        """Export the begin-turn save before model/action work starts.
+
+        This is deliberately fail-closed: a run configured for recovery must
+        never continue after it failed to capture the rollback point and its
+        matching conversation/memory state.
+        """
+        if not self.config.recovery_manifest_path:
+            return
+        if not self.config.checkpoint_dir or not self.config.conversation_state_path:
+            raise SessionError("recovery checkpoint paths are incomplete")
+        from lechonk.eval.checkpoint import export_turn_save
+        from lechonk.core.recovery import build_checkpoint, write_checkpoint
+        ruleset_ref = getattr(self._session, "ruleset_reference", None)
+        help_ref = getattr(self._session, "help_reference", None)
+        if help_ref is None:
+            help_ref = getattr(self._session, "generic_help_reference", None)
+        help_status = getattr(help_ref, "status", None)
+        help_hash = getattr(self._session, "help_reference_hash", None)
+        if help_hash is None:
+            help_hash = getattr(help_ref, "content_hash", None)
+        help_source_sha = getattr(help_ref, "source_sha256", None)
+        if help_status not in (None, "available"):
+            help_hash = None
+            help_source_sha = None
+        classic_ref = getattr(self._session, "classic_reference", None)
+        classic_status = getattr(self._session, "classic_reference_status", None)
+        if callable(classic_status):
+            classic_status = classic_status()
+        if classic_status is None:
+            classic_status = getattr(classic_ref, "status", None)
+        classic_present = (None if classic_ref is None and classic_status is None
+                           else classic_status in ("available", "complete"))
+        classic_provenance = getattr(
+            self._session, "classic_reference_provenance", None)
+        if callable(classic_provenance):
+            classic_provenance = classic_provenance()
+        classic_tree = getattr(classic_ref, "tree_sha256", None)
+        if classic_tree is None and isinstance(classic_provenance, Mapping):
+            classic_tree = classic_provenance.get("tree_sha256")
+        # An unavailable reference object may retain its schema/default empty
+        # digest.  Recovery manifests must encode absence as None, never an
+        # empty or unverifiable checksum.
+        classic_schema = (getattr(classic_ref, "schema_version", None)
+                          if classic_present else None)
+        if not classic_present:
+            classic_tree = None
+        manual_ref = getattr(self._session, "manual_reference", None)
+        if manual_ref is None:
+            manual_ref = getattr(self._session, "freeciv_manual_reference", None)
+        manual_status = getattr(self._session, "manual_reference_status", None)
+        if callable(manual_status):
+            manual_status = manual_status()
+        if manual_status is None:
+            manual_status = getattr(manual_ref, "status", None)
+        manual_present = (None if manual_ref is None and manual_status is None
+                          else manual_status in ("available", "complete"))
+        manual_schema = (getattr(manual_ref, "schema_version", None)
+                         if manual_present else None)
+        manual_source_sha = (getattr(manual_ref, "source_sha256", None)
+                             if manual_present else None)
+        manual_hash = (getattr(manual_ref, "content_hash", None)
+                       if manual_present else None)
+        exported = export_turn_save(
+            username=self.config.username, turn=turn,
+            dest_dir=self.config.checkpoint_dir)
+        # Bind the checkpoint to an immutable conversation snapshot.  The
+        # live state file continues changing as later turns commit and must
+        # never mutate an earlier recovery manifest's hash.
+        live_state = Path(self.config.conversation_state_path)
+        snapshot_state = (Path(self.config.checkpoint_dir) /
+                          f"conversation-state-turn-{turn}.json")
+        # Checkpoints are standalone snapshots: they must not depend on the
+        # live run's WAL, which may continue growing after this checkpoint.
+        conversation = getattr(self.client, "_conversation_manager", None)
+        if conversation is not None and callable(getattr(conversation, "export_standalone", None)):
+            conversation.export_standalone(snapshot_state)
+        else:
+            snapshot_state.parent.mkdir(parents=True, exist_ok=True)
+            tmp_state = snapshot_state.with_suffix(snapshot_state.suffix + ".tmp")
+            shutil.copyfile(live_state, tmp_state)
+            with open(tmp_state, "rb") as state_fh:
+                os.fsync(state_fh.fileno())
+            os.replace(tmp_state, snapshot_state)
+        # Persist the rename itself before publishing the manifest.  Without
+        # the directory fsync, a power loss could leave a manifest pointing
+        # at a filename whose durable directory entry was never committed.
+        try:
+            dir_fd = os.open(snapshot_state.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            raise SessionError(
+                f"cannot durably publish conversation checkpoint: {exc}") from exc
+        checkpoint_kwargs = dict(
+            checkpoint_path=exported.path,
+            artifact_root=str(Path(self.config.checkpoint_dir).resolve().parent),
+            conversation_state_path=snapshot_state,
+            turn=turn, username=self.config.username, run_id=self.config.run_id,
+            parent_run_id=self.config.parent_run_id,
+            player_id=getattr(self._session, "player_id", None),
+            config_digest=(self.config.recovery_config_digest or
+                           f"context={self.config.context_policy};seed={self.config.seed}"),
+            strategy_memory=self.memory.dump_state(),
+            ruleset_reference_schema_version=getattr(
+                ruleset_ref, "schema_version", None),
+            ruleset_reference_hash=getattr(ruleset_ref, "content_hash", None),
+            help_reference_schema_version=getattr(
+                help_ref, "schema_version", None),
+            help_reference_hash=help_hash,
+            help_reference_source_sha256=help_source_sha,
+            classic_reference_schema_version=classic_schema,
+            classic_ruleset_tree_sha256=classic_tree,
+            classic_reference_present=classic_present,
+            checkpoint_sha256=exported.sha256)
+        # Keep compatibility with recovery manifests created before the
+        # optional generated-manual fields were introduced.
+        import inspect
+        build_parameters = inspect.signature(build_checkpoint).parameters
+        for key, value in (
+                ("manual_reference_schema_version", manual_schema),
+                ("manual_reference_hash", manual_hash),
+                ("manual_reference_source_sha256", manual_source_sha),
+                ("manual_reference_present", manual_present)):
+            if key in build_parameters:
+                checkpoint_kwargs[key] = value
+        for key, value in (("config_digest_schema", self.config.recovery_config_digest_schema),
+                           ("prompt_bundle_id", self.config.prompt_bundle_id)):
+            if key in build_parameters and value is not None:
+                checkpoint_kwargs[key] = value
+        checkpoint = build_checkpoint(**checkpoint_kwargs)
+        write_checkpoint(self.config.recovery_manifest_path, checkpoint)
+        self._progress("checkpoint_written", turn=turn,
+                       path=self.config.recovery_manifest_path)
 
     def _watchdog_phase_state(self) -> tuple[int, Optional[float]]:
         """The stall watchdog's phase view: (state generation, phase
@@ -953,6 +1688,70 @@ class GameRunner:
             self._transition(RunState.STARTUP)
             self._session = self._session_factory()
             self._session.start()  # §3 startup deadline (session-enforced)
+            # The interactive gameplay client may expose a local,
+            # read-only encyclopedia tool.  Configure it only after the
+            # session has collected its immutable ruleset reference.
+            self._configure_ruleset_lookup()
+            if self.config.resume_turn is not None:
+                actual_turn = int(getattr(self._session, "turn", -1))
+                if actual_turn != int(self.config.resume_turn):
+                    raise SessionError(
+                        f"loaded checkpoint turn mismatch: expected "
+                        f"{self.config.resume_turn}, got {actual_turn}")
+                if (self.config.resume_player_id is not None and
+                        int(getattr(self._session, "player_id", -1)) !=
+                        int(self.config.resume_player_id)):
+                    raise SessionError(
+                        "loaded checkpoint player mismatch: expected "
+                        f"{self.config.resume_player_id}, got "
+                        f"{getattr(self._session, 'player_id', None)}")
+            session_port = getattr(self._session, "port", None)
+            if callable(session_port):
+                session_port = session_port()
+            # AdapterSession verifies the server's pingtimeout after reset.
+            # Publish that read-back when available, while remaining
+            # compatible with legacy/fake sessions that predate these
+            # observability attributes.
+            session_ready = {
+                "port": session_port,
+                "aifill": self.config.aifill,
+                "configured_ai_opponents": self.config.aifill - 1,
+            }
+            for attr in ("pingtimeout_status", "pingtimeout_actual",
+                         "scenario_readback_status", "aifill_actual",
+                         "maxplayers_actual", "actual_total_players",
+                         "actual_ai_players", "actual_ai_opponents",
+                         "actual_barbarian_ai_opponents",
+                         "actual_unknown_ai_opponents", "actual_player_roster",
+                         "ruleset_reference_status", "ruleset_reference_hash",
+                         "help_reference_status", "help_reference_hash",
+                         "classic_reference_status", "classic_reference_hash",
+                         "manual_reference_status", "manual_reference_hash",
+                         "manual_reference_source_sha256"):
+                try:
+                    value = getattr(self._session, attr)
+                    if callable(value):
+                        value = value()
+                except Exception:
+                    continue
+                if value is not None:
+                    session_ready[attr] = value
+            # Persistable provenance is emitted before the first model call;
+            # snapshots contain static ruleset/help data only, never live
+            # observation or player state.
+            for attr, key in (("ruleset_reference_json", "ruleset_reference_json"),
+                              ("help_reference_json", "help_reference_json"),
+                              ("classic_reference_json", "classic_reference_json"),
+                              ("manual_reference_json", "manual_reference_json")):
+                try:
+                    value = getattr(self._session, attr)
+                    if callable(value):
+                        value = value()
+                except Exception:
+                    continue
+                if value is not None:
+                    session_ready[key] = value
+            self._progress("session_ready", **session_ready)
             outcome, reason, turns_completed = self._run_turns(adapter)
         except _AbortRun as abort:
             self._transition(RunState.FAILED)
@@ -982,6 +1781,12 @@ class GameRunner:
                 reason = f"infrastructure failure: {exc!r} (artifacts intact)"
             turns_completed = self._turns_completed
         finally:
+            # A transport failure, phase timeout, or partial mutation must not
+            # leave a staged assistant message in the next conversation.
+            try:
+                self._abort_conversation_turn()
+            except Exception:
+                pass
             metrics = compute_metrics(self.ledger.records())
             for name, value in metrics.metric_events():
                 self._emit(MetricEventRecord(name=name, value=value))
@@ -993,6 +1798,14 @@ class GameRunner:
                     close_status = self._session.close()
                 except Exception as exc:
                     close_status = f"error: {exc!r}"
+            if self._context_journal is not None:
+                try:
+                    self._context_journal.close()
+                except Exception as exc:
+                    # The journal append path is fail-closed; close errors
+                    # are reported in the run status without masking the
+                    # already-recorded outcome.
+                    self._progress("context_journal_close_error", error=str(exc))
             if self._watchdog is not None:
                 self._watchdog.stop()
         return RunResult(
@@ -1011,7 +1824,8 @@ class GameRunner:
         while True:
             self._check_abort()
             turn = int(self._session.turn)
-            if turn > self.config.max_turns:
+            if (self.config.max_turns is not None
+                    and turn > self.config.max_turns):
                 # No terminal state_transition is emitted here by design:
                 # COMPLETED is an outcome, terminal state NEXT_OWN_PHASE
                 # (see the module docstring).
@@ -1033,7 +1847,12 @@ class GameRunner:
         GAME_OVER. Returns (outcome-or-None, reason, prev_snapshot)."""
         self._transition(RunState.ACTING)
         acting_entered = self._state_entered
+        self._history_results = []
+        self._history_rejections = []
+        self._history_collecting = False
         self._emit(TurnStartRecord(turn=turn))
+        self._progress("turn_started", turn=turn)
+        self._write_start_checkpoint(turn)
 
         # The client declares its provenance class (WP3 paired runs run a
         # scripted comparator arm through this same pipeline; its decisions
@@ -1097,7 +1916,14 @@ class GameRunner:
         # failure like the prompt budget (FW-13): the metric event names
         # the condition, never a generic infrastructure truncation.
         try:
-            offered = table.offered()
+            offered, admission = self._admit_candidates(table)
+            # Render exactly once, from the admitted surface.  In v2 the
+            # admission result owns the expanded (8,000-token) rendering;
+            # rendering its ``offered`` CandidateTable would silently route
+            # back through the legacy 1,200-token cap.  Keep this canonical
+            # text for both the ledger hash and the model prompt.
+            candidates_text = (admission.render() if admission is not None
+                               else table.render())
         except CandidateTableCapExceeded as exc:
             self._emit(MetricEventRecord(
                 name="candidate_table_cap_exceeded",
@@ -1111,10 +1937,21 @@ class GameRunner:
         candidates_seq = self._emit(CandidatesRefRecord(
             turn=turn,
             table_hash=hashlib.sha256(
-                offered.render().encode("utf-8")).hexdigest(),
+                candidates_text.encode("utf-8")).hexdigest(),
             candidate_count=len(offered.candidates),
             by_domain=by_domain,
-            opportunity_domains=opportunity_domains(offered.candidates)))
+            opportunity_domains=opportunity_domains(offered.candidates),
+            candidate_surface_policy=(admission.policy if admission else "legacy_v1"),
+            candidate_cap_tokens=(admission.cap_tokens if admission else None),
+            total_candidate_count=(admission.total_candidate_count if admission else None),
+            offered_candidate_count=(admission.offered_candidate_count if admission else None),
+            omitted_candidate_count=(admission.omitted_candidate_count if admission else None),
+            total_by_domain=(admission.total_by_domain if admission else {}),
+            offered_by_domain=(admission.offered_by_domain if admission else {}),
+            omitted_by_domain=(admission.omitted_by_domain if admission else {}),
+            total_tokens=(admission.total_tokens if admission else None),
+            offered_tokens=(admission.offered_tokens if admission else None),
+            omitted_tokens=(admission.omitted_tokens if admission else None)))
 
         # W3-9 (D9/D12, Option A): the turn-start observation event — the
         # first of the four events feeding the persistent last-seen
@@ -1126,8 +1963,10 @@ class GameRunner:
 
         delta = enforce_delta_budget(compute_delta(prev_snapshot, snapshot))
         delta_text = delta.render()
-        self.memory.begin_turn(turn)
-        candidates_text = table.render()
+        memory_profile = ("gameplay"
+                          if self.config.prompt_profile in {"gameplay_v1", "gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"}
+                          else "legacy")
+        self.memory.begin_turn(turn, profile=memory_profile)
         # The intent-before-write durability boundary (§3 line 34): every
         # intent record of the turn is on disk before the first mutation.
         self.ledger.fsync()
@@ -1151,8 +1990,20 @@ class GameRunner:
             self._transition(RunState.FAILED)
             return ("TRUNCATED", f"prompt budget exceeded: {exc}",
                     prev_snapshot)
+        batch = result.batch
+        self._progress(
+            "turn_decision",
+            turn=turn,
+            actions=[item.ref for item in result.planned],
+            action_count=len(result.planned),
+            repair_used=repair_used,
+            degraded=result.degraded,
+            why=why,
+            notes=(batch.notes if batch is not None else ""),
+        )
         self._check_acting_deadline(acting_entered)
         self._check_abort()
+        self._history_collecting = True
 
         # --- memory update (rides the ActionBatch, never a separate call);
         # FW-R2: the ledger carries the union of every attempt's
@@ -1246,9 +2097,20 @@ class GameRunner:
             self._transition(RunState.GAME_OVER)
             defeated = self._my_player_defeated(finish.observation)
             if finish.truncated and not finish.terminated:
+                # The phase was interrupted by infrastructure; do not publish
+                # a partial legacy history episode or context-journal record.
+                self._history_collecting = False
                 return ("TRUNCATED",
                         "infrastructure truncation at the phase boundary "
                         "(server timeout) — artifacts intact", None)
+            # A truncated/infra phase is not a completed conversation turn;
+            # only a terminal game-over boundary may be committed.  This
+            # keeps a partial turn out of the next request's history.
+            self._commit_history_episode(
+                turn=turn, result=result, repair_used=repair_used)
+            self._history_collecting = False
+            self._commit_conversation_turn(
+                turn=turn, result=result, repair_used=repair_used)
             if defeated is None:
                 return ("TRUNCATED",
                         "game over at the phase boundary with unknown "
@@ -1258,6 +2120,15 @@ class GameRunner:
             return ("DEFEATED" if defeated else "VICTORY",
                     "game over at the phase boundary "
                     f"(defeated={defeated})", None)
+        # A normal phase boundary is a completed conversation turn too.  The
+        # next model request must see the exact assistant response plus this
+        # turn's execution report; commit only after finish_phase and memory
+        # advancement have both succeeded.
+        self._commit_history_episode(
+            turn=turn, result=result, repair_used=repair_used)
+        self._history_collecting = False
+        self._commit_conversation_turn(
+            turn=turn, result=result, repair_used=repair_used)
         # W3-9: the finish-boundary observation event (the fourth) — the
         # post-finish observation is the first sight of the next phase's
         # state; final-boundary transitions before the horizon exit are
@@ -1369,6 +2240,70 @@ class GameRunner:
     # the model phase
     # ------------------------------------------------------------------
 
+    def _emit_client_call_records(self, *, turn: int, prompt: TurnPrompt,
+                                   response: Any, logical_attempt: int,
+                                   before_records: int,
+                                   next_attempt: int) -> tuple[int, int]:
+        """Ledger physical API calls while preserving legacy fake clients.
+
+        A lookup-enabled turn has one logical ``complete_turn`` call that
+        may contain an initial tool-request API call and a tool-final API
+        call.  The runner must expose both physical calls, then allow one
+        repair (three physical calls total).  Legacy clients do not expose
+        ``call_records`` and retain the historical one-record-per-protocol
+        call behavior.
+        """
+        records = list(getattr(self.client, "call_records", ()))[before_records:]
+        records = [record for record in records
+                   if record.get("kind") != "conversation_compaction"]
+        if not records:
+            next_attempt += 1
+            seq = self._emit(ModelCallRecord(
+                call_id=prompt.call_id, attempt=next_attempt,
+                prompt_hash=response.prompt_hash, latency_ms=response.latency_ms,
+                tokens_in=response.tokens_in, tokens_out=response.tokens_out,
+                cost_usd=response.cost_usd, fingerprint=response.fingerprint,
+                error=response.error,
+                usage_status=(response.usage_status or (
+                    "partial" if response.tokens_in is not None or
+                    response.tokens_out is not None else "unavailable")),
+                cost_status=(response.cost_status or "unknown")))
+            self._progress(
+                "model_call_finished", turn=turn, attempt=next_attempt,
+                logical_attempt=logical_attempt, physical=True,
+                latency_ms=response.latency_ms, tokens_in=response.tokens_in,
+                tokens_out=response.tokens_out,
+                outcome=("error" if response.error else "ok"),
+            )
+            return seq, next_attempt
+
+        last_seq = None
+        for record in records:
+            next_attempt += 1
+            seq = self._emit(ModelCallRecord(
+                call_id=str(record.get("call_id") or prompt.call_id),
+                attempt=next_attempt,
+                prompt_hash=str(record.get("prompt_hash") or response.prompt_hash),
+                latency_ms=int(record.get("latency_ms") or 0),
+                tokens_in=(int(record["tokens_in"]) if record.get("tokens_in") is not None else None),
+                tokens_out=(int(record["tokens_out"]) if record.get("tokens_out") is not None else None),
+                cost_usd=(float(record["cost_usd"]) if record.get("cost_usd") is not None else None),
+                fingerprint=str(record.get("fingerprint") or ""),
+                error=record.get("error"),
+                usage_status=record.get("usage_status"),
+                cost_status=record.get("cost_status")))
+            last_seq = seq
+            self._progress(
+                "model_call_finished", turn=turn, attempt=next_attempt,
+                logical_attempt=logical_attempt,
+                physical_kind=record.get("kind", "initial"),
+                latency_ms=record.get("latency_ms", 0),
+                tokens_in=record.get("tokens_in", 0),
+                tokens_out=record.get("tokens_out", 0),
+                outcome=("error" if record.get("error") else "ok"),
+            )
+        return last_seq, next_attempt
+
     def _model_phase(self, adapter: _AdapterModules, *, turn: int,
                      table: CandidateTable, snapshot: Snapshot,
                      delta_text: str, snapshot_seq: int,
@@ -1385,19 +2320,24 @@ class GameRunner:
         # FW-16: every attempt's batch-level ActionBatch.commitments, in
         # attempt order — the turn's CommitmentRecord unions both sources.
         batch_commitments: list = []
+        physical_call_index = 0
         prompt = TurnPrompt(
             call_id=f"{run_id}/t{turn}/call1", turn_id=f"{run_id}/t{turn}",
-            memory=self.memory.render_for_prompt(),
+            memory=self.memory.render_for_prompt(
+                profile=("gameplay" if self.config.prompt_profile in
+                         {"gameplay_v1", "gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"} else "legacy")),
             snapshot=snapshot.render(), delta=delta_text,
             candidates=candidates_text,
+            history=(self.history.render()
+                     if self.config.context_policy == "hybrid_v1" else ""),
             budget_s=max(0.0, self.config.acting_deadline_s
                          - (self._clock() - acting_entered)))
+        self._progress("model_call_started", turn=turn, attempt=1)
+        before_records = len(getattr(self.client, "call_records", ()))
         resp = self.client.complete_turn(prompt)
-        call_seq = self._emit(ModelCallRecord(
-            call_id=prompt.call_id, attempt=1, prompt_hash=resp.prompt_hash,
-            latency_ms=resp.latency_ms, tokens_in=resp.tokens_in,
-            tokens_out=resp.tokens_out, cost_usd=resp.cost_usd,
-            fingerprint=resp.fingerprint, error=resp.error))
+        call_seq, physical_call_index = self._emit_client_call_records(
+            turn=turn, prompt=prompt, response=resp, logical_attempt=1,
+            before_records=before_records, next_attempt=physical_call_index)
         result = self._ingest(
             resp, turn=turn, table=table, call_seq=call_seq,
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
@@ -1448,7 +2388,9 @@ class GameRunner:
         # turn never exceeds the deadline by construction.
         repair_prompt = RepairPrompt(
             call_id=f"{run_id}/t{turn}/call2", turn_id=f"{run_id}/t{turn}",
-            memory=self.memory.render_for_prompt(),
+            memory=self.memory.render_for_prompt(
+                profile=("gameplay" if self.config.prompt_profile in
+                         {"gameplay_v1", "gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"} else "legacy")),
             snapshot=snapshot.render(), delta=delta_text,
             candidates=candidates_text,
             budget_s=max(0.0, self.config.acting_deadline_s
@@ -1456,13 +2398,12 @@ class GameRunner:
             error_class=self._repair_class(resp, result),
             failed_refs=[ref for ref, _ in result.invalid],
             refreshed_candidates=candidates_text)
+        self._progress("model_call_started", turn=turn, attempt=2)
+        before_records = len(getattr(self.client, "call_records", ()))
         resp2 = self.client.complete_repair(repair_prompt)
-        call_seq2 = self._emit(ModelCallRecord(
-            call_id=repair_prompt.call_id, attempt=2,
-            prompt_hash=resp2.prompt_hash, latency_ms=resp2.latency_ms,
-            tokens_in=resp2.tokens_in, tokens_out=resp2.tokens_out,
-            cost_usd=resp2.cost_usd, fingerprint=resp2.fingerprint,
-            error=resp2.error))
+        call_seq2, physical_call_index = self._emit_client_call_records(
+            turn=turn, prompt=repair_prompt, response=resp2, logical_attempt=2,
+            before_records=before_records, next_attempt=physical_call_index)
         result2 = self._ingest(
             resp2, turn=turn, table=table, call_seq=call_seq2,
             snapshot_seq=snapshot_seq, candidates_seq=candidates_seq,
@@ -1481,8 +2422,17 @@ class GameRunner:
         result2.degraded = (
             not result2.planned
             and not (result2.batch is not None and not result2.batch.actions))
-        why = (f"model unresponsive after the repair cap (≤2 API attempts "
-               f"per turn): {result2.why}")
+        physical_cap = (3 if self.config.context_policy == "conversation_v1"
+                        and self.config.prompt_profile in {"gameplay_v2", "gameplay_v3", "gameplay_v4", "gameplay_v5", "gameplay_v6"}
+                        and hasattr(self.client, "call_records") else 2)
+        if result2.degraded:
+            why = (f"model unresponsive after the repair cap (≤{physical_cap} "
+                   f"physical API attempts per turn): {result2.why}")
+        else:
+            # A successful repair is a usable model decision.  Preserve its
+            # own diagnostic (normally empty) instead of labeling it as a
+            # repair-cap failure in live progress and turn telemetry.
+            why = result2.why
         return result2, True, why
 
     def _why_unusable(self, resp: ModelResponse, result: _IngestResult) -> str:
@@ -1548,7 +2498,7 @@ class GameRunner:
         # ref to a cap-elided candidate is state it could not see
         # (state_fog_error), never an executable action. Mid-batch legality is
         # a separate check (_execute_planned, full refreshed table).
-        by_id = table.offered().by_id()
+        by_id = self._admit_candidates(table)[0].by_id()
         result = _IngestResult(batch=batch)
         aborted_actors: set[str] = set()
         for item in batch.actions:
@@ -1709,7 +2659,7 @@ class GameRunner:
         stops the next group before any dispatch (verified at HEAD: the
         group loop only calls _execute_planned). The later groups' refs
         ride into the stop summary as unstarted_refs."""
-        offered = table.offered()
+        offered, _ = self._admit_candidates(table)
         log = defaults_mod.decide(snapshot, offered)
         planned: list[_PlannedAction] = []
         for decision in log.decisions:
@@ -1905,25 +2855,53 @@ class GameRunner:
         # pre-mutation baseline (captured BEFORE the send — the session's
         # cached obs may already be post-mutation when the send failed,
         # e.g. a step that completed and an execute that raised after it).
-        try:
-            fresh = self._session.refresh()
-            readback = adapter.execute.verify_readback(
-                cand, pre_obs, fresh.get("observation") or {},
-                my_player_id=self._session.player_id,
-                pre_info=pre_info, post_info=fresh.get("info") or {},
-                production_names=self._session.production_name_map())
-        except Exception as exc2:
+        failure = getattr(self._session, "last_dispatch_failure", None)
+        if isinstance(failure, Mapping) and failure.get("transport_uncertain"):
+            # A websocket callback/write failure poisons the owning session;
+            # refresh() would only re-enter the same connection and can also
+            # clear standing orders.  Fail closed and quarantine without a
+            # same-session reconnect or resend.
+            diagnostic = failure.get("transport_diagnostic")
+            if not isinstance(diagnostic, Mapping):
+                diagnostic = {}
             decision = "unknown"
-            evidence = f"the reconnect read failed: {exc2!r}"
+            evidence = (
+                "transport callback failed; same-session refresh refused "
+                f"(stage={failure.get('stage')!r}, "
+                f"exception={failure.get('exception')!r}, "
+                f"loop={failure.get('owned_loop')!r}, "
+                f"vendor={diagnostic.get('vendor_module_sha256')!r}, "
+                f"traceback={str(failure.get('traceback', ''))[-2048:]})")
+            self._progress(
+                "transport_failure_quarantined",
+                stage=str(failure.get("stage", "unknown")),
+                exception=str(failure.get("exception", "unknown")),
+                loop=str(failure.get("owned_loop")),
+                vendor_module=str(diagnostic.get("vendor_module", "")),
+                vendor_module_sha256=str(diagnostic.get(
+                    "vendor_module_sha256", "")),
+                traceback=str(failure.get("traceback", ""))[-2048:],
+            )
         else:
-            if readback.status == adapter.execute.CONTRADICTED:
-                decision = "non_execution_verified"
-            elif readback.status == adapter.execute.VERIFIED:
-                decision = "executed"
-            else:
+            try:
+                fresh = self._session.refresh()
+                readback = adapter.execute.verify_readback(
+                    cand, pre_obs, fresh.get("observation") or {},
+                    my_player_id=self._session.player_id,
+                    pre_info=pre_info, post_info=fresh.get("info") or {},
+                    production_names=self._session.production_name_map())
+            except Exception as exc2:
                 decision = "unknown"
-            evidence = (f"reconciliation read-back {readback.status}: "
-                        f"{readback.detail}")
+                evidence = f"the reconnect read failed: {exc2!r}"
+            else:
+                if readback.status == adapter.execute.CONTRADICTED:
+                    decision = "non_execution_verified"
+                elif readback.status == adapter.execute.VERIFIED:
+                    decision = "executed"
+                else:
+                    decision = "unknown"
+                evidence = (f"reconciliation read-back {readback.status}: "
+                            f"{readback.detail}")
         self._emit(MetricEventRecord(
             name="mutation_reconciliation",
             value=f"{cand.id}: {decision} ({evidence})"))
@@ -2326,7 +3304,7 @@ class GameRunner:
         — a standing-order re-issue is never dispatched after the ACTING
         deadline (the stop summary reports the outstanding orders as
         remaining_standing_actors, never as per-action records)."""
-        offered = table.offered()
+        offered, _ = self._admit_candidates(table)
         completed_seqs: list[int] = []
         for actor in sorted(self._standing):
             self._check_abort()

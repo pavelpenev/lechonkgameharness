@@ -164,6 +164,10 @@ a { color: #2563eb; }
     <h2>Model batch — actions with provenance</h2>
     <div id="actions-body">loading…</div>
   </section>
+  <section class="panel" id="panel-model-traces">
+    <h2>Full model output</h2>
+    <div id="model-traces-body">loading…</div>
+  </section>
   <section class="panel" id="panel-commitments">
     <h2>Commitments board</h2>
     <div id="commitments-body">loading…</div>
@@ -178,6 +182,7 @@ a { color: #2563eb; }
 <script id="lechonk-turns" type="application/json">__TURNS_JSONL__</script>
 <script id="lechonk-commitments" type="application/json">__COMMITMENTS_JSON__</script>
 <script id="lechonk-meta" type="application/json">__META_JSON__</script>
+<script id="lechonk-model-traces" type="application/json">__MODEL_TRACES_JSON__</script>
 <script>
 (function () {
 "use strict";
@@ -193,7 +198,9 @@ function el(tag, attrs, kids) {
   return n;
 }
 function parseBlock(id) {
-  var t = $(id).textContent.trim();
+  var node = $(id);
+  if (!node) { return null; }
+  var t = node.textContent.trim();
   if (!t || t === "null") { return null; }
   return JSON.parse(t);
 }
@@ -211,6 +218,7 @@ function esc(s) { return String(s).replace(/[&<>]/g, function (c) {
 var meta = parseBlock("lechonk-meta") || {};
 var commitments = parseBlock("lechonk-commitments") || [];
 var turns = parseBlock("lechonk-turns");
+var modelTraces = parseBlock("lechonk-model-traces") || [];
 var records = parseJsonl($("lechonk-transcript").textContent);
 
 var byKind = {};
@@ -649,6 +657,44 @@ function legend(seriesList) {
   renderDetail();
 })();
 
+// ---- full model traces ----------------------------------------------------
+(function renderModelTraces() {
+  var body = $("model-traces-body");
+  if (!body) { return; }
+  if (!meta.model_traces_enabled) {
+    body.appendChild(el("div", { class: "note", text:
+      "Model traces are not embedded. Re-render with --traces " +
+      "model_traces.jsonl to include full reasoning, answers, and tool calls." }));
+    return;
+  }
+  body.appendChild(el("div", { class: "note", text:
+    "Full output is shown verbatim from model_traces.jsonl; incomplete or " +
+    "errored calls are retained and marked below." }));
+  if (!modelTraces.length) { body.appendChild(el("div", { class: "note", text: "no model traces" })); return; }
+  modelTraces.slice().sort(function(a,b) {
+    return (Number(a.turn)||0)-(Number(b.turn)||0) ||
+      (Number(a.attempt)||0)-(Number(b.attempt)||0);
+  }).forEach(function (r) {
+    var status = r.complete === false ? "INCOMPLETE" :
+      (r.complete === true ? "complete" : "STATUS UNKNOWN");
+    var label = "turn " + (r.turn === undefined ? "?" : r.turn) +
+      " · attempt " + (r.attempt === undefined ? "?" : r.attempt) +
+      " · " + status +
+      (r.error ? " · ERROR" : "");
+    var d = el("details");
+    d.appendChild(el("summary", { text: label }));
+    [["reasoning", r.reasoning], ["answer", r.answer],
+     ["tool calls", r.tool_calls], ["content chunks", r.content_chunks],
+     ["error", r.error]].forEach(function (pair) {
+      if (pair[1] === undefined || pair[1] === null || pair[1] === "") return;
+      var value = typeof pair[1] === "string" ? pair[1] : JSON.stringify(pair[1], null, 2);
+      var pre = el("pre", { class: "mono", text: value });
+      d.appendChild(el("h3", { text: pair[0] })); d.appendChild(pre);
+    });
+    body.appendChild(d);
+  });
+})();
+
 // ---- commitments board -----------------------------------------------------
 (function renderCommitments() {
   var body = $("commitments-body");
@@ -834,9 +880,31 @@ def _sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def _read_model_traces(path: Path) -> tuple[list[dict[str, Any]], bool, bytes]:
+    """Read model trace JSONL, tolerating only a torn final line."""
+    records: list[dict[str, Any]] = []
+    raw = path.read_bytes()
+    lines = raw.splitlines(keepends=True)
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            is_last = number == len(lines)
+            if is_last and not line.endswith((b"\n", b"\r")):
+                return records, True, raw
+            raise ValueError(f"malformed model trace line {number}") from exc
+        if not isinstance(item, dict):
+            raise ValueError(f"model trace line {number} is not an object")
+        records.append(item)
+    return records, False, raw
+
+
 def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
                   turns_path: Optional[str | Path] = None,
-                  title: Optional[str] = None) -> dict[str, Any]:
+                  title: Optional[str] = None,
+                  traces_path: Optional[str | Path] = None) -> dict[str, Any]:
     """Render one transcript into a static replay bundle under
     ``out_dir`` (created). Returns the bundle summary (also persisted as
     ``bundle_meta.json``)."""
@@ -878,6 +946,18 @@ def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
                                for line in turns_raw.splitlines()
                                if line.strip()]
 
+    trace_records: list[dict[str, Any]] = []
+    trace_partial = False
+    trace_source = None
+    trace_raw: bytes | None = None
+    if traces_path is not None:
+        trace_src = Path(traces_path)
+        if not trace_src.is_file():
+            raise FileNotFoundError(f"model traces not found: {trace_src}")
+        trace_records, trace_partial, trace_raw = _read_model_traces(trace_src)
+        (out / "model_traces.jsonl").write_bytes(trace_raw)
+        trace_source = str(trace_src)
+
     kinds: dict[str, int] = {}
     for rec in records:
         kinds[rec.kind] = kinds.get(rec.kind, 0) + 1
@@ -909,6 +989,19 @@ def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
         "commitments_board_size": len(board),
         "run_id": manifest.run_id if manifest else None,
         "outcome": outcome_rec.outcome if outcome_rec else None,
+        "model_traces_enabled": traces_path is not None,
+        "model_traces_source": trace_source,
+        "model_traces_count": len(trace_records),
+        "model_traces_complete_count": sum(
+            1 for r in trace_records if r.get("complete") is True),
+        "model_traces_unknown_status_count": sum(
+            1 for r in trace_records if "complete" not in r),
+        "model_traces_discarded_trailing_partial": trace_partial,
+        "model_traces_snapshot_sha256": (
+            hashlib.sha256(trace_raw).hexdigest() if trace_raw is not None else None),
+        "model_traces_snapshot_sha256_note": (
+            "sha256 of the exact bytes read and embedded during rendering; "
+            "integrity metadata, not authenticity" if trace_raw is not None else None),
     }
     html_title = title or (
         f"Le Chonk replay — {manifest.run_id if manifest else transcript.name}")
@@ -920,6 +1013,8 @@ def render_bundle(transcript_path: str | Path, out_dir: str | Path, *,
                      if turns_summaries is not None else "null")
             .replace("__COMMITMENTS_JSON__", _embed(strict_dumps(board)))
             .replace("__META_JSON__", _embed(strict_dumps(meta))))
+    html = html.replace("__MODEL_TRACES_JSON__",
+                        _embed(strict_dumps(trace_records)))
     (out / "index.html").write_text(html, encoding="utf-8")
     (out / "bundle_meta.json").write_text(
         strict_dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
@@ -943,12 +1038,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="bundle output directory (default: "
                              "<transcript dir>/replay)")
     parser.add_argument("--title", default=None, help="viewer title")
+    parser.add_argument("--traces", default=None,
+                        help="optional model_traces.jsonl to embed")
     args = parser.parse_args(argv)
     transcript = Path(args.transcript).resolve()
     out = Path(args.out).resolve() if args.out else \
         transcript.parent / "replay"
     summary = render_bundle(transcript, out, turns_path=args.turns,
-                            title=args.title)
+                            title=args.title, traces_path=args.traces)
     meta = summary["meta"]
     print(f"[replay] rendered {meta['record_count']} records "
           f"({', '.join(f'{k}:{v}' for k, v in sorted(meta['record_kinds'].items()))})")

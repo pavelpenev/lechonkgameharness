@@ -6,6 +6,7 @@ Usage:
   .venv/bin/python scripts/wp3_replay_render.py <run_dir>
   .venv/bin/python scripts/wp3_replay_render.py <run_dir> --transcript NAME
   .venv/bin/python scripts/wp3_replay_render.py <run_dir> --turns NAME
+  .venv/bin/python scripts/wp3_replay_render.py <run_dir> --traces NAME
   .venv/bin/python scripts/wp3_replay_render.py <run_dir> --out DIR
 
 Default: renders <run_dir>/transcript.jsonl (+ turns.jsonl when present)
@@ -44,6 +45,9 @@ def main(argv=None):
                         help="bundle directory name inside the run dir "
                              "(default: replay)")
     parser.add_argument("--title", default=None, help="viewer title")
+    parser.add_argument("--traces", default=None,
+                        help="model_traces.jsonl name inside run dir; "
+                             "embed full model output when supplied")
     args = parser.parse_args(argv)
 
     run_dir = Path(args.run_dir)
@@ -52,13 +56,18 @@ def main(argv=None):
     transcript = run_dir / args.transcript
     turns = run_dir / args.turns
     out = run_dir / args.out
+    traces = run_dir / args.traces if args.traces else None
+    if args.traces and not traces.is_file():
+        print(f"[wp3-replay] FATAL: model traces not found: {traces}")
+        return 2
     if not transcript.is_file():
         print(f"[wp3-replay] FATAL: transcript not found: {transcript}")
         return 2
     summary = render_bundle(
         transcript, out,
         turns_path=turns if turns.is_file() else None,
-        title=args.title)
+        title=args.title,
+        traces_path=traces if traces and traces.is_file() else None)
     meta = summary["meta"]
     kinds = ", ".join(f"{k}:{v}" for k, v in sorted(meta["record_kinds"].items()))
     print(f"[wp3-replay] run dir:  {run_dir}")

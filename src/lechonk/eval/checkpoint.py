@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from lechonk.core.jsonutil import strict_dumps
+from lechonk.core.recovery import validate_freeciv_username
 
 # The pinned container (HANDOFF: docker run --name freeciv-web ...).
 DEFAULT_CONTAINER = "freeciv-web"
@@ -200,7 +201,7 @@ def save_name_for(filename: str) -> str:
 
 
 def save_dir_for(username: str) -> str:
-    return SAVE_DIR_TEMPLATE.format(username=username)
+    return SAVE_DIR_TEMPLATE.format(username=validate_freeciv_username(username))
 
 
 def _parse_stat(raw: str) -> Optional[FileStat]:
@@ -281,6 +282,7 @@ def export_turn_save(*, username: str, turn: int, dest_dir: str | Path,
     with the sha256 recorded; an append-only log entry is written to
     ``dest_dir/exports.jsonl``.
     """
+    username = validate_freeciv_username(username)
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     deadline = clock() + deadline_s
@@ -410,6 +412,7 @@ def stage_for_load(local_path: str | Path, *, username: str,
     sha256 in-container. The staged name keeps the exported save name
     (the save/username coupling, §7.1: the load validates the save's
     username prefix equals ours)."""
+    username = validate_freeciv_username(username)
     local = Path(local_path)
     if not local.is_file():
         raise CheckpointError(f"checkpoint not found: {local}")
