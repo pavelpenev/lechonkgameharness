@@ -79,22 +79,6 @@ git -C vendor/civrealm merge-base --is-ancestor "$CIVREALM_HEAD" HEAD \
   || { echo "civgov-fixes head $CIVREALM_HEAD is not an ancestor of the vendored HEAD" >&2; exit 1; }
 echo "vendor/civrealm is checked out at $CIVREALM_HEAD_SHA (gitlink $CIVREALM_GITLINK)"
 
-# The gitlink intentionally remains pristine in the top-level repository, but
-# Long model calls need a configurable Freeciv ping timeout, and the websocket
-# client needs queued cross-thread writes and deferred transport diagnostics.
-# Apply the tracked compatibility patch idempotently so a clean checkout gets
-# the same behavior as the development workspace.
-CIVREALM_PATCH="../../patches/civrealm-long-pingtimeout.patch"
-if git -C vendor/civrealm apply --reverse --check "$CIVREALM_PATCH" >/dev/null 2>&1; then
-  echo "civrealm compatibility patch already applied"
-elif git -C vendor/civrealm apply --check "$CIVREALM_PATCH" >/dev/null 2>&1; then
-  git -C vendor/civrealm apply "$CIVREALM_PATCH"
-  echo "applied civrealm compatibility patch"
-else
-  echo "civrealm checkout is incompatible with $CIVREALM_PATCH" >&2
-  exit 1
-fi
-
 echo "==> Host architecture"
 arch="$(uname -m)"
 if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; then

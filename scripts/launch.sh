@@ -64,15 +64,10 @@ if [[ -x .venv/bin/python && -d vendor/civrealm && -f vendor/civrealm/pyproject.
   if [ -n "$gitlink_sha" ] && [ "$vendor_head_sha" = "$gitlink_sha" ]; then
     vendor_ok=1
   fi
-  patch_ok=0
-  if git -C vendor/civrealm apply --reverse --check "$repo_dir/patches/civrealm-long-pingtimeout.patch" >/dev/null 2>&1; then
-    patch_ok=1
-  fi
   if ./.venv/bin/python -c 'import lechonk, mistralai' >/dev/null 2>&1 \
       && command -v curl >/dev/null 2>&1 \
       && curl -fsS --max-time 2 http://localhost:8080/pubstatus >/dev/null 2>&1 \
-      && [ "$image_ok" -eq 1 ] && [ "$vendor_ok" -eq 1 ] \
-      && [ "$patch_ok" -eq 1 ]; then
+      && [ "$image_ok" -eq 1 ] && [ "$vendor_ok" -eq 1 ]; then
     stack_ready=1
   fi
 fi

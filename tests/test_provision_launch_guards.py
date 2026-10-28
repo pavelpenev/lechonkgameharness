@@ -246,15 +246,14 @@ def test_reuse_guards_fail_closed_on_provenance_mismatch() -> None:
     launch = LAUNCH.read_text()
     provision = PROVISION.read_text()
 
-    # Fast-path reuse requires the pinned image, exact gitlink checkout, and
-    # the tracked liveness patch to be present and applied.
+    # Fast-path reuse requires the pinned image and exact fork gitlink checkout.
     assert "dock image inspect -f '{{.Id}}'" in launch
     assert 'printf \'%q \' docker "$@"' in launch
     assert "git rev-parse ':vendor/civrealm'" in launch
-    assert "git -C vendor/civrealm apply --reverse --check" in launch
+    assert "git -C vendor/civrealm apply --reverse --check" not in launch
     assert '"$expected_image_id" = "$actual_image_id"' in launch
     assert '"$vendor_head_sha" = "$gitlink_sha"' in launch
-    assert '"$patch_ok" -eq 1' in launch
+    assert '"$patch_ok" -eq 1' not in launch
 
     # Provisioning refuses an existing container with a different image; it
     # must not silently remove and recreate it.
@@ -481,14 +480,12 @@ def _make_launch_fixture(
     tmp_path: Path,
     *,
     running: str = "true",
-    patch_ok: bool = True,
     docker_mode: str = "direct",
 ) -> tuple[Path, Path]:
     """Build a tiny local git fixture and command mocks for launch.sh."""
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     (root / ".venv" / "bin").mkdir(parents=True)
-    (root / "patches").mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
 
     subrepo = tmp_path / "civrealm"
@@ -502,21 +499,16 @@ def _make_launch_fixture(
         check=True,
     )
     (subrepo / "value.txt").write_text("patched\n")
-    patch = subprocess.run(
-        ["git", "-C", str(subrepo), "diff", "--", "value.txt"],
+    subprocess.run(["git", "-C", str(subrepo), "add", "value.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(subrepo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "compatibility patch"],
         check=True,
-        text=True,
-        capture_output=True,
-    ).stdout
-    (root / "patches" / "civrealm-long-pingtimeout.patch").write_text(patch)
-    (subrepo / "value.txt").write_text("base\n")
-    subprocess.run(["git", "-C", str(subrepo), "apply", str(root / "patches" / "civrealm-long-pingtimeout.patch")], check=True)
+    )
     sha = subprocess.run(["git", "-C", str(subrepo), "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip()
     vendor = root / "vendor" / "civrealm"
     vendor.parent.mkdir()
     vendor.symlink_to(subrepo, target_is_directory=True)
     subprocess.run(["git", "-C", str(root), "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/civrealm"], check=True)
-    subprocess.run(["git", "-C", str(root), "add", "patches"], check=True)
 
     launch_copy = root / "scripts" / "launch.sh"
     launch_copy.write_text(LAUNCH.read_text())
@@ -557,8 +549,6 @@ def _make_launch_fixture(
     (bin_dir / "sg").chmod(0o755)
     (bin_dir / "curl").write_text("#!/usr/bin/env bash\nexit 0\n")
     (bin_dir / "curl").chmod(0o755)
-    if not patch_ok:
-        (root / "patches" / "civrealm-long-pingtimeout.patch").write_text("not a patch\n")
     return root, bin_dir
 
 
@@ -704,9 +694,9 @@ def test_launch_dock_sg_fallback_preserves_adversarial_argument_boundaries(
     assert len(logged) == 6
 
 
-@pytest.mark.parametrize(("running", "patch_ok", "expect_provision"), [("true", True, False), ("false", True, True), ("true", False, True)])
-def test_launch_fast_path_is_executable_and_fail_closed(tmp_path: Path, running: str, patch_ok: bool, expect_provision: bool) -> None:
-    root, bin_dir = _make_launch_fixture(tmp_path, running=running, patch_ok=patch_ok)
+@pytest.mark.parametrize(("running", "expect_provision"), [("true", False), ("false", True)])
+def test_launch_fast_path_is_executable_and_fail_closed(tmp_path: Path, running: str, expect_provision: bool) -> None:
+    root, bin_dir = _make_launch_fixture(tmp_path, running=running)
     result = subprocess.run(
         [str(root / "scripts" / "launch.sh"), "--turns", "1"],
         cwd=root,
