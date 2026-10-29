@@ -245,6 +245,50 @@ def test_runner_happy_path_model_driven_run(tmp_path):
     assert result.metrics.participation.numerator == 2
 
 
+def test_runner_horizon_writes_next_turn_boundary_checkpoint(tmp_path,
+                                                              monkeypatch):
+    """A bounded run publishes a resume point after its final turn."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session, max_turns=1)
+    checkpoints = []
+    monkeypatch.setattr(
+        runner, "_write_start_checkpoint",
+        lambda turn: checkpoints.append(turn),
+    )
+
+    result = runner.run()
+
+    assert result.outcome == "COMPLETED"
+    assert result.turns_completed == 1
+    assert checkpoints == [1, 2]
+    assert client.calls == 1
+
+
+def test_runner_horizon_checkpoint_failure_is_truncated(tmp_path, monkeypatch):
+    """A configured recovery boundary is fail-closed at the horizon."""
+    session = FakeSession([turn_world(1), turn_world(2)])
+    client = FakeModelClient([
+        ok_response(["unit:10:goto_e"], turn_id="t1", with_memory=False),
+    ])
+    runner = make_runner(tmp_path, client=client, session=session, max_turns=1)
+
+    def fail_checkpoint(turn):
+        if turn == 2:
+            raise RuntimeError("boundary checkpoint failed")
+
+    monkeypatch.setattr(runner, "_write_start_checkpoint", fail_checkpoint)
+
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert result.turns_completed == 1
+    assert "boundary checkpoint failed" in result.reason
+    assert client.calls == 1
+
+
 def test_runner_gameplay_profile_renders_typed_commitments(tmp_path):
     """Gameplay prompts expose typed commitment metadata, while the
     default/legacy profile remains byte-compatible with an explicit legacy
@@ -360,6 +404,40 @@ def test_runner_installs_ruleset_lookup_for_gameplay_v3(tmp_path):
             "prompt_budget_schema": "gameplay-v3-budget-v1"})
     runner.run()
     assert callable(client.lookup)
+
+
+def test_v3_control_access_gate_fails_before_model_or_phase_finish(tmp_path):
+    """A v3 surface omission is a preflight failure, never a model turn."""
+    client = FakeModelClient()
+    session = FakeSession([turn_world(1), turn_world(2)])
+    runner = make_runner(
+        tmp_path, client=client, session=session, max_turns=1,
+        config_overrides={
+            "context_policy": "conversation_v1", "prompt_profile": "gameplay_v6",
+            "recovery_config_digest_schema": "interactive-config-v3",
+            "prompt_bundle_id": "gameplay_v6",
+            "candidate_surface_policy": "candidate_surface_v3",
+            "candidate_surface_cap": 12000,
+            "candidate_admission_version": "candidate_surface_v3-r1",
+            "compaction_schema": "conversation-compaction-v1",
+            "prompt_budget_schema": "gameplay-v6-budget-v1",
+        })
+    # Keep the raw table from the real fake session, but simulate a broken
+    # admission result that exposes no candidates to the model.
+    runner._admit_candidates = lambda table: (
+        CandidateTable(turn=table.turn, candidates=[]), None)
+
+    result = runner.run()
+
+    assert result.outcome == "TRUNCATED"
+    assert "control access gate failed" in result.reason
+    assert client.calls == 0
+    assert [action for action, _deadline in session.calls] == []
+    records = _records(runner.ledger.path)
+    events = [r for r in records if isinstance(r, MetricEventRecord)
+              and r.name == "control_access"]
+    assert len(events) == 1
+    assert json.loads(events[0].value)["passed"] is False
 
 
 def test_runner_installs_ruleset_lookup_for_gameplay_v4(tmp_path):

@@ -3,7 +3,8 @@
 ## Append-only conversation history and compaction — 2026-10-27
 
 **Type:** architecture / feature
-**Status:** implementation complete; long-game validation pending
+**Status:** implementation complete; superseded by the 2026-10-29 release evidence below
+  (mechanically completed to absolute turn 100; strategic/control limitations remain)
 **Design:** [docs/conversation-history-design.md](docs/conversation-history-design.md)
 
 ### Objective
@@ -66,9 +67,10 @@ request contracts unchanged.
 - [x] Fresh and resumed live launches applied the configured ping timeout and
   verified the typed server-setting readback; the confirmed value/status are in
   runtime metadata (1260 seconds with the default 1200-second acting deadline).
-- [ ] Longer live characterization confirms sustained latency. There is no
-  continuous heartbeat while model generation blocks the worker, and no live
-  call longer than the configured timeout has yet been tested.
+- [Historical limitation] Longer live characterization was not part of the
+  release evidence. There is no continuous heartbeat while model generation
+  blocks the worker, and no live call longer than the configured timeout was
+  established by this section.
 
 ### Validation status
 
@@ -85,9 +87,9 @@ Freeciv `pingtimeout` readback and persisted the effective value/status in
 runtime metadata. A fresh parent/child run then exported a verified
 start-of-turn save, staged it into a distinct child run, restored conversation
 and committed memory, verified player/turn identity, and completed one child
-turn. Longer sustained-latency validation remains pending; the worker has no
-continuous heartbeat during model generation, so this behavior is not yet
-proven beyond the configured timeout.
+turn. The older sustained-latency caveat remains a limitation: the worker has
+no continuous heartbeat during model generation, so behavior beyond the
+configured timeout is not claimed here.
 
 ### Risks and boundaries
 
@@ -112,7 +114,8 @@ at [docs/hybrid-history-design.md](docs/hybrid-history-design.md).
 ## Screenshot-first gameplay capture and competition edits — 2026-10-28
 
 **Type:** architecture / feature
-**Status:** drafted; design and plan independently reviewed with corrections; implementation not started
+**Status:** historical full-architecture plan; implementation not started for that
+  scope (the later screenshot/highlight prototype is separately evidenced below)
 **Design:** [docs/gameplay-capture-design.md](docs/gameplay-capture-design.md)
 
 ### Objective
@@ -412,3 +415,201 @@ review outcomes. This plan is drafted and intentionally unimplemented. No
 implementation, verification, or competition compliance is asserted by this
 section; future changes must preserve the dependency, schema, evidence, and
 failure gates above.
+
+## Comprehensive gameplay-control reliability — 2026-10-29
+
+**Type:** architecture / correctness
+
+**Status:** independently reviewed; planned, not implemented
+
+**Design and evidence:** [control audit](docs/harness-control-audit-2026-10-29.md),
+[control design](docs/harness-control-design.md)
+
+This section supersedes the assumption that a structural `PASS` implies good
+gameplay. The 51–100 run completed mechanically but exposed only unit actions;
+its own participation gate was false. No current game is restarted by this
+planning change. Full reasoning traces, prefix caching, 500,000-token
+compaction, no local output cap, Le Chonk identity, and existing recovery
+lineages remain constraints.
+
+### Deadline-first release scope
+
+The user supplied a rounded 15-hour window on 2026-10-29. Taking the observed
+08:27:35 UTC clock as a planning anchor gives an approximate 23:27 UTC cutoff.
+This is a planning estimate, not a promise that the game will finish on
+schedule.
+
+The first two hours (target 10:27 UTC) are the containment window: fix the
+active-player technology readback and regression, run focused offline checks,
+and run a 3–5-turn captured smoke (a 10-turn smoke is optional only if its
+measured calls and capture synchronization fit the window). Use the existing
+versioned `gameplay_v6`/`candidate_surface_v3` configuration; do not introduce a
+new profile or resolver during the deadline cut. The smoke and its external
+preflight gate must verify that all own settlers, cities, legal research, and
+required production choices are reachable, that critical actors have visible
+state, and that identity, capture synchronization, degraded-run reporting, and
+recovery evidence are present. Run a synthetic mature-empire stress fixture as
+well, because a fresh short game may not reproduce late-game starvation. Any
+missing essential coverage fails the gate visibly.
+
+If that smoke is healthy, freeze the exact launcher/runtime configuration and
+start the main recording by T+2 hours: Le Chonk, two AI opponents, default
+tiles, conversation caching, the 500,000-token compaction policy, no local
+output-token cap, and matching manifest/capture metadata. The next nine hours
+(approximately through 19:27 UTC) are for recorded gameplay, checkpoint health
+audits, and preparing the concise story in parallel; completion of a full game
+is not guaranteed. Measure p50/p95 turn time, control coverage, capture sync,
+degraded status, and recovery evidence during the continuation. The prior
+roughly 45-second mean is not a safe assumption after restoring strategic
+controls. Set the latest restart cutoff from the measured distribution and
+remaining-turn estimate.
+
+At about T+11 hours (approximately 19:27 UTC), freeze the selected footage and
+reserve four hours for the two-minute highlight, concise edited story,
+rendering, review, and one retry. Target a final export by about T+14 hours
+(approximately 22:27 UTC), leaving one hour for validation and delivery. A
+partial game must be labelled as such; it must not be presented as a complete
+victory or merged with footage from another run without clear provenance.
+
+The full health-system rewrite, new catalog tools, the multi-round controller,
+and broad capability expansion remain backlog work. If the preflight gate fails,
+do not launch an untrustworthy deadline run; use the existing
+`lechonk-42-story` highlight or a local fix/fallback with clear provenance.
+Missing government, rates, transport, diplomacy, or victory controls remain
+explicit readiness limits. No old checkpoint changes policy silently: use a
+fresh run or an explicitly validated fork.
+
+The narrowed deadline cut has advisor review approval as a prioritization plan;
+that is not code or capability validation. The full analysis above remains the
+longer-term plan.
+
+### Plan risks and gates
+
+Risks are catalog bloat and latency, read/mutation races, uncertain checkpoint
+recovery, prompt/tool compatibility, and an unverified victory path. The top
+level result is `NOT_READY` when a deterministic mechanical or control-access
+gate fails; model outcome warnings remain distinct. Any automatic continuation
+past a checkpoint requires the recorded gates and review. This plan adds no
+implementation or claim of completion; each package needs its own verification
+evidence before promotion.
+
+### Dependency-ordered execution plan
+
+**Status:** independent design and execution-plan reviews passed after corrections; implementation remains planned. The audit and design
+now incorporate the confirmed active-player readback reproduction, the legacy
+offered-count limitation, tool-call reasoning replay risk, optional discovery,
+state-barrier rules, and explicit incomplete-phase semantics.
+
+| Package | Owner / targets | Depends on | Deliverable and exit |
+|---|---|---|---|
+| P0 evidence, health, resolver (M) | runner, metrics, schema, CLI; `runner.py`, `schemas.py`, `wp2_model_run.py`, `execute.py`, launcher/resume resolver | baseline tests | Active-player verifier; raw/catalog/offered/omitted coverage; one resolver gives the same effective identity, horizon, and sampling across launcher/CLI/recovery. T01/T02 pass; old profiles readable. |
+| P1 static containment (M) | candidate/prompt; admission and observation | P0 | Mature 100+ unit/20+ city fixture exposes settlers, cities, research, contact, and required production alternatives or fails visibly. Declared-scale smoke only. |
+| P2 capability spikes (M) | adapter/session and model transport | P0 | Immutable state barrier; interrupted refresh returns `mutation_outcome_unknown`; Mistral direct/no-query/chained/malformed/timeout/strict-final/thinking-tools probes; mid-phase save result. |
+| P3 catalog and queries (L) | adapter/catalog and recovery identity | P2 | Revisioned fog-safe dashboard, actor-indexed selectors, bounded pages, hashes, stale/owner rejection, complete supported-action enumeration. T03/T04 pass. |
+| P4 rounds and durability (L) | runner, turn, conversation, recovery | P3, recovery spike | Per-round leases and fresh validation, one mutating action per actor initially, explicit finish, monotonic budgets, partial truth, WAL/commit marker, phase-boundary fork. T05–T09 pass. |
+| P5a core/government/rates/diplomacy (L) | adapter/vendor integration | P3 | Settlement, production, research, combat, government, rates, selected diplomacy each have registry, legality, mapping, readback, stale-ref tests, and scripted real-adapter smoke. |
+| P5b specialists/upgrades/trade (L) | adapter/vendor integration | P5a | Each selected capability has the same registry, fog, legality, mapping, readback, and test exit; unsupported remains labelled. |
+| P5c naval/transport (L) | adapter/vendor integration | P5b | Naval and transport paths pass the same exact capability gate before island scenarios. |
+| P5d selected victory (L) | adapter/vendor integration | P5c and chosen ruleset | Space launch or other enabled victory path has handler, available-action exposure, readback, and terminal test; no victory claim from source docs alone. |
+| P6 validated rollout and UX (M) | CLI/docs/capture/manifest/health integration | P4, P5a–P5d, pre-promotion smoke fixture | Integrates one resolver and independent labels; default promotion remains gated by P7. Old lineages preserved; no resolver creation here. |
+| P7 promotion validation (L) | verification, run operations, capture | P4, P5, P6 integration | Fresh 10-turn and mature-state runs, scripted adapter smoke, 2-AI scenario, 50→100→200/300 soak, chosen-ruleset terminal run. Report p50/p90/p95 per phase and per request, calls, output, cache, bytes/turn. Promotion is this package's exit. |
+
+The new production profile omits `temperature`, `top_p`, and `max_tokens` so
+provider defaults are used as requested; its default `reasoning_effort=high` is
+an explicit trace policy. The current direct driver makes that setting
+configurable via `--reasoning-effort`; existing historical profiles retain
+their pinned request shape and are not rewritten. Actual field presence is
+recorded.
+
+### Acceptance test matrix
+
+| ID | Fixture / fault | Expected result | Gate |
+|---|---|---|---|
+| T01 | Reproduce known unit-first starvation with 100+ units, 512-unit stress, 20+ cities | Baseline records the known failure honestly; P3 later requires supported critical actions reachable with no starvation or duplicate pages | P0/P3 |
+| T02 | Opponent 1 first; active 2 researches 7 while opponent researches 3 | Readback verifies active player's 7 | P0 |
+| T03 | Ordinary dirty snapshot race; separately interrupted potentially mutating refresh | Ordinary inconsistency retries within bound or fails before dispatch; interrupted mutating refresh returns `mutation_outcome_unknown` and stops | P2 |
+| T04 | 64-entry/16KiB pages, unequal options, direct last actor | Complete enumeration once; oversized entry typed error | P3 |
+| T05 | Mutation between lease actions, reconnect, phase, wrong owner | Relevant precondition change rejects affected remaining refs; unrelated actor change may proceed after fresh validation; reconnect/phase change invalidates entire lease; no rebinding | P4 |
+| T06 | Direct, no-query, one-query, chained, malformed, timeout, repair, thinking+tools | Matching results, no orphan exchange, exact raw trace; unresolved replay blocks promotion | P2/P4 |
+| T07 | More than 20 units in one phase | Multiple rounds, one explicit finish, monotonic budgets | P4 |
+| T08 | Crash at prepare, action ack, commit, boundary save | Truthful partial record; only prior verified save forkable | P4 |
+| T09 | 500k mid-phase, timeout/unknown anchor, compaction crash | Safe between-round compaction; exact tail; no output cap or staged exchange compaction | P4 |
+| T10 | Government/rates/specialist/upgrade/treaty controls | Registry, legality, mapping, readback, tests; unsupported labelled | P5 |
+| T11 | Launcher, CLI, resume, segment 50→100 | Same profile and horizons/sampling; incompatible lineage fails | P0/P6 |
+| T12 | Capture smoke, disk-full, soak, terminal ruleset, same-turn multi-round IDs | Separate evidence/gameplay health; phase/round/request/tool-call/revision IDs join without overwrite; sidebar labels lookup/thinking/acting/current-round and does not advance game; timings per phase and per request; no readiness without victory path/editorial review | P7 |
+
+Original PLAN sections above remain the historical baseline. The capture
+prototype now produces verified screenshots and highlights in saved runs, but
+the older full capture architecture gates are not all verified; this section
+does not mark them complete. The offline baseline is 1,318 tests passed in
+46.02 seconds, with no new live game started for this plan. Pre-existing source
+and vendor changes remain preserved.
+
+All API, model, ledger, capture, and sidebar events need distinct phase, round,
+request, tool-call, and revision IDs. Joins must preserve honest intent,
+readback, lookup, thinking, acting, and current-round statuses; same-turn
+decisions must never overwrite one another. Timing reports include both own
+phase and individual request/decision distributions, not an average that
+mistakes API calls for game turns. New fixtures use honest synthetic or newly
+instrumented isolated state; missing raw pre-admission data cannot be recreated
+from legacy logs.
+
+Validation starts with a fresh 10-turn game and isolated mature-state 10-turn
+run, plus a scripted real-adapter settlement/production/research smoke kept
+separate from autonomous gameplay. Then run 50 stop/audit → 100 resume →
+200/300 soak, followed by a terminal run for the pinned ruleset. Before a
+full-game claim, record enabled victory conditions and map requirements and
+complete every required path. Do not change actual run or map settings silently.
+
+### Review record
+
+Accepted: optional discovery; proven tools→strict-final baseline; snapshot
+barrier rather than a claimed Python lock; actor-indexed selectors; 20 as a
+per-round bound; explicit `STOPPED_INCOMPLETE_PHASE`; exact traces/no local
+output cap; old profiles and lineages; separate capture evidence quality.
+
+Deferred/rejected: silent checkpoint policy switching; forced city cadence;
+automatic finish; replay after uncertain mutation; documentation-only claims
+for transport, trade, or spaceship; every action in one prompt; unprobed
+tool/strict-schema behavior. Independent re-review remains required at P0,
+P3/P4, and P7; no item here is implemented.
+
+### Review record — 2026-10-29
+
+The architecture advisor and independent plan reviewer both returned PASS after
+corrections to the snapshot barrier, batch lease, replay probe, compaction
+durability, and resolver dependencies. The 1,318-test/46.02-second baseline,
+document diff, and local links were verified. No new live game or code change
+was made in this review. User approval and live capability probes remain
+pending; future phase gates still require their own evidence.
+
+## Release evidence completion — 2026-10-29
+
+The release cut completed the scoped, mechanically verifiable work: the
+own-player research/readback fix; the critical-controls admission gate;
+`--reasoning-effort` CLI support; resume and conversation compaction; the actual
+same-game recording through absolute turn 100 across resumed segments; and the
+118-second narrated demo. The latest segment,
+`artifacts/runs/lechonk-none-recording-100-20261029/`, covers own phases 51–100
+(50 phases) and passes 15 structural checks. Its participation gate is false
+and 29 model actions were rejected for `state_fog_error`; this evidence is not
+a victory or strategic benchmark.
+
+The comprehensive gameplay-control architecture above remains explicitly
+deferred/not implemented. Government, rates, transport, diplomacy, full
+capability coverage, and a verified victory path remain backlog items; the
+release does not claim that all gameplay issues are fixed. Earlier pending
+language in this plan is historical where retained, and is superseded only for
+the mechanically completed scope stated here.
+
+The dated pre-review offline baseline was `.venv/bin/pytest -q`: 1,347 passed;
+the final full verification is `.venv/bin/pytest -q`: 1,355 passed in 46.77 s.
+The unchanged Node presenter self-test passed, and media-reuse validation passed
+alongside the approved artifact hash checks. Ruff was unavailable and therefore
+was not passed. The review fixes cover persisting incomplete usage anchors,
+validating generated audio as actual PCM WAV, and quote-safe concat paths.
+Generated test logs and obsolete previews were archived reversibly; the inventory is
+`/home/pav/code/lechonkgameharness-archive/cleanup-20261029-final/inventory.json`.
+Source capture assets were retained. Generated video/audio artifacts remain
+local and ignored; the checkout contains the renderer, provenance-oriented
+documentation, and this evidence summary, not generated binaries.

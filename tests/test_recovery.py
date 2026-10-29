@@ -16,6 +16,7 @@ from lechonk.core.recovery import (
     load_checkpoint,
     sha256_file,
     validate_freeciv_username,
+    validate_player_name,
     write_checkpoint,
 )
 from lechonk.core.ledger import TranscriptLedger
@@ -43,6 +44,37 @@ def test_freeciv_username_accepts_legacy_and_valid_values(value):
 def test_freeciv_username_rejects_path_or_parser_unsafe_values(value):
     with pytest.raises(RecoveryError, match="invalid username"):
         validate_freeciv_username(value)
+
+
+def test_checkpoint_player_name_is_optional_and_checksummed(tmp_path):
+    root, save, state, manifest, _ = _fixture(tmp_path)
+    checkpoint = build_checkpoint(
+        checkpoint_path=save, artifact_root=root,
+        conversation_state_path=state, turn=4, username="player",
+        run_id="run-4", parent_run_id="run-3", player_id=1,
+        config_digest="cfg-digest", strategy_memory={},
+        player_name="Le Chonk")
+    write_checkpoint(manifest, checkpoint)
+    loaded = load_checkpoint(manifest, artifact_root=root)
+    assert loaded.player_name == "Le Chonk"
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    assert raw["player_name"] == "Le Chonk"
+    raw["player_name"] = "Tampered"
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(RecoveryError, match="manifest checksum"):
+        load_checkpoint(manifest, artifact_root=root)
+
+
+def test_legacy_checkpoint_omits_player_name(tmp_path):
+    root, _, _, manifest, _ = _fixture(tmp_path)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "player_name" not in raw
+
+
+@pytest.mark.parametrize("value", ["", "x" * 48, "bad\nname"])
+def test_player_name_validation(value):
+    with pytest.raises(ValueError):
+        validate_player_name(value)
 
 
 def test_low_level_runner_rejects_unsafe_username():

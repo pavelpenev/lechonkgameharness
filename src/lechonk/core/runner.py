@@ -176,6 +176,7 @@ from lechonk.core.ledger import TranscriptLedger
 from lechonk.core.memory import StrategyMemory
 from lechonk.core.history import DecisionEpisode, DecisionHistory
 from lechonk.core.context_journal import ContextJournal
+from lechonk.core.control_access import assess_control_access
 from lechonk.core.metrics import compute_metrics, opportunity_domains
 from lechonk.core.model_client import (
     REPAIR_CLASS_SCHEMA,
@@ -189,7 +190,7 @@ from lechonk.core.model_client import (
 )
 from lechonk.core.delta import compute_delta, enforce_delta_budget
 from lechonk.core.jsonutil import canonical_json
-from lechonk.core.recovery import validate_freeciv_username
+from lechonk.core.recovery import validate_freeciv_username, validate_player_name
 from lechonk.core.schemas import (
     ActionBatch,
     ActionResultRecord,
@@ -495,6 +496,7 @@ class RunnerConfig:
     workdir: str = "."
     seed: int = 42
     username: str = "myagent"
+    player_name: Optional[str] = None
     aifill: int = 2
     # Candidate admission is deliberately independent from the prompt
     # profile.  The legacy policy remains the default so existing runs and
@@ -507,6 +509,8 @@ class RunnerConfig:
 
     def __post_init__(self) -> None:
         validate_freeciv_username(self.username)
+        if self.player_name is not None:
+            self.player_name = validate_player_name(self.player_name)
         # CivRealm's bundled server uses maxplayers=10.  The controlled
         # human occupies one slot, so aifill is the total number of filled
         # player slots (the Freeciv server's semantics), and may not exceed
@@ -612,6 +616,7 @@ def _default_session_factory(config: RunnerConfig) -> Any:
         workdir=config.workdir,
         seed=config.seed,
         username=config.username,
+        player_name=config.player_name,
         aifill=config.aifill,
         # §3 startup ≤ 120 s + server-spawn margin (the session default).
         startup_deadline=config.startup_deadline_s + 30.0,
@@ -1520,6 +1525,7 @@ class GameRunner:
             config_digest=(self.config.recovery_config_digest or
                            f"context={self.config.context_policy};seed={self.config.seed}"),
             strategy_memory=self.memory.dump_state(),
+            player_name=self.config.player_name,
             ruleset_reference_schema_version=getattr(
                 ruleset_ref, "schema_version", None),
             ruleset_reference_hash=getattr(ruleset_ref, "content_hash", None),
@@ -1716,6 +1722,7 @@ class GameRunner:
                 "port": session_port,
                 "aifill": self.config.aifill,
                 "configured_ai_opponents": self.config.aifill - 1,
+                "configured_player_name": self.config.player_name,
             }
             for attr in ("pingtimeout_status", "pingtimeout_actual",
                          "scenario_readback_status", "aifill_actual",
@@ -1723,6 +1730,7 @@ class GameRunner:
                          "actual_ai_players", "actual_ai_opponents",
                          "actual_barbarian_ai_opponents",
                          "actual_unknown_ai_opponents", "actual_player_roster",
+                         "player_name_verified",
                          "ruleset_reference_status", "ruleset_reference_hash",
                          "help_reference_status", "help_reference_hash",
                          "classic_reference_status", "classic_reference_hash",
@@ -1826,6 +1834,13 @@ class GameRunner:
             turn = int(self._session.turn)
             if (self.config.max_turns is not None
                     and turn > self.config.max_turns):
+                # The regular turn checkpoint is written before model work,
+                # so at a bounded horizon the latest manifest still points
+                # at the turn that just completed.  Publish the next-turn
+                # boundary now, after all effects and conversation commits
+                # for the completed turn are durable.  This makes a resume
+                # continue at ``turn`` without replaying the horizon turn.
+                self._write_start_checkpoint(turn)
                 # No terminal state_transition is emitted here by design:
                 # COMPLETED is an outcome, terminal state NEXT_OWN_PHASE
                 # (see the module docstring).
@@ -1952,6 +1967,33 @@ class GameRunner:
             total_tokens=(admission.total_tokens if admission else None),
             offered_tokens=(admission.offered_tokens if admission else None),
             omitted_tokens=(admission.omitted_tokens if admission else None)))
+
+        # Deadline release gate: gameplay_v6/candidate_surface_v3 must retain
+        # the classic controls that a mature empire needs.  Keep this out of
+        # the prompt and conversation so it cannot change cache prefixes.
+        if self.config.candidate_surface_policy == "candidate_surface_v3":
+            control_access = assess_control_access(
+                table, offered, snapshot, self._session.obs,
+                my_player_id=self._session.player_id)
+            self._emit(MetricEventRecord(
+                name="control_access",
+                value=canonical_json(control_access)))
+            self._progress(
+                "control_access",
+                turn=turn,
+                passed=bool(control_access["passed"]),
+                missing_ref_count=len(control_access["missing_ref_ids"]),
+                missing_unit_state_count=len(control_access["missing_unit_state_ids"]),
+                missing_city_state_count=len(control_access["missing_city_state_ids"]),
+            )
+            if not control_access["passed"]:
+                self._transition(RunState.FAILED)
+                missing = ",".join(control_access["missing_ref_ids"][:4]) or "state"
+                return (
+                    "TRUNCATED",
+                    f"control access gate failed: {missing}",
+                    prev_snapshot,
+                )
 
         # W3-9 (D9/D12, Option A): the turn-start observation event — the
         # first of the four events feeding the persistent last-seen

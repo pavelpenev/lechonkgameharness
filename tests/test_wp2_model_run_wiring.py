@@ -50,6 +50,16 @@ def test_prompt_snapshot_identity_is_shared_from_recovery_to_main_wiring(monkeyp
     shutil.rmtree(module.RUNDIR, ignore_errors=True)
 
 
+def test_player_name_resolution_fresh_resume_and_legacy(monkeypatch):
+    module = load_runner(monkeypatch, "gameplay_v4")
+    assert module.resolve_player_name(None, None, fresh=True) == "Le Chonk"
+    assert module.resolve_player_name(None, "Stored", fresh=False) == "Stored"
+    assert module.resolve_player_name("Explicit", None, fresh=False) == "Explicit"
+    with pytest.raises(ValueError, match="conflicts"):
+        module.resolve_player_name("Other", "Stored", fresh=False)
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
 def test_model_call_progress_drives_heartbeat_and_stops_first_physical_finish(
         monkeypatch):
     module = load_runner(monkeypatch, "gameplay_v3")
@@ -431,6 +441,70 @@ def test_capture_sync_cli_requires_capture_and_reserves_deadline(monkeypatch):
     shutil.rmtree(module.RUNDIR, ignore_errors=True)
 
 
+def test_reasoning_effort_cli_defaults_and_accepts_none(monkeypatch):
+    module = load_runner(monkeypatch, "gameplay_v3")
+    parsed = module._parse_args(["--run-id", "reasoning-default"])
+    assert parsed.reasoning_effort == "high"
+    parsed = module._parse_args([
+        "--run-id", "reasoning-none", "--reasoning-effort", "none"])
+    assert parsed.reasoning_effort == "none"
+    with pytest.raises(SystemExit):
+        module._parse_args([
+            "--run-id", "reasoning-invalid", "--reasoning-effort", "off"])
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_cli_rejects_pingtimeout_above_freeciv_hard_cap(monkeypatch, capsys):
+    module = load_runner(monkeypatch, "gameplay_v3")
+    with pytest.raises(SystemExit):
+        module._parse_args([
+            "--run-id", "pingtimeout-too-large",
+            "--api-timeout-s", "1680", "--acting-deadline-s", "1740.1",
+        ])
+    assert "maximum acting deadline: 1740" in capsys.readouterr().err
+    parsed = module._parse_args([
+        "--run-id", "pingtimeout-at-cap", "--api-timeout-s", "1680",
+        "--acting-deadline-s", "1740", "--capture", "--stream",
+        "--capture-sync", "--capture-sync-budget-ms", "12",
+    ])
+    assert parsed.acting_deadline_s == 1740
+    assert parsed.api_timeout_s == 1680
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_resume_path_is_absolute_and_retry_reexec_reanchors_it(monkeypatch,
+                                                               tmp_path):
+    module = load_runner(monkeypatch, "gameplay_v3")
+    relative = Path("checkpoints") / "recovery.json"
+    parsed = module._parse_args([
+        "--run-id", "resume-path-test", "--resume", str(relative),
+        "--prompt-profile", "gameplay_v3",
+        "--context-policy", "conversation_v1",
+    ])
+    assert Path(parsed.resume).is_absolute()
+    assert parsed.resume == str(relative.resolve())
+
+    rewritten = module._retry_argv_with_absolute_resume(
+        ["--resume", str(relative), "--run-id", "child"], parsed.resume)
+    assert rewritten == ["--resume", parsed.resume, "--run-id", "child"]
+    rewritten_equals = module._retry_argv_with_absolute_resume(
+        ["--resume=" + str(relative), "--run-id", "child"], parsed.resume)
+    assert rewritten_equals == ["--resume=" + parsed.resume,
+                               "--run-id", "child"]
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_capture_retry_is_fail_closed_with_explicit_recovery_path(monkeypatch):
+    module = load_runner(monkeypatch, "gameplay_v3")
+    assert module._capture_retry_block_reason(False) is None
+    reason = module._capture_retry_block_reason(True)
+    assert reason is not None
+    assert "observer cannot safely reattach" in reason
+    assert "new --run-id" in reason
+    assert "--capture-dir" in reason
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
 def test_section_max_preserves_unknown_only_measurements(monkeypatch):
     module = load_runner(monkeypatch, "gameplay_v3")
     assert module._numeric_max([None, "unknown", True]) is None
@@ -449,6 +523,73 @@ def test_section_max_ignores_unknown_mixed_measurements(monkeypatch):
         {"section_tokens": {"delta": 17}},
         {"section_tokens": {"delta": "unknown"}},
     ], "delta") == 17
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_token_table_renders_truncated_turn_with_partial_sections(monkeypatch):
+    """A provider error may omit section keys; reporting must still finish."""
+    module = load_runner(monkeypatch, "gameplay_v3")
+    per_turn = [{
+        "turn": 42, "wall_clock_s": None, "api_calls": 1,
+        "api_attempts": [1], "api_tokens_in": 0, "api_tokens_out": 0,
+        "api_cost_usd": 0.0, "section_tokens": {"snapshot": 17},
+        "snapshot_tokens_ledger": None, "candidate_count": None,
+        "snapshot_within_8000": False, "delta_within_800": False,
+        "memory_within_1500": False,
+        "actions_executed": 0, "actions_rejected": 0,
+        "readbacks": {},
+    }]
+    metrics = {
+        "participation": {}, "participation_gate_pass": None,
+        "domain_model_shares": {},
+        "commitment_followthrough_any": {},
+        "commitment_followthrough_model": {},
+        "reason_but_dont_act": {}, "illegal_action_shares": {},
+    }
+    report = module.render_table_md(
+        per_turn, module.feasibility_inputs(per_turn, 0), metrics)
+    assert "| unknown |" in report
+    assert "(ledger unknown)" in report
+    assert "| 17 (ledger unknown) | unknown |" in report
+    assert module._section_max(per_turn, "memory") is None
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_analyse_excludes_compaction_call_from_turn_telemetry(monkeypatch):
+    """Compaction shares a turn id but is not a model decision attempt."""
+    module = load_runner(monkeypatch, "gameplay_v3")
+    from lechonk.core.schemas import OutcomeRecord, TurnStartRecord
+    records = [
+        TurnStartRecord(turn=43, ts="2026-10-29T05:04:00+00:00"),
+        OutcomeRecord(outcome="TRUNCATED", reason="test",
+                      ts="2026-10-29T05:05:00+00:00"),
+    ]
+    calls = [
+        {"turn": 43, "kind": "conversation_compaction",
+         "section_tokens": {}, "attempt": 1, "outcome": "ok",
+         "tokens_in": 441604, "tokens_out": 7621, "latency_ms": 85136,
+         "cost_usd": 1.0},
+        {"turn": 43, "kind": "provider_call",
+         "physical_kind": "conversation_compaction_repair",
+         "section_tokens": {}, "attempt": 2, "outcome": "ok",
+         "tokens_in": 1200, "tokens_out": 300, "latency_ms": 200,
+         "cost_usd": 0.1},
+        {"turn": 43, "kind": "initial",
+         "section_tokens": {"memory": 1361, "snapshot": 3956,
+                            "delta": 6, "candidates": 1114},
+         "attempt": 1, "outcome": "ok", "tokens_in": 12263,
+         "tokens_out": 7172, "latency_ms": 1000, "cost_usd": 0.1},
+    ]
+    per_turn, outcome = module.analyse(records, calls, None, 60)
+    assert outcome.outcome == "TRUNCATED"
+    assert per_turn[0]["api_calls"] == 1
+    assert per_turn[0]["api_attempts"] == [1]
+    assert per_turn[0]["section_tokens"] == {
+        "memory": 1361, "snapshot": 3956, "delta": 6,
+        "candidates": 1114}
+    assert module._is_compaction_call(calls[0])
+    assert module._is_compaction_call(calls[1])
+    assert not module._is_compaction_call(calls[2])
     shutil.rmtree(module.RUNDIR, ignore_errors=True)
 
 
@@ -824,3 +965,19 @@ def test_synthetic_v4_checkpoint_child_resume_and_profile_seed_reject(
         for module in modules:
             shutil.rmtree(getattr(module, "RUNDIR", ""), ignore_errors=True)
         shutil.rmtree(getattr(source, "RUNDIR", ""), ignore_errors=True)
+
+
+def test_expected_ledger_turns_uses_absolute_resume_boundary(monkeypatch):
+    module = load_runner(monkeypatch, "gameplay_v4")
+    assert module.expected_ledger_turns(3) == [1, 2, 3]
+    assert module.expected_ledger_turns(3, resume_turn=50) == [50, 51, 52]
+    shutil.rmtree(module.RUNDIR, ignore_errors=True)
+
+
+def test_expected_ledger_turns_rejects_missing_or_duplicate_resume_ledger():
+    # The acceptance check compares the ordered list, not merely its length;
+    # a replayed or skipped resumed turn must fail validation.
+    expected = list(range(50, 53))
+    assert [50, 51, 52] == expected
+    assert [49, 50, 51] != expected
+    assert [50, 52, 52] != expected

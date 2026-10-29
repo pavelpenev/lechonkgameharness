@@ -60,7 +60,7 @@ from typing import Any, Mapping, Optional
 
 from lechonk.adapter import candidates as candidates_mod
 from lechonk.adapter.obs_extract import RulesetNames
-from lechonk.core.recovery import validate_freeciv_username
+from lechonk.core.recovery import validate_freeciv_username, validate_player_name
 from lechonk.core.schemas import CandidateTable
 
 # --- §3-aligned timeouts and deadlines --------------------------------------
@@ -70,6 +70,10 @@ SERVER_TIMEOUT_MARGIN_S = 60.0  # leave room for phase-boundary cleanup
 BEGIN_TURN_TIMEOUT_S = 900   # WAITING <= 720 s + margin (upstream default 30)
 WAIT_FOR_TIMEOUT_S = 60      # 2x the §3 per-mutation <= 30 s bound (default 10000)
 PINGTIMEOUT_S = 1800         # Keep Freeciv alive across long streamed model calls.
+# Freeciv rejects pingtimeout values above 1800.  Since the websocket liveness
+# window is derived from acting_deadline_s plus the cleanup margin below, the
+# largest safe direct acting deadline is 1740 seconds.
+MAX_ACTING_DEADLINE_S = PINGTIMEOUT_S - SERVER_TIMEOUT_MARGIN_S
 # CivRealm's own controller truncates at fc_args['max_turns']; the runner owns
 # the real horizon, so give an unbounded runner enough headroom here.
 UNBOUNDED_MAX_TURNS = 100_000
@@ -405,6 +409,7 @@ class AdapterSession:
         workdir: str,
         seed: int,
         username: str = "myagent",
+        player_name: Optional[str] = None,
         aifill: int = 2,
         startup_deadline: float = DEFAULT_STARTUP_DEADLINE_S,
         step_deadline: float = DEFAULT_STEP_DEADLINE_S,
@@ -417,6 +422,8 @@ class AdapterSession:
         self._workdir = os.path.abspath(workdir)
         self._seed = int(seed)
         self._username = validate_freeciv_username(username)
+        self._player_name = (validate_player_name(player_name)
+                             if player_name is not None else None)
         self._aifill = int(aifill)
         self.startup_deadline = float(startup_deadline)
         self.step_deadline = float(step_deadline)
@@ -444,6 +451,13 @@ class AdapterSession:
             acting_deadline_s = float(acting_deadline_s)
             if not math.isfinite(acting_deadline_s) or acting_deadline_s <= 0:
                 raise ValueError("acting_deadline_s must be a finite positive number")
+            if acting_deadline_s > MAX_ACTING_DEADLINE_S:
+                raise ValueError(
+                    "acting_deadline_s must be at most "
+                    f"{MAX_ACTING_DEADLINE_S:g}s: Freeciv pingtimeout is capped "
+                    f"at {PINGTIMEOUT_S:g}s and this session adds a "
+                    f"{SERVER_TIMEOUT_MARGIN_S:g}s margin"
+                )
         self.acting_deadline_s = acting_deadline_s
         # CivRealm's controller-side server timeout must exceed the runner's
         # model/action phase deadline.  Keep the historical 300s bounded-run
@@ -490,6 +504,7 @@ class AdapterSession:
         self._actual_barbarian_ai_opponents: Optional[int] = None
         self._actual_unknown_ai_opponents: Optional[int] = None
         self._actual_player_roster: Optional[list[Mapping[str, Any]]] = None
+        self._player_name_verified = False
 
         self._commands: "queue.Queue[tuple[str, Any, queue.Queue]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
@@ -691,6 +706,10 @@ class AdapterSession:
     @property
     def actual_player_roster(self) -> Optional[list[Mapping[str, Any]]]:
         return self._actual_player_roster
+
+    @property
+    def player_name_verified(self) -> bool:
+        return self._player_name_verified
 
     @property
     def ruleset(self) -> Optional[RulesetNames]:
@@ -1058,6 +1077,10 @@ class AdapterSession:
         configs = importlib.import_module("civrealm.configs")
         fc_args = configs.fc_args  # process-global (configs/__init__.py:112)
         fc_args["self_play"] = False  # congestion must raise, never rename
+        if self._player_name is None:
+            fc_args.pop("player_name", None)
+        else:
+            fc_args["player_name"] = self._player_name
         fc_args["aifill"] = self._aifill
         fc_args["debug.randomly_generate_seeds"] = False
         fc_args["debug.mapseed"] = self._seed
@@ -1090,6 +1113,8 @@ class AdapterSession:
         self._capture_event_loop_identity(env)
         self._verify_pingtimeout(env, fc_args["pingtimeout"])
         self._collect_scenario_readback(env)
+        if self._player_name is not None:
+            self._verify_player_name_readback()
         self._obs = _snapshot(obs)
         self._info = _snapshot(info)
         self._turn = int(info.get("turn", 0) or 0)
@@ -1311,6 +1336,22 @@ class AdapterSession:
             self._scenario_readback_status = "confirmed"
         elif complete_settings or roster:
             self._scenario_readback_status = "partial"
+
+    def _verify_player_name_readback(self) -> None:
+        """Fail closed unless Freeciv confirms our configured display name."""
+        matches = [entry for entry in (self._actual_player_roster or [])
+                   if str(entry.get("username", "")).lower() ==
+                   self._username.lower()]
+        if len(matches) != 1:
+            raise SessionError(
+                "configured player_name could not be matched to the session "
+                f"username {self._username!r}")
+        actual = matches[0].get("name")
+        if actual != self._player_name:
+            raise SessionError(
+                f"Freeciv player name mismatch: expected {self._player_name!r}, "
+                f"got {actual!r}")
+        self._player_name_verified = True
 
     def _dispatch(self, kind: str, payload: Any) -> Any:
         self._ensure_event_loop_identity()

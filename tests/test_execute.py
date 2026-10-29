@@ -409,6 +409,61 @@ def test_set_tech_goal_readback():
                    post_other).status == CONTRADICTED
 
 
+@pytest.mark.parametrize(
+    ("verb_id", "field", "expected"),
+    [
+        ("tech:cur_player:research_tech_alphabet_7", "researching", 7),
+        ("tech:cur_player:set_tech_goal_bronze_working_7", "tech_goal", 7),
+    ],
+)
+def test_tech_readback_uses_active_player_id_with_multiple_players(
+        verb_id, field, expected):
+    """Opponent records have the same marker keys; identity must be explicit."""
+    pre = _world([], [own_city(1)])
+    opponent = enemy_player(player_id=1, **{field: 3})
+    active = my_player(player_id=2, **{field: expected})
+    post = _world([], [own_city(1)], players=[opponent, active])
+    verb = verb_id.rsplit(":", 1)[-1]
+    cand = _raw_cand(verb_id, "tech", "cur_player", verb,
+                     {"ctrl_type": "tech", "actor_id": "cur_player",
+                      "action_key": verb, "tech_id": expected})
+    rb = _verify_cand(cand, pre, post, my_player_id=2)
+    assert rb.status == VERIFIED
+    assert rb.evidence[field] == expected
+
+
+@pytest.mark.parametrize(
+    ("verb_id", "field"),
+    [
+        ("tech:cur_player:research_tech_alphabet_7", "researching"),
+        ("tech:cur_player:set_tech_goal_bronze_working_7", "tech_goal"),
+    ],
+)
+def test_tech_readback_contradicts_active_player_not_opponent(
+        verb_id, field):
+    pre = _world([], [own_city(1)])
+    opponent = enemy_player(player_id=1, **{field: 7})
+    active = my_player(player_id=2, **{field: 3})
+    post = _world([], [own_city(1)], players=[opponent, active])
+    verb = verb_id.rsplit(":", 1)[-1]
+    cand = _raw_cand(verb_id, "tech", "cur_player", verb,
+                     {"ctrl_type": "tech", "actor_id": "cur_player",
+                      "action_key": verb, "tech_id": 7})
+    rb = _verify_cand(cand, pre, post, my_player_id=2)
+    assert rb.status == CONTRADICTED
+
+
+def test_tech_readback_is_inconclusive_when_active_player_missing():
+    pre = _world([], [own_city(1)])
+    opponent = enemy_player(player_id=1, researching=7, tech_goal=7)
+    post = _world([], [own_city(1)], players=[opponent])
+    cid = "tech:cur_player:research_tech_alphabet_7"
+    cand = _raw_cand(cid, "tech", "cur_player", "research_tech_alphabet_7",
+                     {"ctrl_type": "tech", "actor_id": "cur_player",
+                      "action_key": "research_tech_alphabet_7", "tech_id": 7})
+    assert _verify_cand(cand, pre, post, my_player_id=2).status == INCONCLUSIVE
+
+
 # ---------------------------------------------------------------------------
 # diplomacy read-backs
 # ---------------------------------------------------------------------------

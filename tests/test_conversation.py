@@ -157,6 +157,28 @@ def test_missing_local_estimate_does_not_reuse_previous_estimate():
     assert manager.observed_completion_tokens == 20
 
 
+@pytest.mark.parametrize("estimated_tokens", [None, 0, -1])
+def test_incomplete_usage_estimate_does_not_create_invalid_anchor_round_trip(
+        tmp_path, estimated_tokens):
+    state = tmp_path / "state.json"
+    manager = ConversationManager(
+        system_message={"role": "system", "content": "s"},
+        state_path=state,
+    )
+    request = manager.begin_turn({"role": "user", "content": "question"})
+    request_hash = "sha256:" + hashlib.sha256(
+        conversation_module.canonical_json(request).encode("utf-8")).hexdigest()
+    manager.record_usage(10, estimated_tokens=estimated_tokens,
+                         message_count=len(request), request_hash=request_hash)
+    assert manager._pending_usage_anchor is None
+    manager.stage_assistant("answer")
+    manager.commit_turn()
+    restored = ConversationManager.load(state)
+    assert restored._trusted_usage_anchor is None
+    assert restored.observed_prompt_tokens == 10
+    assert restored.observed_estimated_tokens == 0
+
+
 def test_prefixed_request_estimate_rejects_invalid_calibration_and_subset_is_safe(monkeypatch):
     manager = _manager()
     manager.messages.extend([{"role": "user", "content": "u"},
@@ -582,7 +604,7 @@ def test_real_provider_compaction_historical_note_round_trips_and_reloads(tmp_pa
     assert restored.request_messages() == manager.request_messages()
 
 
-@pytest.mark.parametrize("historical_note", [None, 1, [], "", "   ", "x" * 2_001])
+@pytest.mark.parametrize("historical_note", [None, 1, [], "", "   "])
 def test_compaction_historical_note_must_be_valid_when_present(historical_note):
     manager = _manager()
     manager.messages.extend([{"role": "user", "content": "old"},
@@ -593,6 +615,45 @@ def test_compaction_historical_note_must_be_valid_when_present(historical_note):
     with pytest.raises(ConversationError):
         manager.compact(lambda _: summary, force=True)
     assert manager.request_messages() == before
+
+
+def test_real_size_historical_note_is_preserved_without_field_ceiling():
+    manager = _manager()
+    manager.messages.extend([{"role": "user", "content": "old"},
+                             {"role": "assistant", "content": "answer"}])
+    note = "strategic context " * 137
+    note = note[:2597].rstrip() + "!"
+    summary = {"version": 1, "summary": "keep", "commitments": [],
+               "uncertainties": [], "facts": [], "historical_note": note}
+    manager.compact(lambda _: summary, force=True)
+    payload = json.loads(manager.messages[1]["content"].split("\n", 1)[1])
+    assert payload["summary"]["historical_note"] == note
+
+
+def test_real_size_fact_is_preserved_without_item_ceiling():
+    manager = _manager()
+    manager.messages.extend([{"role": "user", "content": "old"},
+                             {"role": "assistant", "content": "answer"}])
+    fact = "f" * 2890
+    summary = {"version": 1, "summary": "keep", "commitments": [],
+               "uncertainties": [], "facts": [fact]}
+    before = manager.request_messages()
+    manager.compact(lambda _: summary, force=True)
+    payload = json.loads(manager.messages[1]["content"].split("\n", 1)[1])
+    assert payload["summary"]["facts"] == [fact]
+    assert manager.request_messages() != before
+
+
+def test_large_summary_text_is_preserved_under_aggregate_budget():
+    manager = _manager()
+    manager.messages.extend([{"role": "user", "content": "old"},
+                             {"role": "assistant", "content": "answer"}])
+    summary_text = "strategic " * 1401  # over 12,000 characters, under 8,000 tokens
+    summary = {"version": 1, "summary": summary_text, "commitments": [],
+               "uncertainties": [], "facts": []}
+    manager.compact(lambda _: summary, force=True)
+    payload = json.loads(manager.messages[1]["content"].split("\n", 1)[1])
+    assert payload["summary"]["summary"] == summary_text.strip()
 
 
 def test_compaction_historical_note_is_trimmed_and_unknown_fields_remain_rejected():
@@ -1010,3 +1071,158 @@ def test_state_restart_replays_wal_after_snapshot_failure(tmp_path, monkeypatch)
     assert len(reports) == 1
     restored_again = ConversationManager.load(state)
     assert restored_again.messages == restored.messages
+
+
+def _record_and_commit_anchor(manager: ConversationManager) -> None:
+    request = manager.begin_turn({"role": "user", "content": "question"})
+    estimate = conversation_module._message_tokens(request)
+    request_hash = "sha256:" + hashlib.sha256(
+        conversation_module.canonical_json(request).encode("utf-8")).hexdigest()
+    manager.record_usage(100, estimate, message_count=len(request),
+                         completion_tokens=20, request_hash=request_hash)
+    manager.stage_assistant("answer")
+    manager.commit_turn()
+
+
+def test_unknown_usage_preserves_last_trusted_anchor(tmp_path):
+    manager = _manager(tmp_path)
+    _record_and_commit_anchor(manager)
+    manager.record_usage(None)
+    estimate = manager.estimate_prefixed_request(
+        manager.request_messages(), [{"role": "user", "content": "next"}])
+    assert manager.observed_prompt_tokens == 0
+    assert estimate["method"] == "provider_extended_prefix"
+    assert estimate["effective"] >= 120
+
+
+def test_trusted_anchor_rejected_after_hash_or_epoch_change():
+    manager = _manager()
+    _record_and_commit_anchor(manager)
+    manager.record_usage(None)
+    manager.messages[1]["content"] = "tampered"
+    assert manager.estimate_prefixed_request(
+        manager.request_messages(), [{"role": "user", "content": "next"}])["method"] == "raw"
+    manager.messages[1]["content"] = "question"
+    manager.epoch += 1
+    assert manager.estimate_prefixed_request(
+        manager.request_messages(), [{"role": "user", "content": "next"}])["method"] == "raw"
+
+
+def test_trusted_anchor_survives_snapshot_wal_and_fork(tmp_path):
+    state = tmp_path / "state.json"
+    manager = ConversationManager(system_message={"role": "system", "content": "stable"},
+                                   state_path=state, journal_path=tmp_path / "conversation.jsonl")
+    _record_and_commit_anchor(manager)
+    manager.record_usage(None)
+    manager.append_execution_report({"turn": 2, "outcome": "timeout"})
+    restored = ConversationManager.load(state)
+    assert restored._trusted_usage_anchor == manager._trusted_usage_anchor
+    fork_state = tmp_path / "fork" / "state.json"
+    manager.fork_persistence(fork_state, fork_state.with_name("conversation.jsonl"))
+    forked = ConversationManager.load(fork_state)
+    assert forked._trusted_usage_anchor == manager._trusted_usage_anchor
+
+
+def test_import_trusted_usage_anchor_is_fail_closed_and_persistable(tmp_path):
+    manager = _manager()
+    _record_and_commit_anchor(manager)
+    anchor = dict(manager._trusted_usage_anchor)
+    prefix = manager.request_messages()[:anchor["message_count"]]
+    manager._trusted_usage_anchor = None
+    manager.import_trusted_usage_anchor(anchor, prior_messages=prefix)
+    assert manager._trusted_anchor_valid()
+    manager.record_usage(None)
+    assert manager.estimate_prefixed_request(
+        manager.request_messages(), [{"role": "user", "content": "next"}]
+    )["method"] == "provider_extended_prefix"
+    exported = tmp_path / "standalone.json"
+    manager.export_standalone(exported)
+    assert ConversationManager.load(exported)._trusted_anchor_valid()
+
+    manager._trusted_usage_anchor = None
+    tampered = list(prefix)
+    tampered[-1] = dict(tampered[-1], content="wrong")
+    with pytest.raises(ConversationError, match="prefix"):
+        manager.import_trusted_usage_anchor(anchor, prior_messages=tampered)
+    with pytest.raises(ConversationError, match="epoch"):
+        manager.import_trusted_usage_anchor({**anchor, "epoch": 1}, prior_messages=prefix)
+    with pytest.raises(ConversationError, match="request hash"):
+        manager.import_trusted_usage_anchor({**anchor, "request_hash": "sha256:" + "0" * 64},
+                                             prior_messages=prefix)
+    assert manager._trusted_usage_anchor is None
+
+
+def test_begin_turn_rejects_mismatched_latest_calibration_and_load_rejects_bad_anchor(tmp_path):
+    manager = _manager()
+    _record_and_commit_anchor(manager)
+    manager.messages[1]["content"] = "tampered"
+    assert not manager._latest_calibration_valid()
+
+    state = tmp_path / "state.json"
+    clean = _manager()
+    _record_and_commit_anchor(clean)
+    clean.state_path = state
+    clean.export_standalone(state)
+    payload = json.loads(state.read_text())
+    payload["trusted_usage_anchor"]["request_hash"] = "sha256:" + "z" * 64
+    payload["checksum"] = hashlib.sha256(
+        conversation_module.canonical_json({k: v for k, v in payload.items()
+                                            if k != "checksum"}).encode()).hexdigest()
+    state.write_text(json.dumps(payload))
+    with pytest.raises(ConversationError, match="trusted usage anchor"):
+        ConversationManager.load(state)
+    payload["trusted_usage_anchor"]["request_hash"] = "sha256:" + "a" * 64
+    payload["trusted_usage_anchor"]["message_count"] = "2"
+    payload["checksum"] = hashlib.sha256(
+        conversation_module.canonical_json({k: v for k, v in payload.items()
+                                            if k != "checksum"}).encode()).hexdigest()
+    state.write_text(json.dumps(payload))
+    with pytest.raises(ConversationError, match="trusted usage anchor"):
+        ConversationManager.load(state)
+
+
+def test_failed_uncommitted_usage_does_not_replace_trusted_anchor():
+    manager = _manager()
+    _record_and_commit_anchor(manager)
+    trusted = dict(manager._trusted_usage_anchor)
+    request = manager.begin_turn({"role": "user", "content": "failed"})
+    manager.record_usage(999, conversation_module._message_tokens(request),
+                         message_count=len(request), completion_tokens=999,
+                         request_hash="sha256:" + "1" * 64)
+    manager.abort_turn()
+    assert manager._trusted_usage_anchor == trusted
+
+
+def test_missing_usage_cannot_promote_stale_pending_anchor(tmp_path):
+    manager = _manager(tmp_path)
+    _record_and_commit_anchor(manager)
+    trusted = dict(manager._trusted_usage_anchor)
+    request = manager.begin_turn({"role": "user", "content": "next"})
+    request_hash = "sha256:" + hashlib.sha256(
+        conversation_module.canonical_json(request).encode("utf-8")).hexdigest()
+    manager.record_usage(10, estimated_tokens=conversation_module._message_tokens(request),
+                         message_count=len(request), request_hash=request_hash)
+    assert manager._pending_usage_anchor is not None
+    manager.record_usage(None)
+    assert manager._pending_usage_anchor is None
+    manager.stage_assistant("answer")
+    manager.commit_turn()
+    assert manager._trusted_usage_anchor == trusted
+    assert ConversationManager.load(tmp_path / "state.json")._trusted_usage_anchor == trusted
+
+
+def test_trusted_suffix_uses_utf8_upper_bound_and_compaction_rotates_anchor():
+    manager = ConversationManager(
+        system_message={"role": "system", "content": "stable"},
+        config=ConversationConfig(trigger_tokens=20, tail_tokens=10),
+    )
+    _record_and_commit_anchor(manager)
+    manager.record_usage(None)
+    suffix = {"role": "user", "content": "🙂" * 200}
+    estimate = manager.estimate_prefixed_request(manager.request_messages(), [suffix])
+    assert estimate["method"] == "provider_extended_prefix"
+    assert estimate["effective"] >= conversation_module._safe_message_tokens([suffix])
+    manager.compact(lambda _: {"version": 1, "summary": "s",
+                               "commitments": [], "uncertainties": [], "facts": []},
+                    force=True)
+    assert manager._trusted_usage_anchor is None

@@ -649,6 +649,7 @@ def test_actual_client_sampling_is_the_client_truth():
     s = actual_client_sampling()
     assert s["temperature"] == mc.DEFAULT_TEMPERATURE == 1.0
     assert s["reasoning_effort"] == mc.DEFAULT_REASONING_EFFORT == "high"
+    assert actual_client_sampling(reasoning_effort="none")["reasoning_effort"] == "none"
     assert s["max_tokens"] == mc.DEFAULT_MAX_TOKENS
     assert s["response_format"] == "json_schema strict (WP2 spike decision)"
     assert "top_p" not in s       # the client never sends it — never recorded

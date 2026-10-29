@@ -56,6 +56,48 @@ def _message_tokens(messages: Iterable[Mapping[str, Any]]) -> int:
     return sum(estimate_tokens(canonical_json(message)) for message in messages)
 
 
+def _safe_message_tokens(messages: Iterable[Mapping[str, Any]]) -> int:
+    """Upper-bound unmeasured JSON suffixes by UTF-8 bytes plus framing."""
+    encoded = [canonical_json(message).encode("utf-8") for message in messages]
+    return sum(len(value) + 4 for value in encoded)
+
+
+def _message_hash(message: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(canonical_json(message).encode("utf-8")).hexdigest()
+
+
+def _message_hash_payload(messages: Iterable[Mapping[str, Any]]) -> str:
+    return "sha256:" + hashlib.sha256(canonical_json(list(messages)).encode("utf-8")).hexdigest()
+
+
+def _valid_hash(value: Any) -> bool:
+    return (isinstance(value, str) and value.startswith("sha256:")
+            and len(value) == len("sha256:") + 64
+            and all(ch in "0123456789abcdef" for ch in value.removeprefix("sha256:")))
+
+
+def _valid_anchor_schema(anchor: Any) -> bool:
+    if not isinstance(anchor, dict):
+        return False
+    if (isinstance(anchor.get("epoch"), bool) or not isinstance(anchor.get("epoch"), int)
+            or anchor["epoch"] < 0):
+        return False
+    for field in ("prompt_tokens", "estimated_tokens", "message_count"):
+        value = anchor.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+        if field != "message_count" and value <= 0:
+            return False
+        if field == "message_count" and value < 0:
+            return False
+    completion = anchor.get("completion_tokens")
+    if completion is not None and (isinstance(completion, bool) or not isinstance(completion, int)
+                                   or completion < 0):
+        return False
+    return (_valid_hash(anchor.get("request_hash"))
+            and (anchor.get("assistant_hash") is None or _valid_hash(anchor.get("assistant_hash"))))
+
+
 def _fsync_parent_directory(path: str | Path) -> None:
     """Persist the directory entry containing ``path``.
 
@@ -92,22 +134,21 @@ def _validate_compaction_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     if not set(summary) <= allowed:
         raise ConversationError("compaction summary contains unknown fields")
     text = summary["summary"]
-    if not isinstance(text, str) or not text.strip() or len(text) > 12_000:
-        raise ConversationError("compaction summary text is invalid or too large")
+    if not isinstance(text, str) or not text.strip():
+        raise ConversationError("compaction summary text must be a nonempty string")
     normalized: dict[str, Any] = {"version": 1, "summary": text.strip()}
     if "historical_note" in summary:
         historical_note = summary["historical_note"]
-        if (not isinstance(historical_note, str) or
-                not historical_note.strip() or len(historical_note.strip()) > 2_000):
+        if not isinstance(historical_note, str) or not historical_note.strip():
             raise ConversationError(
-                "compaction historical_note must be a nonempty string of at most 2000 characters")
+                "compaction historical_note must be a nonempty string")
         normalized["historical_note"] = historical_note.strip()
     for key in required[1:]:
         value = summary[key]
         if not isinstance(value, list) or len(value) > 128:
             raise ConversationError(f"compaction {key} must be a bounded list")
         items: list[Any] = []
-        for item in value:
+        for index, item in enumerate(value):
             if key == "commitments" and isinstance(item, Mapping):
                 try:
                     commitment = Commitment.model_validate(item, strict=True)
@@ -115,13 +156,13 @@ def _validate_compaction_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
                     raise ConversationError(
                         "compaction commitments contains an invalid typed commitment") from exc
                 encoded = commitment.model_dump(mode="json", exclude_none=False)
-                if len(canonical_json(encoded)) > 4_000:
-                    raise ConversationError("compaction commitment is too large")
                 items.append(encoded)
-            elif isinstance(item, str) and item.strip() and len(item) <= 2_000:
+            elif isinstance(item, str) and item.strip():
                 items.append(item.strip())
             else:
-                raise ConversationError(f"compaction {key} contains invalid item")
+                item_type = type(item).__name__
+                raise ConversationError(
+                    f"compaction {key}[{index}] invalid item type {item_type}")
         normalized[key] = items
     if estimate_tokens(canonical_json(normalized)) > 8_000:
         raise ConversationError("compaction summary exceeds its token budget")
@@ -223,6 +264,11 @@ class ConversationManager:
         self._observed_request_message_count: int | None = None
         self._observed_completion_tokens: int | None = None
         self._observed_request_hash: str | None = None
+        # Last provider measurement that is known to describe a committed
+        # assistant response.  Unlike the latest-call calibration this is
+        # deliberately retained when a later call has unknown usage.
+        self._trusted_usage_anchor: dict[str, Any] | None = None
+        self._pending_usage_anchor: dict[str, Any] | None = None
         self._journal_next_seq = 0
         self._journal_records_applied = 0
         self._transaction_before: dict[str, Any] | None = None
@@ -242,6 +288,10 @@ class ConversationManager:
                      completion_tokens: int | None = None,
                      request_hash: str | None = None) -> None:
         """Calibrate the character estimator with provider prompt usage."""
+        # A pending anchor belongs only to the current measurement.  Clear it
+        # before any branch so missing or unusable usage cannot later be
+        # promoted by an unrelated commit.
+        self._pending_usage_anchor = None
         if prompt_tokens is None:
             # A missing current measurement must never leave stale calibration
             # eligible for a later repair request.
@@ -267,6 +317,24 @@ class ConversationManager:
                 int(completion_tokens) if completion_tokens is not None and completion_tokens >= 0
                 else None)
             self._observed_request_hash = request_hash
+            # Promote only a complete, hashable request measurement.  The
+            # assistant correspondence is attached by commit_exchange/
+            # commit_turn once the response is durably committed.
+            if (_valid_hash(request_hash)
+                    and estimated_tokens is not None and estimated_tokens > 0
+                    and isinstance(message_count, int) and not isinstance(message_count, bool)
+                    and message_count >= 0):
+                self._pending_usage_anchor = {
+                    "epoch": self.epoch,
+                    "prompt_tokens": int(prompt_tokens),
+                    "estimated_tokens": int(estimated_tokens or 0),
+                    "message_count": int(message_count),
+                    "completion_tokens": (int(completion_tokens)
+                                           if completion_tokens is not None and completion_tokens >= 0
+                                           else None),
+                    "request_hash": request_hash,
+                    "assistant_hash": None,
+                }
         else:
             # Zero is not a usable prompt measurement; invalidate any older
             # calibration just like a missing provider usage object.
@@ -275,6 +343,7 @@ class ConversationManager:
             self._observed_request_message_count = None
             self._observed_completion_tokens = None
             self._observed_request_hash = None
+            self._pending_usage_anchor = None
 
     @property
     def observed_prompt_tokens(self) -> int:
@@ -311,24 +380,32 @@ class ConversationManager:
             "observed_request_message_count": self._observed_request_message_count,
         }
         count = self._observed_request_message_count
-        calibrated_hash_matches = (
-            isinstance(self._observed_request_hash, str) and
-            self._observed_request_hash.startswith("sha256:") and
-            hashlib.sha256(
-                canonical_json(self.messages[:count]).encode("utf-8")
-            ).hexdigest() == self._observed_request_hash.removeprefix("sha256:")
-            if isinstance(count, int) and not isinstance(count, bool)
-            and 0 <= count <= len(self.messages) else False
-        )
-        valid = (self._observed_prompt_tokens > 0 and
+        trusted = self._trusted_usage_anchor
+        trusted_valid = self._trusted_anchor_valid()
+        # Unknown usage invalidates only the latest calibration.  A trusted
+        # anchor is usable only after its assistant response was committed.
+        if (not self._observed_prompt_tokens or not self._observed_request_hash) and trusted_valid:
+            count = int(trusted["message_count"])
+        provider_tokens = self._observed_prompt_tokens if self._observed_prompt_tokens > 0 else (
+            int(trusted["prompt_tokens"]) if trusted_valid else 0)
+        provider_estimate = self._observed_estimated_tokens if self._observed_prompt_tokens > 0 else (
+            int(trusted["estimated_tokens"]) if trusted_valid else 0)
+        provider_hash = self._observed_request_hash if self._observed_prompt_tokens > 0 else (
+            trusted["request_hash"] if trusted_valid else None)
+        trusted_used = self._observed_prompt_tokens <= 0 and trusted_valid
+        valid = (provider_tokens > 0 and
                  isinstance(count, int) and not isinstance(count, bool) and
                  0 <= len(prefix) <= count <= len(self.messages) and
                  prefix == self.messages[:len(prefix)] and
-                 _message_tokens(self.messages[:count]) == self._observed_estimated_tokens and
-                 calibrated_hash_matches)
+                 provider_estimate > 0 and
+                 _message_tokens(self.messages[:count]) == provider_estimate and
+                 isinstance(provider_hash, str) and hashlib.sha256(
+                     canonical_json(self.messages[:count]).encode("utf-8")).hexdigest()
+                 == provider_hash.removeprefix("sha256:"))
         if valid:
-            effective = (self._observed_prompt_tokens +
-                         _message_tokens(appended) + max(0, int(guard_tokens)))
+            suffix_estimate = (_safe_message_tokens(appended) if trusted_used
+                               else _message_tokens(appended))
+            effective = provider_tokens + suffix_estimate + max(0, int(guard_tokens))
             method = "provider_prefix"
         # A compaction prefix can include the assistant completion and its
         # locally appended execution report, even though the calibrated
@@ -337,20 +414,25 @@ class ConversationManager:
         # extension has the expected committed assistant response.  This
         # avoids the large character-estimator overestimate while preserving
         # the full cacheable history.
-        elif (self._observed_prompt_tokens > 0 and
-              self._observed_completion_tokens is not None and
+        elif (provider_tokens > 0 and
+              (self._observed_completion_tokens if self._observed_prompt_tokens > 0 else trusted.get("completion_tokens") if trusted_valid else None) is not None and
               isinstance(count, int) and not isinstance(count, bool) and
               0 <= count < len(prefix) <= len(self.messages) and
               prefix == self.messages[:len(prefix)] and
-              _message_tokens(self.messages[:count]) == self._observed_estimated_tokens and
-              self._observed_request_hash and
+              provider_estimate > 0 and
+              _message_tokens(self.messages[:count]) == provider_estimate and
+              provider_hash and
               hashlib.sha256(canonical_json(self.messages[:count]).encode("utf-8")).hexdigest()
-              == self._observed_request_hash.removeprefix("sha256:") and
-              self.messages[count].get("role") == "assistant"):
-            suffix_tokens = _message_tokens(prefix[count + 1:])
-            effective = (self._observed_prompt_tokens +
-                         self._observed_completion_tokens + suffix_tokens +
-                         _message_tokens(appended) + max(0, int(guard_tokens)))
+              == provider_hash.removeprefix("sha256:") and
+              self.messages[count].get("role") == "assistant" and
+              (not trusted_valid or trusted.get("assistant_hash") in (None, _message_hash(self.messages[count])))):
+            suffix_tokens = (_safe_message_tokens(prefix[count + 1:]) if trusted_used
+                             else _message_tokens(prefix[count + 1:]))
+            appended_tokens = (_safe_message_tokens(appended) if trusted_used
+                               else _message_tokens(appended))
+            completion = self._observed_completion_tokens if self._observed_prompt_tokens > 0 else trusted["completion_tokens"]
+            effective = (provider_tokens + completion + suffix_tokens +
+                         appended_tokens + max(0, int(guard_tokens)))
             method = "provider_extended_prefix"
         else:
             effective = raw + max(0, int(guard_tokens))
@@ -358,6 +440,98 @@ class ConversationManager:
         return {"effective": effective, "raw": raw,
                 "method": method, "guard": max(0, int(guard_tokens)),
                 "calibration": calibration}
+
+    def _trusted_anchor_valid(self) -> bool:
+        anchor = self._trusted_usage_anchor
+        if not isinstance(anchor, dict) or anchor.get("epoch") != self.epoch:
+            return False
+        count = anchor.get("message_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0 or count >= len(self.messages):
+            return False
+        if not _valid_hash(anchor.get("request_hash")) or not _valid_hash(anchor.get("assistant_hash")):
+            return False
+        if hashlib.sha256(canonical_json(self.messages[:count]).encode("utf-8")).hexdigest() != anchor["request_hash"].removeprefix("sha256:"):
+            return False
+        return _message_hash(self.messages[count]) == anchor["assistant_hash"]
+
+    def _latest_calibration_valid(self) -> bool:
+        count = self._observed_request_message_count
+        if (self._observed_prompt_tokens <= 0 or self._observed_estimated_tokens <= 0
+                or (count is not None and (not isinstance(count, int) or isinstance(count, bool)))
+                or (count is not None and (count < 0 or count > len(self.messages)))
+                ):
+            return False
+        # Pre-anchor snapshots did not persist a request hash.  Preserve
+        # their conservative aggregate calibration; hash-bearing records are
+        # validated strictly below.
+        if self._observed_request_hash is None:
+            return True
+        if count is None:
+            return False
+        if not _valid_hash(self._observed_request_hash):
+            return False
+        return (_message_tokens(self.messages[:count]) == self._observed_estimated_tokens
+                and _message_hash_payload(self.messages[:count]) == self._observed_request_hash)
+
+    def import_trusted_usage_anchor(
+            self, evidence: Mapping[str, Any], *,
+            prior_messages: Iterable[Mapping[str, Any]]) -> None:
+        """Import verified usage from a previously committed request.
+
+        This is intentionally fail-closed for recovery from legacy snapshots:
+        callers must provide the exact prior request prefix and the assistant
+        response that followed it.  No provider measurement is installed if
+        any epoch, hash, token, or correspondence check fails.
+        """
+        if not isinstance(evidence, Mapping):
+            raise ConversationError("trusted usage evidence must be an object")
+        try:
+            epoch = evidence["epoch"]
+            prompt_tokens = evidence["prompt_tokens"]
+            estimated_tokens = evidence["estimated_tokens"]
+            count = evidence["message_count"]
+            request_hash = evidence["request_hash"]
+            assistant_hash = evidence["assistant_hash"]
+        except KeyError as exc:
+            raise ConversationError(f"trusted usage evidence missing {exc.args[0]}") from exc
+        if (isinstance(epoch, bool) or not isinstance(epoch, int) or epoch != self.epoch):
+            raise ConversationError("trusted usage evidence epoch mismatch")
+        if (isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int)
+                or prompt_tokens <= 0):
+            raise ConversationError("trusted usage evidence prompt_tokens must be positive")
+        if (isinstance(estimated_tokens, bool) or not isinstance(estimated_tokens, int)
+                or estimated_tokens <= 0):
+            raise ConversationError("trusted usage evidence estimated_tokens must be positive")
+        if (isinstance(count, bool) or not isinstance(count, int)
+                or count < 1 or count >= len(self.messages)):
+            raise ConversationError("trusted usage evidence message_count is invalid")
+        if not _valid_hash(request_hash):
+            raise ConversationError("trusted usage evidence request_hash is invalid")
+        if not _valid_hash(assistant_hash):
+            raise ConversationError("trusted usage evidence assistant_hash is invalid")
+        prior = _copy_messages(prior_messages)
+        if prior != self.messages[:count]:
+            raise ConversationError("trusted usage evidence prefix does not match current history")
+        if _message_tokens(prior) != estimated_tokens:
+            raise ConversationError("trusted usage evidence local estimate mismatch")
+        actual_request_hash = _message_hash_payload(prior)
+        if actual_request_hash != request_hash:
+            raise ConversationError("trusted usage evidence request hash mismatch")
+        assistant = self.messages[count]
+        if assistant.get("role") != "assistant" or _message_hash(assistant) != assistant_hash:
+            raise ConversationError("trusted usage evidence assistant correspondence mismatch")
+        self._trusted_usage_anchor = {
+            "epoch": epoch,
+            "prompt_tokens": prompt_tokens,
+            "estimated_tokens": estimated_tokens,
+            "message_count": count,
+            "completion_tokens": (evidence.get("completion_tokens")
+                                   if isinstance(evidence.get("completion_tokens"), int)
+                                   and not isinstance(evidence.get("completion_tokens"), bool)
+                                   and evidence.get("completion_tokens") >= 0 else None),
+            "request_hash": request_hash,
+            "assistant_hash": assistant_hash,
+        }
 
     @property
     def staged(self) -> bool:
@@ -377,7 +551,7 @@ class ConversationManager:
         # whole candidate again would double-count the prefix and hide the
         # true compaction boundary.
         estimated_current = _message_tokens(self.messages)
-        if self._observed_prompt_tokens and self._observed_estimated_tokens:
+        if self._latest_calibration_valid():
             # Reconcile provider count for the last request with committed
             # messages added after that request (assistant/report).  The API's
             # completion_tokens is authoritative for the assistant response;
@@ -426,6 +600,7 @@ class ConversationManager:
         _validate_messages(candidate)
         self._begin_transaction()
         self.messages = candidate
+        self._refresh_trusted_anchor()
         self._staged = None
         self._staged_assistant = None
         seq = self._append_journal(self.messages[old_len:])
@@ -442,8 +617,11 @@ class ConversationManager:
         """
         if self.staged:
             raise ConversationError("cannot append an execution report mid-turn")
+        # A provider measurement from a failed/uncommitted response must not
+        # later be associated with an unrelated assistant at the same index.
         before = len(self.messages)
         self._begin_transaction()
+        self._pending_usage_anchor = None
         self._append_state_message(execution_report, engine_only=True)
         seq = self._append_journal(self.messages[before:], kind="execution_report")
         self._persist_committed(seq)
@@ -474,6 +652,7 @@ class ConversationManager:
         _validate_messages(committed)
         self._begin_transaction()
         self.messages = committed
+        self._refresh_trusted_anchor()
         self._staged = None
         self._staged_assistant = None
         seq = self._append_journal(self.messages[old_len:])
@@ -483,6 +662,7 @@ class ConversationManager:
     def abort_turn(self) -> None:
         self._staged = None
         self._staged_assistant = None
+        self._pending_usage_anchor = None
 
     def compact(self, compactor: Callable[[list[dict[str, Any]]], Mapping[str, Any]], *, force: bool = False) -> list[dict[str, Any]]:
         """Compact only at a transaction boundary; failure leaves state intact."""
@@ -516,10 +696,15 @@ class ConversationManager:
         self._begin_transaction()
         self.messages = [self.messages[0], summary_message, *tail]
         self.epoch += 1
+        # The retained history is a new cache generation; any prior provider
+        # anchor describes the old epoch and must not survive rotation.
+        self._trusted_usage_anchor = None
+        self._pending_usage_anchor = None
         self._observed_prompt_tokens = _message_tokens(self.messages)
         self._observed_estimated_tokens = self._observed_prompt_tokens
         self._observed_request_message_count = None
         self._observed_completion_tokens = None
+        self._observed_request_hash = None
         if self.prompt_cache_key:
             # A compacted prefix is a new cache generation.  Keep the key
             # stable within an epoch, but never mix cache entries whose
@@ -638,6 +823,10 @@ class ConversationManager:
             "observed_request_message_count": self._observed_request_message_count,
             "observed_completion_tokens": self._observed_completion_tokens,
             "observed_request_hash": self._observed_request_hash,
+            "trusted_usage_anchor": (dict(self._trusted_usage_anchor)
+                                      if self._trusted_usage_anchor is not None else None),
+            "pending_usage_anchor": (dict(self._pending_usage_anchor)
+                                      if self._pending_usage_anchor is not None else None),
             "journal_next_seq": self._journal_next_seq,
             "journal_records_applied": self._journal_records_applied,
             "staged": _copy_messages(self._staged) if self._staged is not None else None,
@@ -656,6 +845,8 @@ class ConversationManager:
                       "observed_request_message_count", "observed_completion_tokens",
                       "observed_request_hash"):
             setattr(self, "_" + field, before[field])
+        self._trusted_usage_anchor = before["trusted_usage_anchor"]
+        self._pending_usage_anchor = before["pending_usage_anchor"]
         self._journal_next_seq = before["journal_next_seq"]
         self._journal_records_applied = before["journal_records_applied"]
         self._staged = before["staged"]
@@ -664,6 +855,18 @@ class ConversationManager:
 
     def _finish_transaction(self) -> None:
         self._transaction_before = None
+
+    def _refresh_trusted_anchor(self) -> None:
+        anchor = self._pending_usage_anchor
+        if not isinstance(anchor, dict):
+            return
+        count = anchor.get("message_count")
+        if (anchor.get("epoch") == self.epoch and isinstance(count, int)
+                and 0 <= count < len(self.messages)
+                and self.messages[count].get("role") == "assistant"):
+            anchor["assistant_hash"] = _message_hash(self.messages[count])
+            self._trusted_usage_anchor = anchor
+            self._pending_usage_anchor = None
 
     def _append_journal(self, new_messages: list[dict[str, Any]], *, kind: str = "conversation_turn") -> int:
         if self.journal_path is None:
@@ -680,7 +883,8 @@ class ConversationManager:
                        "observed_estimated_tokens": self._observed_estimated_tokens,
                        "observed_request_message_count": self._observed_request_message_count,
                        "observed_completion_tokens": self._observed_completion_tokens,
-                       "observed_request_hash": self._observed_request_hash}
+                       "observed_request_hash": self._observed_request_hash,
+                       "trusted_usage_anchor": self._trusted_usage_anchor}
             payload["checksum"] = hashlib.sha256(
                 canonical_json({k: v for k, v in payload.items() if k != "checksum"}).encode("utf-8")
             ).hexdigest()
@@ -780,7 +984,11 @@ class ConversationManager:
                           "observed_request_hash"):
                 if field in record:
                     setattr(obj, "_" + field, record[field])
+            if "trusted_usage_anchor" in record:
+                obj._trusted_usage_anchor = record["trusted_usage_anchor"]
             obj._journal_records_applied += 1
+        if obj._trusted_usage_anchor is not None and not _valid_anchor_schema(obj._trusted_usage_anchor):
+            raise ConversationError("invalid trusted usage anchor in journal")
         return obj
     def _persist(self, *, journal_records_applied: int | None = None) -> None:
         if self.state_path is None:
@@ -802,7 +1010,8 @@ class ConversationManager:
                    "observed_estimated_tokens": self._observed_estimated_tokens,
                    "observed_request_message_count": self._observed_request_message_count,
                    "observed_completion_tokens": self._observed_completion_tokens,
-                   "observed_request_hash": self._observed_request_hash}
+                   "observed_request_hash": self._observed_request_hash,
+                   "trusted_usage_anchor": self._trusted_usage_anchor}
         payload["checksum"] = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
         return payload
 
@@ -843,7 +1052,9 @@ class ConversationManager:
                    "observed_prompt_tokens": self._observed_prompt_tokens,
                    "observed_estimated_tokens": self._observed_estimated_tokens,
                    "observed_request_message_count": self._observed_request_message_count,
-                   "observed_completion_tokens": self._observed_completion_tokens}
+                   "observed_completion_tokens": self._observed_completion_tokens,
+                   "observed_request_hash": self._observed_request_hash,
+                   "trusted_usage_anchor": self._trusted_usage_anchor}
         payload["checksum"] = hashlib.sha256(
             canonical_json({k: v for k, v in payload.items() if k != "checksum"}).encode("utf-8")
         ).hexdigest()
@@ -939,16 +1150,17 @@ class ConversationManager:
             if value is not None and (not isinstance(value, int) or value < 0):
                 raise ConversationError(f"invalid conversation calibration: {field}")
         request_hash = data.get("observed_request_hash")
-        if request_hash is not None and (
-                not isinstance(request_hash, str) or
-                not request_hash.startswith("sha256:") or
-                len(request_hash) != len("sha256:") + 64):
+        if request_hash is not None and not _valid_hash(request_hash):
             raise ConversationError("invalid conversation calibration: observed_request_hash")
         obj._observed_prompt_tokens = int(data.get("observed_prompt_tokens", 0) or 0)
         obj._observed_estimated_tokens = int(data.get("observed_estimated_tokens", 0) or 0)
         obj._observed_request_message_count = data.get("observed_request_message_count")
         obj._observed_completion_tokens = data.get("observed_completion_tokens")
         obj._observed_request_hash = data.get("observed_request_hash")
+        anchor = data.get("trusted_usage_anchor")
+        if anchor is not None and not _valid_anchor_schema(anchor):
+            raise ConversationError("invalid trusted usage anchor")
+        obj._trusted_usage_anchor = anchor
         obj._journal_next_seq = len(existing_records)
         obj._journal_records_applied = applied_marker
         if applied_marker:
@@ -960,6 +1172,8 @@ class ConversationManager:
                                        "observed_request_message_count", "observed_completion_tokens",
                                        "observed_request_hash"))):
                 raise ConversationError("conversation snapshot does not match applied journal prefix")
+            if prefix._trusted_usage_anchor != obj._trusted_usage_anchor:
+                raise ConversationError("conversation snapshot trusted anchor mismatch")
         for record in existing_records[applied_marker:]:
             record_messages = _copy_messages(record.get("messages", []))
             if record.get("kind") == "conversation_base":
@@ -978,5 +1192,9 @@ class ConversationManager:
                           "observed_request_hash"):
                 if field in record:
                     setattr(obj, "_" + field, record[field])
+            if "trusted_usage_anchor" in record:
+                obj._trusted_usage_anchor = record["trusted_usage_anchor"]
             obj._journal_records_applied += 1
+        if obj._trusted_usage_anchor is not None and not _valid_anchor_schema(obj._trusted_usage_anchor):
+            raise ConversationError("invalid trusted usage anchor in journal")
         return obj

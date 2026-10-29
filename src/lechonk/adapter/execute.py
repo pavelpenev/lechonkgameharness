@@ -201,7 +201,8 @@ def verify_readback(
                             production_names=production_names,
                             post_info=post_info)
     if candidate.domain == "tech":
-        return _verify_tech(candidate, payload, pre_obs, post_obs)
+        return _verify_tech(candidate, payload, pre_obs, post_obs,
+                            my_player_id=my_player_id)
     if candidate.domain == "dipl":
         return _verify_dipl(candidate, payload, pre_obs, post_obs)
     return _rb(INCONCLUSIVE, f"no verifier for domain {candidate.domain!r}")
@@ -478,17 +479,15 @@ def _verify_city(candidate: Candidate, payload: Mapping[str, Any],
 
 def _verify_tech(candidate: Candidate, payload: Mapping[str, Any],
                  pre_obs: Mapping[str, Any],
-                 post_obs: Mapping[str, Any]) -> Readback:
+                 post_obs: Mapping[str, Any], *,
+                 my_player_id: int) -> Readback:
     verb = candidate.verb
     tech_id = payload.get("tech_id")
-    # The tech actor is 'cur_player' (our own player); find it via the
-    # own-player marker fields (player_state.py).
-    def my(obs):
-        for pid, p in _players(obs).items():
-            if any(m in p for m in ("tech_goal", "bulbs_researched", "embassy_txt")):
-                return p
-        return None
-    post_p = my(post_obs)
+    # The tech actor is 'cur_player' (our own player). Every player record
+    # includes the same marker keys in the CivRealm observation, so key
+    # presence cannot identify the active player. Use the session's verified
+    # player id instead.
+    post_p = _players(post_obs).get(my_player_id)
     if post_p is None:
         return _rb(INCONCLUSIVE, "own player not found in the post-observation")
     if verb.startswith("research_tech_"):

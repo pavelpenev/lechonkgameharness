@@ -109,6 +109,12 @@ With no horizon flag, the launcher continues until Freeciv reports game over. Pa
 `--turns 10` for a short smoke test. The direct `wp2_model_run.py` command remains
 the bounded 10-turn WP2 acceptance driver unless you pass `--until-game-over`.
 
+The direct runner's `--reasoning-effort` accepts `none`, `minimal`, `low`,
+`medium`, `high`, or `xhigh`; the default is `high`. The `none` setting is sent
+to Mistral as the literal string `"none"` and omits the thinking trace. Answers
+and tool calls remain logged, and the local output cap is unchanged. The actual
+CLI declaration is in `scripts/wp2_model_run.py`.
+
 #### Screenshot-first capture prototype (short test)
 
 This is an experimental, local capture path, not a production-ready recorder. It
@@ -249,14 +255,30 @@ the projected context reaches 500,000 estimated tokens, the conversation is
 compacted at a completed-turn boundary into a versioned state summary plus a
 recent exact tail. The current fog-safe snapshot and candidate table remain the
 authority for each new turn. Use `--context-policy legacy` to run the original
-fresh-prompt policy. Conversation state and a checksummed start-of-turn recovery
-manifest are persisted. To continue from a verified checkpoint, pass the parent
-manifest and a new run ID:
+fresh-prompt policy.
+
+Conversation state and a checksummed recovery manifest are persisted. At a normal
+turn horizon, the runner writes a verified checkpoint for the *next* turn after
+the requested turns have completed. For example, a run with `--turns 50` ends
+after turn 50 and records the start of turn 51; it does not make a live pause in
+the existing server. Resume from that manifest with a new run ID and
+`--turns 50` to execute turns 51 through 100 without replaying turn 50:
 
 ```sh
 ./scripts/launch.sh --resume artifacts/runs/parent/recovery.json \
-  --run-id parent-continuation --until-game-over
+  --run-id parent-continuation --turns 50 \
+  --seed <same-seed> --opponents <same-count> \
+  --context-policy conversation_v1 --prompt-profile gameplay_v2
 ```
+
+Resume reloads the verified Freeciv save and conversation snapshot in a new
+process. Keep the seed, opponent count, prompt profile, context policy, and
+other scenario settings unchanged; recovery validation rejects mismatches. The
+continuation needs its own capture directory and presenter, so the two capture
+segments can be reviewed or joined offline. If the run ends early because of
+game over, an error, or a failed checkpoint export, inspect its verdict and
+manifest before attempting to continue; only a verified horizon checkpoint is a
+safe continuation point.
 
 Freeciv's `aifill` setting is the total number of filled player slots,
 including the model's human slot. The direct runner accepts `--opponents N`
@@ -733,7 +755,8 @@ Upstream quirks with fog implications, disclosed:
   manifests), run sequentially on an otherwise-idle machine.
 - **Model fingerprint:** every arm records a per-model fingerprint (fixed
   capacity-revealing probe prompt, `fingerprint_probe_v2`; K=3 samples collected
-  under the arm's sampling — temperature 1.0, reasoning_effort high, no top_p;
+  under that arm's recorded sampling — the historical evaluation arms used
+  temperature 1.0, `reasoning_effort=high`, and no `top_p`;
   the recorded fingerprint is the sorted, deduplicated set of the sample output
   hashes) and arm-start timestamps —
   `mistral-large-4` is a public preview whose weights can drift under the same ID;
@@ -801,13 +824,13 @@ diagnosis but is not a fully verified comparison.
 
 ### Sampling recorded in run manifests (old vs new semantics)
 
-- **What the client actually runs (decision 4, 2026-10-24 amendment):** every
-  model call — turn calls, repair attempts, and capability/fingerprint probes
-  alike — runs at temperature 1.0 with `reasoning_effort="high"`; the client
-  never sends `top_p` and never sets a random seed. This is the single source of
-  truth (`lechonk.model.sampling.actual_client_sampling`), and it is what all
-  four run drivers (`wp4_eval.py`, `wp3_paired_smoke.py`, `wp2_model_run.py`,
-  `wp2_fault_run.py`) now persist in their manifests.
+- **Historical evaluation sampling (decision 4, 2026-10-24 amendment):** the
+  recorded evaluation arms used temperature 1.0 with
+  `reasoning_effort="high"`; the client never sent `top_p` and never set a
+  random seed. Those historical run settings and manifests are unchanged. The
+  current direct `wp2_model_run.py` driver exposes a configurable
+  `--reasoning-effort` and defaults to `high`; its effective value is persisted
+  in the run manifest.
 - **Old manifests (before this change) are NOT rewritten.** Manifests recorded
   before 2026-10-25 persist a fabricated sampling dict
   (`{"temperature": 0.0, ..., "top_p": 1.0, "random_seed": null, ...}`) that the
@@ -815,8 +838,8 @@ diagnosis but is not a fully verified comparison.
   spike era. That evidence is never edited: when comparing runs across this
   boundary, treat any manifest `sampling.temperature == 0.0` (or a `top_p` key)
   as a pre-W1-6 record whose actual sampling was temperature 1.0,
-  `reasoning_effort="high"`, no `top_p` — the same as every post-W1-6 manifest
-  records explicitly.
+  `reasoning_effort="high"`, no `top_p` — the same as every post-W1-6
+  high-profile manifest records explicitly.
 - **API-call totals:** arm manifests' `post_run.api_totals` now count each HTTP
   request exactly once. Totals recorded before this change double-counted
   fingerprint-probe usage (the probe's aggregate record plus its per-request
@@ -964,12 +987,23 @@ Agreed simplifications in the current implementation, documented rather than hid
 
 ## Video and development story
 
-- **Video:** [`artifacts/submission/video.mp4`](artifacts/submission/video.mp4) — 99.1 s,
-  1280x720 H.264. Sourced from the zero-perturbation observer (Playwright chromium headless;
-  observers never take a player slot) plus replay-viewer playback, assembled by
-  `artifacts/submission/build/assemble.sh` with a per-source manifest in
-  `artifacts/submission/build/video_manifest.json`. Capture scripts:
-  `scripts/wp0_observe_attach.js` (observer attach flow), `scripts/wp0_spectate.js`.
+- **Current video of record:** [`artifacts/highlights/lechonk-demo-118-louder-20261029/story.mp4`](artifacts/highlights/lechonk-demo-118-louder-20261029/story.mp4) — 118 s,
+  1920x1080 at 30 fps, H.264/AAC. It uses Marie (French) narration with
+  expressiveness 1 and attributed music by the Skidmore College Orchestra via
+  Musopen. Local provenance is recorded in
+  [`provenance.json`](artifacts/highlights/lechonk-demo-118-louder-20261029/provenance.json),
+  [`filtergraph.txt`](artifacts/highlights/lechonk-demo-118-louder-20261029/filtergraph.txt),
+  and [`copiedcredits.txt`](artifacts/highlights/lechonk-demo-118-louder-20261029/copiedcredits.txt).
+  These generated artifacts are ignored and are not included in a checkout.
+- **Older video:** [`artifacts/submission/video.mp4`](artifacts/submission/video.mp4) — 99.1 s,
+  1280x720 H.264, assembled from the earlier observer/replay workflow; it remains
+  preserved as historical evidence.
+- **Release evidence (2026-10-29):** the same game was recorded through absolute
+  turn 100 across resumed segments. The latest segment,
+  `lechonk-none-recording-100-20261029`, covers own phases 51–100 (50 phases) and
+  passes 15 structural checks. Its `participation_gate_pass` is `false`, with 29
+  `state_fog_error` rejected model actions. This is not a victory claim or a
+  strategic benchmark.
 - **Development story:** [`docs/dev-story.md`](docs/dev-story.md) — how the harness was
   built, what broke, and what it was based on (including the OSS disclosure above), now
   including the evaluation-day narrative (the two truncated predecessor runs, the

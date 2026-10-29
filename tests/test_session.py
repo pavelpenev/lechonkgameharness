@@ -292,8 +292,23 @@ def test_server_timeout_covers_long_model_phase(tmp_path):
 def test_pingtimeout_covers_custom_long_acting_deadline(tmp_path):
     session = AdapterSession(
         workdir=str(tmp_path / "long-deadline"), seed=1,
-        acting_deadline_s=2000.0)
-    assert session.pingtimeout_s == 2060.0
+        acting_deadline_s=1740.0)
+    assert session.server_timeout_s == 1800.0
+    assert session.pingtimeout_s == 1800.0
+
+
+def test_acting_deadline_above_freeciv_pingtimeout_limit_fails_fast(tmp_path):
+    try:
+        AdapterSession(
+            workdir=str(tmp_path / "too-long-deadline"), seed=1,
+            acting_deadline_s=1740.1)
+    except ValueError as exc:
+        message = str(exc)
+        assert "acting_deadline_s" in message
+        assert "1740s" in message
+        assert "1800s" in message
+    else:
+        raise AssertionError("unsafe acting deadline was accepted")
 
 
 class _FakeOptions:

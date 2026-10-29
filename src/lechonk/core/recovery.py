@@ -44,6 +44,20 @@ def validate_freeciv_username(value: Any) -> str:
     return value
 
 
+def validate_player_name(value: Any) -> str:
+    """Validate the visible Freeciv ruler name (not the save username)."""
+    if not isinstance(value, str):
+        raise ValueError("player_name must be a string")
+    name = value.strip()
+    if not name:
+        raise ValueError("player_name must not be empty")
+    if len(name.encode("utf-8")) >= 48:
+        raise ValueError("player_name must be shorter than 48 UTF-8 bytes")
+    if not all(char.isprintable() for char in name):
+        raise ValueError("player_name must contain printable characters only")
+    return name
+
+
 def derive_freeciv_username(run_id: str) -> str:
     """Derive a deterministic, collision-resistant fresh-run username.
 
@@ -135,11 +149,14 @@ class RecoveryCheckpoint:
     # legacy manifests so they remain readable and fail closed at resolution.
     config_digest_schema: str | None = None
     prompt_bundle_id: str | None = None
+    player_name: str | None = None
 
     def __post_init__(self) -> None:
         # ``build_checkpoint`` and ``load_checkpoint`` validate at their
         # boundaries, but keep direct dataclass construction fail-closed too.
         validate_freeciv_username(self.username)
+        if self.player_name is not None:
+            validate_player_name(self.player_name)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +187,8 @@ class RecoveryCheckpoint:
             "manual_reference_present": self.manual_reference_present,
             "config_digest_schema": self.config_digest_schema,
             "prompt_bundle_id": self.prompt_bundle_id,
+            **({"player_name": self.player_name}
+               if self.player_name is not None else {}),
         }
 
     def with_checksum(self) -> dict[str, Any]:
@@ -201,7 +220,8 @@ def build_checkpoint(*, checkpoint_path: str | Path,
                      manual_reference_source_sha256: str | None = None,
                      manual_reference_present: bool | None = None,
                      config_digest_schema: str | None = None,
-                     prompt_bundle_id: str | None = None) -> RecoveryCheckpoint:
+                     prompt_bundle_id: str | None = None,
+                     player_name: str | None = None) -> RecoveryCheckpoint:
     """Build a checkpoint from existing verified files and committed state."""
     root = Path(artifact_root).resolve(strict=True)
     save = _inside(Path(checkpoint_path), root, label="checkpoint path")
@@ -212,6 +232,8 @@ def build_checkpoint(*, checkpoint_path: str | Path,
     if not isinstance(player_id, int) or isinstance(player_id, bool) or player_id < 0:
         raise RecoveryError("invalid checkpoint player_id")
     username = validate_freeciv_username(username)
+    if player_name is not None:
+        player_name = validate_player_name(player_name)
     run_id = _text(run_id, field="run_id", max_len=256)
     config_digest = _text(config_digest, field="config_digest", max_len=256)
     if parent_run_id is not None:
@@ -269,6 +291,7 @@ def build_checkpoint(*, checkpoint_path: str | Path,
         manual_reference_hash=manual_reference_hash,
         manual_reference_source_sha256=manual_reference_source_sha256,
         manual_reference_present=manual_reference_present,
+        player_name=player_name,
         config_digest_schema=config_digest_schema,
         prompt_bundle_id=prompt_bundle_id)
 

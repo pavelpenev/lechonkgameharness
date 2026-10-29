@@ -313,8 +313,12 @@ class MistralTurnClient:
             "play. Return JSON with keys version, summary, commitments, "
             "uncertainties, and facts; version must be 1. Commitments may be "
             "legacy strings or strict typed Commitment objects; historical_note "
-            "is optional. Keep it concise. "
-            "Mark observations historical; the "
+            "is optional and may be long when needed for strategic fidelity; "
+            "summary and historical_note must be nonempty strings, each list "
+            "has at most 128 items, string items must be nonempty, and strict "
+            "typed commitments are required where used. Keep the complete "
+            "object under the aggregate 8,000-token summary budget. Mark "
+            "observations historical; the "
             "next authoritative snapshot and candidate table override it.")
         instruction = {"role": "user", "content": prompt}
         compaction_messages = list(messages) + [instruction]
@@ -429,8 +433,11 @@ class MistralTurnClient:
                   ". Return only a JSON object with exactly these keys: "
                   "version (integer 1), summary (nonempty string), commitments "
                   "(legacy strings or strict Commitment objects), uncertainties "
-                  "(strings), facts (strings), and optional historical_note "
-                  "(string). Do not invent facts.")
+                  "(nonempty strings), facts (nonempty strings), and optional "
+                  "historical_note (nonempty string). Lists have at most 128 "
+                  "items; keep the complete object under the aggregate "
+                  "8,000-token summary budget. Preserve strategic fidelity; "
+                  "do not invent facts.")
         suffix = [*original_messages[len(prefix_messages):],
                   {"role": "assistant", "content": raw_text[:12_000]},
                   {"role": "user", "content": repair}]

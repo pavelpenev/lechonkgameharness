@@ -76,6 +76,8 @@ from lechonk.capture_gateway import CaptureGateway
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from lechonk.core.recovery import validate_player_name
+
 
 def _known_number(value):
     """Return whether an API usage value is safe to include in a sum.
@@ -86,6 +88,32 @@ def _known_number(value):
     """
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
+
+
+def _report_value(value):
+    """Return a stable human-readable value for incomplete telemetry.
+
+    A failed or truncated turn can have no rendered prompt sections (or only
+    a subset of them).  Reports must preserve that distinction instead of
+    crashing or implying that the measurement was zero.
+    """
+    return "unknown" if value is None else value
+
+
+def _section_report_value(section_tokens, name):
+    """Render one section token count, including missing section keys."""
+    if not isinstance(section_tokens, dict):
+        return "unknown"
+    return _report_value(section_tokens.get(name))
+
+
+def resolve_player_name(requested, stored, *, fresh):
+    """Resolve visible name while preserving legacy nameless checkpoints."""
+    if fresh:
+        return requested or "Le Chonk"
+    if stored is not None and requested is not None and requested != stored:
+        raise ValueError("--player-name conflicts with checkpoint")
+    return stored if stored is not None else requested
 
 
 def _token_usage_totals(records):
@@ -139,7 +167,17 @@ def _numeric_max(values):
 def _section_max(per_turn, section):
     """Maximum rendered section size, retaining an unknown-only result."""
     return _numeric_max(
-        (turn.get("section_tokens", {}).get(section) for turn in per_turn))
+        (turn.get("section_tokens", {}).get(section)
+         if isinstance(turn.get("section_tokens"), dict) else None
+         for turn in per_turn))
+
+
+def _is_compaction_call(record):
+    """Whether an API log record is context compaction, not a turn attempt."""
+    compaction_kinds = {"conversation_compaction",
+                        "conversation_compaction_repair"}
+    return (record.get("kind") in compaction_kinds
+            or record.get("physical_kind") in compaction_kinds)
 
 
 def _snapshot_within_8000(section_tokens, ledger_tokens):
@@ -170,6 +208,8 @@ def _parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=20261028,
                         help="deterministic map/game/agent seed "
                              "(default: 20261028)")
+    parser.add_argument("--player-name", default=None,
+                        help="visible Freeciv ruler name (default fresh run: Le Chonk; resume adopts checkpoint)")
     scenario = parser.add_mutually_exclusive_group()
     scenario.add_argument(
         "--aifill", type=int, default=None,
@@ -188,6 +228,12 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--acting-deadline-s", type=float, default=180.0,
         help="maximum model/action phase per turn in seconds (default: 180)")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+        default="high",
+        help="Mistral reasoning effort; 'none' disables the thinking trace "
+             "(default: high)")
     parser.add_argument(
         "--stream", dest="stream", action="store_true",
         help="stream reasoning/output deltas as the response arrives")
@@ -222,13 +268,31 @@ def _parse_args(argv=None):
         help="maximum recording wait per turn (default: 6000 ms)")
     parser.set_defaults(stream=False)
     args = parser.parse_args(argv)
+    # AdapterSession changes the process-wide cwd to the run workdir during
+    # startup. Keep the checkpoint anchored to the caller's cwd so a bounded
+    # retry (which re-executes this script after that cwd change) cannot
+    # reinterpret a relative --resume path under artifacts/runs/<id>/workdir.
+    if args.resume is not None:
+        args.resume = str(Path(args.resume).expanduser().resolve())
     if args.api_timeout_s <= 0:
         parser.error("--api-timeout-s must be positive")
+    if args.player_name is not None:
+        try:
+            args.player_name = validate_player_name(args.player_name)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.acting_deadline_s <= 0:
         parser.error("--acting-deadline-s must be positive")
     if args.acting_deadline_s < args.api_timeout_s + 25:
         parser.error("--acting-deadline-s must be at least "
                      "--api-timeout-s + 25 seconds")
+    # Freeciv's pingtimeout has a hard 1800-second maximum; AdapterSession
+    # derives it as acting deadline plus a 60-second margin.  Reject an
+    # impossible request instead of silently clamping it and creating a run
+    # whose declared deadline is not the one the server can enforce.
+    if args.acting_deadline_s + 60 > 1800:
+        parser.error("--acting-deadline-s + 60 seconds must be at most "
+                     "1800 seconds (maximum acting deadline: 1740 seconds)")
     if args.capture and not args.stream:
         parser.error("--capture requires --stream")
     if args.capture_dir is not None and not args.capture:
@@ -285,11 +349,13 @@ TURNS = None if _ARGS.until_game_over else _ARGS.turns
 UNTIL_GAME_OVER = TURNS is None
 API_TIMEOUT_S = _ARGS.api_timeout_s
 ACTING_DEADLINE_S = _ARGS.acting_deadline_s
+REASONING_EFFORT = _ARGS.reasoning_effort
 AIFILL = _ARGS.aifill
 OPPONENTS = _ARGS.opponents
 STREAM = _ARGS.stream
 CONTEXT_POLICY = _ARGS.context_policy
 PROMPT_PROFILE = _ARGS.prompt_profile
+PLAYER_NAME = _ARGS.player_name
 OPEN_OBSERVER = _ARGS.open_observer
 CAPTURE_ENABLED = _ARGS.capture
 CAPTURE_DIR = _ARGS.capture_dir
@@ -329,6 +395,46 @@ RESUME_CHECKPOINT = None
 # across generations (including explicit retry attempts).
 from lechonk.core.recovery import derive_freeciv_username
 FREECIV_USERNAME = derive_freeciv_username(RUN)
+
+
+def _retry_argv_with_absolute_resume(argv, resume_path):
+    """Return *argv* with every resume spelling anchored to *resume_path*.
+
+    ``sys.argv`` still contains the user's original relative path even though
+    argument parsing canonicalizes ``_ARGS.resume``. The bounded retry is a
+    fresh process and must receive the canonical value explicitly; otherwise
+    its import-time resume validation runs after the previous process changed
+    cwd and resolves the path against the wrong directory.
+    """
+    if resume_path is None:
+        return list(argv)
+    absolute = str(Path(resume_path).expanduser().resolve())
+    result = list(argv)
+    for index, value in enumerate(result):
+        if value == "--resume" and index + 1 < len(result):
+            result[index + 1] = absolute
+        elif value.startswith("--resume="):
+            result[index] = "--resume=" + absolute
+    return result
+
+
+def _capture_retry_block_reason(capture_enabled):
+    """Explain why an implicit retry is unsafe for a recorded run.
+
+    The presenter attaches to one capture manifest for the lifetime of a
+    process.  Re-executing with the same explicit ``--capture-dir`` collides
+    with that manifest; choosing a new directory would instead produce a
+    second, unobserved game unless a new presenter were attached.  Fail closed
+    so a capture never silently loses its visual continuity.
+    """
+    if not capture_enabled:
+        return None
+    return (
+        "implicit bounded retry disabled because capture is enabled; the "
+        "observer cannot safely reattach to a new capture directory. "
+        "Start a new run with a new --run-id and an empty --capture-dir "
+        "(or rerun without --capture)"
+    )
 
 
 def _static_classic_reference_provenance():
@@ -641,6 +747,17 @@ if RESUME_MANIFEST:
         raise SystemExit(
             f"resume rejected: target run directory already exists: {RUNDIR} "
             "(use a new --run-id or explicit retry attempt)")
+
+# Fresh runs use the showcase name.  Resumes adopt the checkpoint's pinned
+# display name when present; legacy checkpoints have no such field and retain
+# their historical behavior unless the caller explicitly supplies a name.
+try:
+    PLAYER_NAME = resolve_player_name(
+        PLAYER_NAME,
+        RESUME_CHECKPOINT.player_name if RESUME_CHECKPOINT is not None else None,
+        fresh=RESUME_CHECKPOINT is None)
+except ValueError as exc:
+    raise SystemExit(f"resume rejected: {exc}") from exc
 
 # A first attempt may reuse an empty directory created by provisioning, but it
 # must never silently delete a user's prior run artifacts. Retries are the only
@@ -1405,6 +1522,7 @@ def build_manifest(arm_start_ts, spike_fingerprint, live_probe,
         evidence_artifact="artifacts/runs/wp2-spike/spike_report.json")
     fc_args = {
         "self_play": False, "aifill": AIFILL,
+        "player_name": PLAYER_NAME,
         "debug.randomly_generate_seeds": False,
         "debug.mapseed": SEED, "debug.gameseed": SEED,
         "debug.agentseed": SEED,
@@ -1438,13 +1556,16 @@ def build_manifest(arm_start_ts, spike_fingerprint, live_probe,
             "autotoggle": "disabled",
             "victories": "SPACERACE|ALLIED (CivRealm default)",
             "aifill": AIFILL, "configured_ai_opponents": AIFILL - 1,
+            "player_name": PLAYER_NAME,
             "self_play": False,
         },
         model_id=mc.MODEL_ID,
         # W1-6 sampling manifest truth: the ACTUAL client sampling
-        # (temperature 1.0, reasoning_effort "high"; the client never
+        # (temperature 1.0, configured reasoning effort; the client never
         # sends top_p) — never the fabricated greedy dict.
-        sampling=actual_client_sampling(),
+        # Keep the shared actual_client_sampling() helper as the single
+        # manifest source of truth while recording this run's override.
+        sampling=actual_client_sampling(reasoning_effort=REASONING_EFFORT),
         prompt_hashes=_active_prompt_hashes(prompts, bundle_id=PROMPT_BUNDLE_ID),
         config_after_load={
             "freeciv_username": FREECIV_USERNAME,
@@ -1453,10 +1574,12 @@ def build_manifest(arm_start_ts, spike_fingerprint, live_probe,
             "fc_args": fc_args,
             "api_timeout_s": API_TIMEOUT_S,
             "acting_deadline_s": ACTING_DEADLINE_S,
+            "reasoning_effort": REASONING_EFFORT,
             "max_turns": TURNS,
             "until_game_over": UNTIL_GAME_OVER,
             "aifill": AIFILL,
             "configured_ai_opponents": AIFILL - 1,
+            "player_name": PLAYER_NAME,
             "context_policy": CONTEXT_POLICY,
             "prompt_profile": PROMPT_PROFILE,
             "static_manual_reference": {
@@ -1562,7 +1685,7 @@ def analyse(records, call_records, result, run_wall_s):
     # The per-call API records (decision 4) keyed by turn.
     api_by_turn = {}
     for rec in call_records:
-        if rec.get("turn") is not None:
+        if rec.get("turn") is not None and not _is_compaction_call(rec):
             api_by_turn.setdefault(rec["turn"], []).append(rec)
 
     turns = sorted(turn_starts)
@@ -1582,9 +1705,16 @@ def analyse(records, call_records, result, run_wall_s):
         api_calls = api_by_turn.get(turn, [])
         # The rendered section sizes come from the turn's prompt (the first
         # call of the turn renders it; repair calls repeat the same sections).
-        sections = (api_calls[0]["section_tokens"] if api_calls else
-                    {"memory": None, "snapshot": None, "delta": None,
-                     "candidates": None})
+        raw_sections = (api_calls[0].get("section_tokens")
+                        if api_calls else None)
+        # Error/truncated call records may have no section telemetry at all,
+        # or may contain only the sections rendered before the failure.
+        # Normalize the shape once so analysis and reporting remain total.
+        sections = {
+            name: (raw_sections.get(name) if isinstance(raw_sections, dict)
+                   else None)
+            for name in ("memory", "snapshot", "delta", "candidates")
+        }
         turn_actions = actions.get(turn, [])
         readbacks = {}
         for a in turn_actions:
@@ -1643,6 +1773,19 @@ def analyse(records, call_records, result, run_wall_s):
                             "housekeeping")},
         })
     return per_turn, outcome
+
+
+def expected_ledger_turns(turns, resume_turn=None):
+    """Return the absolute turn numbers expected in this run's ledger.
+
+    ``--turns`` is a count of phases for both fresh and resumed runs.  A
+    resumed checkpoint already identifies the first phase, so acceptance
+    checks must not assume that every ledger starts at turn one.
+    """
+    if turns is None:
+        return None
+    start = resume_turn if resume_turn is not None else 1
+    return list(range(start, start + turns))
 
 
 def _turn_of_call(call_id):
@@ -1783,10 +1926,11 @@ def render_table_md(per_turn, feasibility, metrics_dict):
             f"({'+'.join(str(a) for a in t['api_attempts'])}) "
             f"| {t['api_tokens_in']} | {t['api_tokens_out']} "
             f"| {t['api_cost_usd']:.6f} "
-            f"| {t['section_tokens']['memory']} "
-            f"| {t['section_tokens']['snapshot']} "
-            f"(ledger {t['snapshot_tokens_ledger']}) "
-            f"| {t['section_tokens']['delta']} | {t['candidate_count']} "
+            f"| {_section_report_value(t.get('section_tokens'), 'memory')} "
+            f"| {_section_report_value(t.get('section_tokens'), 'snapshot')} "
+            f"(ledger {_report_value(t.get('snapshot_tokens_ledger'))}) "
+            f"| {_section_report_value(t.get('section_tokens'), 'delta')} "
+            f"| {_report_value(t.get('candidate_count'))} "
             f"| {t['actions_executed']} | {t['actions_rejected']} "
             f"| {rb_txt} |")
     lines += [
@@ -2087,6 +2231,7 @@ def main():
     client_kwargs = {
         "enforcement": "json_schema",
         "timeout_ms": round(API_TIMEOUT_S * 1000),
+        "reasoning_effort": REASONING_EFFORT,
         "stream": STREAM,
         "stream_callback": (
             lambda event: progress({"event": "model_output_delta", **event})
@@ -2148,6 +2293,7 @@ def main():
             mc.MistralClient).parameters:
         client_kwargs["prompt_cache_key"] = PROMPT_CACHE_KEY
     client = mc.MistralClient(**client_kwargs)
+    log(f"[{RUN}] reasoning_effort={REASONING_EFFORT}")
     _MODEL_CALL_EVENTS_ENABLED = True
     arm_start_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     spike_fingerprint = load_spike_fingerprint()
@@ -2225,6 +2371,7 @@ def main():
                    TURNS is not None else TURNS),
         run_id=RUN, workdir=WORKDIR, seed=SEED,
         username=FREECIV_USERNAME, aifill=AIFILL,
+        player_name=PLAYER_NAME,
         acting_deadline_s=ACTING_DEADLINE_S,
         context_policy=CONTEXT_POLICY,
         prompt_profile=PROMPT_PROFILE,
@@ -2424,8 +2571,12 @@ def main():
           "prompt/template hashes, arm fingerprint (spike artifact), "
           "capstring")
     check("ledger_complete_target_turns",
-          ((not UNTIL_GAME_OVER and len(per_turn) == TURNS
-            and all(t["turn"] in range(1, TURNS + 1) for t in per_turn))
+          ((not UNTIL_GAME_OVER
+            and [t["turn"] for t in per_turn] ==
+                expected_ledger_turns(TURNS,
+                                       (RESUME_CHECKPOINT.turn
+                                        if RESUME_CHECKPOINT is not None
+                                        else None)))
            or (UNTIL_GAME_OVER and bool(per_turn))),
           f"{len(per_turn)} turn_start records"
           + (f" (turns {per_turn[0]['turn']}..{per_turn[-1]['turn']})"
@@ -2473,8 +2624,11 @@ def main():
           all(t["memory_within_1500"] for t in per_turn),
           f"max memory tokens: "
           f"{_section_max(per_turn, 'memory')}")
-    turn_call_records = [r for r in call_records if r.get("turn") is not None]
-    compaction_call_records = [r for r in call_records if r.get("turn") is None]
+    turn_call_records = [r for r in call_records
+                         if r.get("turn") is not None
+                         and not _is_compaction_call(r)]
+    compaction_call_records = [r for r in call_records
+                               if _is_compaction_call(r)]
     check("per_call_api_logged",
           len(turn_call_records) == sum(t["api_calls"] for t in per_turn)
           and all({"tokens_in", "tokens_out", "latency_ms", "cost_usd"}
@@ -2600,15 +2754,26 @@ def main():
     # --- bounded retry on infrastructure failure (once, logged) --------------
     if (verdict == "FAIL" and result.outcome == "TRUNCATED"
             and ATTEMPT == 1):
+        capture_retry_block_reason = _capture_retry_block_reason(
+            CAPTURE_ENABLED)
         write_json("infra_failure_attempt1.json", {
             "run": RUN, "attempt": 1, "seed": SEED,
             "outcome": result.outcome, "reason": result.reason,
             "turns_completed": result.turns_completed,
             "checks": checks,
-            "note": "bounded retry (once): re-executing the whole run with "
-                    "WP2_MODEL_RUN_ATTEMPT=2; one env per process, so the "
-                    "retry is a fresh process with a fresh env",
+            "retry_suppressed": capture_retry_block_reason is not None,
+            "retry_suppression_reason": capture_retry_block_reason,
+            "note": (capture_retry_block_reason
+                      or
+                      "bounded retry (once): re-executing the whole run "
+                      "with WP2_MODEL_RUN_ATTEMPT=2; one env per process, "
+                      "so the retry is a fresh process with a fresh env"),
         })
+        if capture_retry_block_reason is not None:
+            log(f"[{RUN}] bounded retry suppressed: "
+                f"{capture_retry_block_reason}")
+            _log_file.close()
+            return 1
         log(f"[{RUN}] bounded retry (once): re-executing with "
             f"WP2_MODEL_RUN_ATTEMPT=2")
         retry_env = dict(os.environ, WP2_MODEL_RUN_ATTEMPT="2",
@@ -2618,8 +2783,10 @@ def main():
             # argv here silently changed a short/conversation run into the
             # script's legacy 10-turn default and lost its policy/timeout
             # settings.
+            retry_argv = _retry_argv_with_absolute_resume(
+                sys.argv[1:], RESUME_MANIFEST)
             proc = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                [sys.executable, os.path.abspath(__file__), *retry_argv],
                 env=retry_env)
         finally:
             _log_file.close()
